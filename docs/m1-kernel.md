@@ -235,6 +235,24 @@ NX, `.rodata` без W с NX, `.data` с W и NX, четыре страницы-
 Дополнительно `make test` выполняет `harness.py repeat normal pagefault
 --count 3` (раздел 1); результат — `out/runs/<время>-repeat-<сценарий>/repeat.json`.
 
+## Что проверено при подготовке M1
+
+Эталонная среда та же, что в M0 (Ubuntu 24.04, QEMU 8.2.2, TCG, без KVM).
+Выполнено в рабочем дереве и в свежем `git clone`:
+
+- `make doctor && make && make test` — код выхода 0: host-тесты C
+  (340 проверок, в том числе 20 000 случайных искажений boot info и 20 000 —
+  initramfs; UBSan в режиме trap), 29 Python-тестов, 21 сценарий QEMU с
+  ожидаемыми вердиктами, повторяемость `normal` и `pagefault` (3 + 3
+  запуска, маркеры совпали);
+- host-тесты дополнительно собраны gcc с `-fsanitize=address,undefined`;
+- в host-тесты по одной вносились ошибки в allocator, построитель таблиц,
+  чтение initramfs и валидатор — каждую тесты обнаружили;
+- `make repro-check` — `BOOTX64.EFI`, `kernel.elf`, `initrd.img`,
+  `nanox.img` побайтово совпали в трёх сборках;
+- `make debug-check` — GDB остановился в `kernel_main` на собственном стеке
+  ядра.
+
 ## Что не проверено и ограничения
 
 - Повторная попытка `ExitBootServices` (ветка при изменившемся map key) на

@@ -399,13 +399,13 @@ Bootloader опирается на [UEFI Specification](https://uefi.org/specs/U
 
 ### M1. Собственная загрузка и ядро
 
-- [ ] UEFI loader загружает ядро и initramfs.
-- [ ] Корректно передаёт карту памяти и завершает Boot Services.
-- [ ] Ядро устанавливает свои таблицы, обработчики исключений и стек.
-- [ ] Работают физический allocator, page tables, timer и panic report.
-- [ ] Преднамеренный page fault даёт проверяемую диагностику.
+- [x] UEFI loader загружает ядро и initramfs. Initramfs (cpio newc) проверяется по манифесту загрузчиком и повторно ядром; сценарии `normal`, `missing-initrd`, `corrupt-initrd`, `bad-initrd` — [docs/m1-kernel.md](docs/m1-kernel.md#1-критерии-m1-и-их-проверка).
+- [x] Корректно передаёт карту памяти и завершает Boot Services. Карта проверяется валидатором ядра и host-тестами; после перехода на свои таблицы страниц ядро возвращает allocator'у и затирает всю память boot services и стек загрузчика, загрузка продолжается до TEST PASS. Повторная попытка `ExitBootServices` на стенде не возникала и не проверена.
+- [x] Ядро устанавливает свои таблицы, обработчики исключений и стек. GDT/TSS/IDT, IST-стеки и стек загрузки со страницами-ограничителями; сценарии `ud`, `gp`, `divzero`, `stackoverflow` — [docs/m1-kernel.md §3](docs/m1-kernel.md#3-стеки-gdt-tss-idt).
+- [x] Работают физический allocator, page tables, timer и panic report. Самопроверки allocator'а, таблиц страниц и таймера local APIC, сценарии `doublefree`, `timer-masked`, `panic`, host-тесты allocator'а и построителя таблиц.
+- [x] Преднамеренный page fault даёт проверяемую диагностику. Сценарии `pagefault`, `nullderef`, `wprotect`, `nxexec`: harness сверяет вектор, код ошибки, CR2, функцию RIP по символам `kernel.elf` и результат обхода таблиц страниц — [docs/m1-kernel.md §4](docs/m1-kernel.md#4-отчёт-о-panic-и-исключениях).
 
-Готовность: повторяемая загрузка собственного ядра и предсказуемый аварийный сценарий. Приветственная строка не считается доказательством memory manager или scheduler.
+Готовность: повторяемая загрузка собственного ядра и предсказуемый аварийный сценарий. Приветственная строка не считается доказательством memory manager или scheduler. Подтверждено в QEMU (TCG): `make test` в свежем `git clone` проходит 21 сценарий, а `harness.py repeat normal pagefault --count 3` получает одинаковые serial-маркеры трёх загрузок и трёх аварий (кроме измерений времени). Потоков и планировщика ядро ещё не имеет — это M2.
 
 ### M2. Изоляция, потоки и IPC
 
