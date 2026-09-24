@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include <nanox/elf_plan.h>
+#include <nanox/syscall.h>
+
 #include "test.h"
 
 struct seg {
@@ -153,6 +155,45 @@ void test_elf(const char *kernel_path)
     s = TEXT;
     s.memsz = NX_KERNEL_SPAN_MAX + 0x1000;
     expect_err(0x200000, &s, 1, NX_ELF_E_SPAN);
+
+    /* User program rules (M2): p_paddr is ignored, the segments must lie in
+     * the user half below the stack, and no segment may be W+X. */
+    {
+        const uint64_t B = NX_USER_BASE;
+        struct seg utext = {1, 5, 0x1000, B, 0, 0x100, 0x100};
+        struct seg udata = {1, 6, 0x2000, B + 0x1000, 0x1234, 0x80, 0x3000};
+        struct seg u2[2] = {utext, udata};
+        build(B + 0x10, u2, 2);
+        CHECK_EQ_INT(nx_elf_plan_user(img, sizeof(img), &p), NX_ELF_OK);
+        CHECK_EQ_INT(p.span_base, B);
+        CHECK_EQ_INT(p.span_end, B + 0x4000);
+        CHECK_EQ_INT(p.segments[1].addr, B + 0x1000);
+        /* The kernel rules reject the same image (not identity, too high). */
+        CHECK_EQ_INT(nx_elf_plan(img, sizeof(img), &p), NX_ELF_E_SEG_ADDR);
+        /* W+X segment. */
+        u2[1].flags = 7;
+        build(B + 0x10, u2, 2);
+        CHECK_EQ_INT(nx_elf_plan_user(img, sizeof(img), &p), NX_ELF_E_WX);
+        u2[1].flags = 6;
+        /* Below the user half (PML4 slot 0 belongs to the kernel image). */
+        struct seg low = utext;
+        low.vaddr = B - 0x1000;
+        build(B - 0x1000, &low, 1);
+        CHECK_EQ_INT(nx_elf_plan_user(img, sizeof(img), &p), NX_ELF_E_SEG_ADDR);
+        /* Into the stack area or the higher half. */
+        struct seg high = utext;
+        high.vaddr = NX_USER_STACK_TOP - 0x2000;
+        build(high.vaddr, &high, 1);
+        CHECK_EQ_INT(nx_elf_plan_user(img, sizeof(img), &p), NX_ELF_E_SEG_ADDR);
+        high.vaddr = 0xFFFF800000000000ull;
+        build(high.vaddr, &high, 1);
+        CHECK_EQ_INT(nx_elf_plan_user(img, sizeof(img), &p), NX_ELF_E_SEG_ADDR);
+        /* Span limit. */
+        struct seg wide[2] = {utext, udata};
+        wide[1].vaddr = B + NX_USER_SPAN_MAX;
+        build(B, wide, 2);
+        CHECK_EQ_INT(nx_elf_plan_user(img, sizeof(img), &p), NX_ELF_E_SPAN);
+    }
 
     /* The real kernel produced by the build. */
     if (kernel_path) {

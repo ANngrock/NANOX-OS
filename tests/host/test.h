@@ -34,5 +34,7 @@ void test_mmap(void);
 void test_initramfs(const char *initrd_path);
 void test_pt(void);
 void test_pmm(void);
+void test_handle(void);
+void test_ipc(void);
 
 #endif

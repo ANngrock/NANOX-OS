@@ -142,7 +142,9 @@ HOST_CFLAGS := -std=c17 -O1 -g $(WARN_FLAGS) $(HOST_SAN) -Iabi -Ilib/include \
 HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_sha256.c tests/host/test_elf.c tests/host/test_mmap.c \
     tests/host/test_initramfs.c tests/host/test_pt.c tests/host/test_pmm.c \
+    tests/host/test_handle.c tests/host/test_ipc.c \
     kernel/bootinfo_check.c kernel/initramfs.c kernel/mm/pt.c kernel/mm/pmm.c \
+    kernel/obj/handle.c kernel/obj/ipc.c \
     lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c
 
 $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
