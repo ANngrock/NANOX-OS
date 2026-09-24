@@ -31,7 +31,7 @@ LOADER_CFLAGS := --target=x86_64-unknown-windows $(FREESTANDING_FLAGS) -O2 \
 LOADER_LDFLAGS := /subsystem:efi_application /entry:efi_main /nodefaultlib \
     /machine:x64 /Brepro
 
-LOADER_SRCS := boot/uefi/loader.c boot/uefi/elf_plan.c boot/uefi/mmap_convert.c \
+LOADER_SRCS := boot/uefi/loader.c lib/elf_plan.c boot/uefi/mmap_convert.c \
     lib/serial.c lib/printf.c lib/string.c lib/sha256.c
 LOADER_OBJS := $(patsubst %.c,$(BUILD)/loader/%.obj,$(LOADER_SRCS))
 
@@ -110,7 +110,7 @@ HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_sha256.c tests/host/test_elf.c tests/host/test_mmap.c \
     tests/host/test_initramfs.c tests/host/test_pt.c tests/host/test_pmm.c \
     kernel/bootinfo_check.c kernel/initramfs.c kernel/mm/pt.c kernel/mm/pmm.c \
-    boot/uefi/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c
+    lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c
 
 $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
     $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h kernel/mm/*.h boot/uefi/*.h)

@@ -46,6 +46,8 @@ isr_common:
     /* RBP still holds the interrupted frame pointer, so backtraces taken in
      * the handler continue into the interrupted code. */
     call nx_trap_dispatch
+    .globl nx_trap_return
+nx_trap_return:
     popq %r15
     popq %r14
     popq %r13
@@ -64,5 +66,43 @@ isr_common:
     addq $16, %rsp          /* vector + error code */
     iretq
     .size isr_common, . - isr_common
+
+/* void nx_ctx_switch(uint64_t *save_rsp, uint64_t next_rsp) */
+    .globl nx_ctx_switch
+    .type nx_ctx_switch, @function
+nx_ctx_switch:
+    pushfq
+    pushq %rbp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, (%rdi)
+    movq %rsi, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbx
+    popq %rbp
+    popfq
+    ret
+    .size nx_ctx_switch, . - nx_ctx_switch
+
+/* First code of a new kernel thread: R12 = function, R13 = argument
+ * (restored by nx_ctx_switch from the prepared stack).  Kernel threads run
+ * with interrupts disabled; only the idle thread enables them around hlt. */
+    .globl nx_kthread_trampoline
+    .type nx_kthread_trampoline, @function
+nx_kthread_trampoline:
+    xorl %ebp, %ebp
+    movq %r13, %rdi
+    call *%r12
+    movq %rax, %rdi
+    call nx_task_exit_current
+1:  hlt
+    jmp 1b
+    .size nx_kthread_trampoline, . - nx_kthread_trampoline
 
     .section .note.GNU-stack, "", @progbits

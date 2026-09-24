@@ -30,6 +30,8 @@
 
 volatile uint64_t nx_timer_ticks;
 static volatile uint32_t *lapic;
+static uint32_t calibrated_count;
+static void (*periodic_tick)(struct nx_trap_frame *f);
 
 static uint32_t lapic_read(uint32_t reg)
 {
@@ -47,6 +49,23 @@ static void on_timer(struct nx_trap_frame *f)
     (void)f;
     nx_timer_ticks++;
     lapic_write(LAPIC_EOI, 0);
+}
+
+static void on_periodic(struct nx_trap_frame *f)
+{
+    nx_timer_ticks++;
+    lapic_write(LAPIC_EOI, 0);
+    periodic_tick(f);
+}
+
+void nx_timer_start_periodic(void (*tick)(struct nx_trap_frame *f))
+{
+    if (!calibrated_count)
+        nx_panic("timer: start before a successful calibration");
+    periodic_tick = tick;
+    nx_timer_handler = on_periodic;
+    lapic_write(LAPIC_LVT_TIMER, LVT_PERIODIC | NX_VEC_TIMER);
+    lapic_write(LAPIC_TIMER_INIT, calibrated_count);
 }
 
 void nx_pic_disable(void)
@@ -102,6 +121,7 @@ const char *nx_timer_check(int mask_for_test, struct nx_timer_result *out)
     if (elapsed < 100)
         return "LAPIC timer did not count during calibration";
     out->lapic_per_period = elapsed;
+    calibrated_count = elapsed;
 
     /* Periodic interrupts during a PIT-timed window with interrupts enabled. */
     nx_timer_handler = on_timer;

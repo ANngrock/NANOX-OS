@@ -9,6 +9,7 @@
 
 #include "kernel.h"
 #include "trap.h"
+#include "task.h"
 
 struct __attribute__((packed)) idt_entry {
     uint16_t offset_lo;
@@ -47,12 +48,12 @@ const char *nx_exception_mnemonic(uint64_t vector)
     return vector < 32 ? mnemonics[vector] : "IRQ";
 }
 
-static void set_gate(unsigned vec, uint64_t handler, uint8_t ist)
+static void set_gate(unsigned vec, uint64_t handler, uint8_t ist, uint8_t dpl)
 {
     idt[vec].offset_lo = (uint16_t)handler;
     idt[vec].selector = 0x08;
     idt[vec].ist = ist;
-    idt[vec].type_attr = 0x8E; /* present, DPL 0, 64-bit interrupt gate */
+    idt[vec].type_attr = (uint8_t)(0x8E | dpl << 5); /* present, 64-bit interrupt gate */
     idt[vec].offset_mid = (uint16_t)(handler >> 16);
     idt[vec].offset_hi = (uint32_t)(handler >> 32);
     idt[vec].zero = 0;
@@ -71,7 +72,8 @@ void nx_idt_init(void)
             ist = NX_IST_NMI;
         else if (v == 18)
             ist = NX_IST_MC;
-        set_gate(v, base + 16ull * v, ist);
+        /* Only the syscall vector may be raised by `int` from user mode. */
+        set_gate(v, base + 16ull * v, ist, v == NX_VEC_SYSCALL ? 3 : 0);
     }
     struct idt_ptr p = {sizeof(idt) - 1, (uint64_t)(uintptr_t)idt};
     __asm__ volatile("lidt %0" : : "m"(p) : "memory");
@@ -79,7 +81,8 @@ void nx_idt_init(void)
 
 void nx_trap_dispatch(struct nx_trap_frame *f)
 {
-    if (f->vector == NX_VEC_BP) {
+    int from_user = (f->cs & 3) == 3;
+    if (f->vector == NX_VEC_BP && !from_user) {
         /* Breakpoints are resumable: RIP already points after int3. */
         nx_breakpoint_count++;
         return;
@@ -91,6 +94,13 @@ void nx_trap_dispatch(struct nx_trap_frame *f)
     if (f->vector == NX_VEC_SPURIOUS) {
         nx_spurious_count++; /* no EOI for spurious interrupts */
         return;
+    }
+    if (from_user) {
+        if (f->vector == NX_VEC_SYSCALL) {
+            nx_syscall(f);
+            return;
+        }
+        nx_user_trap(f); /* terminates the task, does not return */
     }
     nx_fatal_trap(f);
 }

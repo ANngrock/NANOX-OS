@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+struct nx_trap_frame;
+
 #define NX_TIMER_HZ 100u
 #define NX_TIMER_WINDOW_PERIODS 30u /* measurement window: 30 x 10 ms */
 
@@ -21,5 +23,9 @@ void nx_pic_disable(void);
  * interrupts disabled. */
 const char *nx_timer_check(int mask_for_test, struct nx_timer_result *out);
 extern volatile uint64_t nx_timer_ticks;
+
+/* After a successful nx_timer_check: periodic interrupts at NX_TIMER_HZ
+ * delivered to `tick` (called in interrupt context after the EOI). */
+void nx_timer_start_periodic(void (*tick)(struct nx_trap_frame *f));
 
 #endif

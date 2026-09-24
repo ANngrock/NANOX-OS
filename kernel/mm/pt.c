@@ -151,6 +151,48 @@ int nx_pt_query(const struct nx_pt_env *env, uint64_t root, uint64_t va, uint64_
     return NX_PT_OK;
 }
 
+void nx_pt_destroy_slots(const struct nx_pt_env *env, uint64_t root, unsigned first,
+                         unsigned last,
+                         void (*leaf)(void *ctx, uint64_t pa, uint64_t flags, uint64_t size),
+                         void *leaf_ctx)
+{
+    uint64_t *pml4 = table(env, root);
+    for (unsigned i = first; i <= last && i < ENTRIES; i++) {
+        if (!(pml4[i] & NX_PTE_P))
+            continue;
+        uint64_t pdpt_pa = pml4[i] & NX_PTE_ADDR;
+        uint64_t *pdpt = table(env, pdpt_pa);
+        for (unsigned j = 0; j < ENTRIES; j++) {
+            uint64_t e3 = pdpt[j];
+            if (!(e3 & NX_PTE_P))
+                continue;
+            if (e3 & NX_PTE_PS) {
+                leaf(leaf_ctx, e3 & NX_PTE_ADDR & ~(NX_PAGE_1G - 1), e3 & ~NX_PTE_ADDR, NX_PAGE_1G);
+                continue;
+            }
+            uint64_t *pd = table(env, e3 & NX_PTE_ADDR);
+            for (unsigned k = 0; k < ENTRIES; k++) {
+                uint64_t e2 = pd[k];
+                if (!(e2 & NX_PTE_P))
+                    continue;
+                if (e2 & NX_PTE_PS) {
+                    leaf(leaf_ctx, e2 & NX_PTE_ADDR & ~(NX_PAGE_2M - 1), e2 & ~NX_PTE_ADDR,
+                         NX_PAGE_2M);
+                    continue;
+                }
+                uint64_t *pt = table(env, e2 & NX_PTE_ADDR);
+                for (unsigned l = 0; l < ENTRIES; l++)
+                    if (pt[l] & NX_PTE_P)
+                        leaf(leaf_ctx, pt[l] & NX_PTE_ADDR, pt[l] & ~NX_PTE_ADDR, NX_PAGE_4K);
+                env->free(env->ctx, e2 & NX_PTE_ADDR);
+            }
+            env->free(env->ctx, e3 & NX_PTE_ADDR);
+        }
+        env->free(env->ctx, pdpt_pa);
+        pml4[i] = 0;
+    }
+}
+
 const char *nx_pt_strerror(int st)
 {
     static const char *const names[NX_PT_E__COUNT] = {

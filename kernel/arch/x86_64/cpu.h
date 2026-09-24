@@ -4,7 +4,13 @@
 
 #include <stdint.h>
 
+#define NX_CR0_MP (1ull << 1)
+#define NX_CR0_EM (1ull << 2)
+#define NX_CR0_TS (1ull << 3)
 #define NX_CR0_WP (1ull << 16)
+#define NX_CR4_OSFXSR (1ull << 9)
+#define NX_CR4_OSXMMEXCPT (1ull << 10)
+#define NX_CR4_OSXSAVE (1ull << 18)
 #define NX_CR4_PGE (1ull << 7)
 #define NX_MSR_EFER 0xC0000080u
 #define NX_EFER_NXE (1ull << 11)

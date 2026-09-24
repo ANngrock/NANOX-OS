@@ -17,6 +17,14 @@
 #define NX_PHYSMAP_BASE ((uint64_t)0xFFFF800000000000ull)
 /* Scratch virtual address used by the VMM self-test. */
 #define NX_VMM_SELFTEST_VA ((uint64_t)0xFFFFC00000000000ull)
+/* Task kernel stacks: one NX_KSTACK_STRIDE window per task slot, the lowest
+ * page of each window is an unmapped guard page. */
+#define NX_KSTACK_BASE ((uint64_t)0xFFFFFE0000000000ull)
+#define NX_KSTACK_PAGES 4u
+#define NX_KSTACK_STRIDE ((uint64_t)0x8000u)
+/* PML4 slots of the user half (slot 0 is the kernel image, 256+ kernel). */
+#define NX_AS_USER_SLOT_FIRST 1u
+#define NX_AS_USER_SLOT_LAST 255u
 
 extern struct nx_pmm nx_pmm;
 /* Kernel PML4 (physical), 0 until nx_vmm_init switched CR3. */
@@ -44,6 +52,19 @@ void *nx_vmm_map_mmio(uint64_t phys);
 int nx_vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags);
 int nx_vmm_unmap_page(uint64_t va, uint64_t *pa);
 int nx_vmm_query(uint64_t va, uint64_t *pa, uint64_t *flags, uint64_t *size);
+/* Page-table environment of the kernel (physmap access, allocator). */
+const struct nx_pt_env *nx_vmm_env(void);
+/* Map / query in an arbitrary address space (invlpg if it is active). */
+int nx_vmm_map_page_in(uint64_t root, uint64_t va, uint64_t pa, uint64_t flags);
+int nx_vmm_query_in(uint64_t root, uint64_t va, uint64_t *pa, uint64_t *flags, uint64_t *size);
+/* New address space sharing PML4 slot 0 and 256..511 with the kernel. */
+uint64_t nx_as_create(void);
+/* Frees the user half (leaf callback decides about leaf pages) and the root. */
+void nx_as_destroy(uint64_t root,
+                   void (*leaf)(void *ctx, uint64_t pa, uint64_t flags, uint64_t size),
+                   void *ctx);
+/* Page-table pages currently allocated by the kernel. */
+uint64_t nx_vmm_tables(void);
 /* One serial line describing how va is mapped (used by the fault report). */
 void nx_vmm_describe(const char *prefix, uint64_t va);
 

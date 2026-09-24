@@ -39,7 +39,19 @@ static void *env_virt(void *ctx, uint64_t phys)
     return nx_phys_to_virt(phys);
 }
 
-static const struct nx_pt_env ENV = {env_alloc, env_virt, 0};
+static void env_free(void *ctx, uint64_t phys)
+{
+    (void)ctx;
+    nx_page_free(phys);
+    tables_allocated--;
+}
+
+static const struct nx_pt_env ENV = {env_alloc, env_virt, env_free, 0};
+
+const struct nx_pt_env *nx_vmm_env(void)
+{
+    return &ENV;
+}
 
 void nx_pmm_setup(const struct nx_mem_region *rg, uint32_t n)
 {
@@ -138,6 +150,19 @@ void nx_vmm_init(const struct nx_mem_region *rg, uint32_t n)
         map_or_panic(addr(stacks[i][0]), addr(stacks[i][0]),
                      addr(stacks[i][1]) - addr(stacks[i][0]), G | W | X_OFF, 0, "stack");
 
+    /* Every higher-half PML4 slot gets its PDPT now, so address spaces
+     * created later share all kernel mappings by copying slots 256..511. */
+    uint64_t *pml4 = nx_phys_to_virt(root);
+    for (unsigned i = 256; i < 512; i++) {
+        uint64_t pdpt = env_alloc(0);
+        if (!pdpt)
+            nx_panic("vmm: no page for kernel PDPT %u", i);
+        uint64_t *t = nx_phys_to_virt(pdpt);
+        for (unsigned j = 0; j < 512; j++)
+            t[j] = 0;
+        pml4[i] = pdpt | NX_PTE_P | NX_PTE_W;
+    }
+
     uint64_t ram = 0;
     for (uint32_t i = 0; i < n; i++) {
         if (!physmap_type(rg[i].type))
@@ -192,6 +217,45 @@ int nx_vmm_unmap_page(uint64_t va, uint64_t *pa)
 int nx_vmm_query(uint64_t va, uint64_t *pa, uint64_t *flags, uint64_t *size)
 {
     return nx_pt_query(&ENV, nx_kernel_root, va, pa, flags, size);
+}
+
+int nx_vmm_map_page_in(uint64_t root, uint64_t va, uint64_t pa, uint64_t flags)
+{
+    int st = nx_pt_map(&ENV, root, va, pa, NX_PAGE_4K, flags);
+    if (st == NX_PT_OK && root == nx_read_cr3())
+        nx_invlpg(va);
+    return st;
+}
+
+int nx_vmm_query_in(uint64_t root, uint64_t va, uint64_t *pa, uint64_t *flags, uint64_t *size)
+{
+    return nx_pt_query(&ENV, root, va, pa, flags, size);
+}
+
+uint64_t nx_as_create(void)
+{
+    uint64_t root;
+    if (nx_pt_new_root(&ENV, &root) != NX_PT_OK)
+        return 0;
+    uint64_t *dst = nx_phys_to_virt(root);
+    const uint64_t *src = nx_phys_to_virt(nx_kernel_root);
+    dst[0] = src[0]; /* kernel image, supervisor-only */
+    for (unsigned i = 256; i < 512; i++)
+        dst[i] = src[i];
+    return root;
+}
+
+void nx_as_destroy(uint64_t root, void (*leaf)(void *ctx, uint64_t pa, uint64_t flags, uint64_t size),
+                   void *ctx)
+{
+    nx_pt_destroy_slots(&ENV, root, NX_AS_USER_SLOT_FIRST, NX_AS_USER_SLOT_LAST, leaf, ctx);
+    nx_page_free(root);
+    tables_allocated--;
+}
+
+uint64_t nx_vmm_tables(void)
+{
+    return tables_allocated;
 }
 
 void *nx_vmm_map_mmio(uint64_t phys)

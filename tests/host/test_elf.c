@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "elf_plan.h"
+#include <nanox/elf_plan.h>
 #include "test.h"
 
 struct seg {

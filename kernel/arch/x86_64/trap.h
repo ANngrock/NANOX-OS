@@ -28,6 +28,7 @@ _Static_assert(sizeof(struct nx_trap_frame) == 22 * 8, "trap frame size");
 #define NX_VEC_PF 14
 #define NX_VEC_PIC_BASE 0x20    /* legacy 8259 remapped here, all masked */
 #define NX_VEC_TIMER 0x40       /* local APIC timer */
+#define NX_VEC_SYSCALL 0x80     /* int $0x80 from user mode (DPL 3 gate) */
 #define NX_VEC_SPURIOUS 0xFF    /* local APIC spurious vector */
 
 /* IST slots (TSS.ist[n-1]). */
@@ -35,7 +36,19 @@ _Static_assert(sizeof(struct nx_trap_frame) == 22 * 8, "trap frame size");
 #define NX_IST_NMI 2
 #define NX_IST_MC 3
 
+#define NX_SEL_KCODE 0x08
+#define NX_SEL_KDATA 0x10
+#define NX_SEL_UDATA 0x1B /* 0x18 | RPL 3 */
+#define NX_SEL_UCODE 0x23 /* 0x20 | RPL 3 */
+
 void nx_gdt_init(void);
+void nx_tss_set_rsp0(uint64_t rsp0);
+/* Pops a trap frame and returns with iretq (isr.S); used as the first
+ * "return address" of a new user task. */
+extern char nx_trap_return[];
+/* Saves callee-saved registers and RFLAGS on the current stack, stores RSP
+ * in *save_rsp, loads next_rsp and restores the same set from there. */
+void nx_ctx_switch(uint64_t *save_rsp, uint64_t next_rsp);
 void nx_idt_init(void);
 /* Called from isr_common with interrupts disabled. */
 void nx_trap_dispatch(struct nx_trap_frame *f);
