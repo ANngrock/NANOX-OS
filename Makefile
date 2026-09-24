@@ -100,7 +100,8 @@ HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_sha256.c tests/host/test_elf.c tests/host/test_mmap.c \
     kernel/bootinfo_check.c boot/uefi/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c
 
-$(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h $(wildcard abi/nanox/*.h)
+$(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
+    $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h boot/uefi/*.h)
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_TEST_SRCS)
 
