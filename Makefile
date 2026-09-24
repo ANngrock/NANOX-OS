@@ -70,15 +70,18 @@ USER_LDFLAGS := -nostdlib -static --build-id=none -z max-page-size=4096 \
 USER_RT_OBJS := $(BUILD)/user/user/rt/start.o $(BUILD)/user/user/rt/rt.o \
     $(BUILD)/user/lib/string.o
 USER_PROGS := hello spin ipc-send ipc-recv load core
+# M5: crypto, X.509 and TLS 1.3 (pure code: bin/core and the host tests).
+CRYPTO_SRCS := lib/crypto/sha512.c lib/crypto/hash.c lib/crypto/drbg.c lib/crypto/aes.c \
+    lib/crypto/chacha.c lib/crypto/x25519.c lib/crypto/bn.c lib/crypto/rsa.c lib/crypto/ecdsa.c \
+    lib/tls/x509.c lib/tls/tls13.c
 USER_ELFS := $(patsubst %,$(BUILD)/user/bin/%,$(USER_PROGS))
 # bin/core (M3): the Cognitive Core executor, several sources.
 CORE_OBJS := $(BUILD)/user/user/core/core.o $(BUILD)/user/user/core/nci.o \
     $(BUILD)/user/user/core/engine.o $(BUILD)/user/user/core/persist.o \
     $(BUILD)/user/lib/store.o $(BUILD)/user/lib/crc32.o \
-    $(BUILD)/user/user/core/m5net.o \
+    $(BUILD)/user/user/core/m5net.o $(BUILD)/user/user/core/m5tls.o \
     $(BUILD)/user/lib/net/nerr.o $(BUILD)/user/lib/net/net.o $(BUILD)/user/lib/net/tcp.o \
-    $(BUILD)/user/lib/sha256.o $(BUILD)/user/lib/crypto/sha512.o $(BUILD)/user/lib/crypto/hash.o \
-    $(BUILD)/user/lib/crypto/drbg.o
+    $(BUILD)/user/lib/sha256.o $(patsubst %.c,$(BUILD)/user/%.o,$(CRYPTO_SRCS))
 
 LOADER_EFI := $(OUT)/BOOTX64.EFI
 KERNEL_ELF := $(OUT)/kernel.elf
@@ -166,15 +169,15 @@ HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_initramfs.c tests/host/test_pt.c tests/host/test_pmm.c \
     tests/host/test_handle.c tests/host/test_ipc.c tests/host/test_event.c \
     tests/host/test_nci.c tests/host/test_engine.c tests/host/test_store.c \
-    tests/host/test_net.c \
+    tests/host/test_net.c tests/host/test_crypto.c \
     kernel/bootinfo_check.c kernel/initramfs.c kernel/mm/pt.c kernel/mm/pmm.c \
     kernel/obj/handle.c kernel/obj/ipc.c kernel/obj/event.c user/core/nci.c user/core/engine.c \
     lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c lib/store.c lib/crc32.c \
-    lib/net/nerr.c lib/net/net.c lib/net/tcp.c
+    lib/net/nerr.c lib/net/net.c lib/net/tcp.c $(CRYPTO_SRCS)
 
 $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
     $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h kernel/mm/*.h kernel/obj/*.h \
-        boot/uefi/*.h user/core/*.h lib/net/*.h)
+        boot/uefi/*.h user/core/*.h lib/net/*.h tests/host/*.h)
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_TEST_SRCS)
 
@@ -187,7 +190,13 @@ $(OUT)/host/storetool: tests/host/storetool.c lib/store.c lib/crc32.c lib/includ
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/host/storetool.c lib/store.c lib/crc32.c
 
-py-test: all $(OUT)/host/storetool
+# M5: the TLS client as a host tool, for interoperability tests with OpenSSL.
+$(OUT)/host/tlstool: tests/host/tlstool.c $(CRYPTO_SRCS) lib/net/nerr.c \
+    $(wildcard lib/include/nanox/*.h)
+	@mkdir -p $(@D)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/host/tlstool.c $(CRYPTO_SRCS) lib/sha256.c lib/net/nerr.c
+
+py-test: all $(OUT)/host/storetool $(OUT)/host/tlstool
 	$(PYTHON) -m unittest discover -s tests/host -p 'test_*.py' -v
 
 # All scenarios, then repeatability: the normal boot and the page-fault crash

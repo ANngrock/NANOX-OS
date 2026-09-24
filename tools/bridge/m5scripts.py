@@ -9,6 +9,9 @@ what those services saw independently.
 
   m5-net         criterion 1: link, ARP, ICMP, DNS, TCP, diagnostics,
                  link down and back up through QMP
+  m5-tls         criterion 2: entropy/CSPRNG, TLS 1.3 with both cipher
+                 suites and both key types against OpenSSL, certificate
+                 verification failures classified as tls
 """
 
 import socket
@@ -86,4 +89,39 @@ def run_net_lossy(ctx):
     return run_net(ctx)
 
 
-SCRIPTS = {"m5-net": run_net, "m5-net-loss": run_net_lossy}
+def run_tls(ctx):
+    c, call, m5 = Checks(), Caller(ctx["client"], "t"), ctx["carry"]["m5"]
+    tls = m5.tls
+    r = call("rng.status")
+    c.expect(r.ok and r.get("health") == "ok" and r.get("drbg") == "hmac-sha256", "rng",
+             describe(r))
+    name = "provider.nanox.test"
+    for suites, suite in ((1, "TLS_AES_128_GCM_SHA256"), (2, "TLS_CHACHA20_POLY1305_SHA256")):
+        r = call("tls.probe", host=name, port=tls["ec-leaf"].port, suites=suites)
+        c.expect(r.ok and r.get("suite") == suite and r.get("sig") == "ecdsa_secp256r1_sha256" and
+                 r.get("depth") == "2" and r.get("verify") == "ok", "tls_ec_%d" % suites,
+                 describe(r))
+    c.expect(tls["ec-leaf"].lines == ["hello", "hello"] and
+             tls["ec-leaf"].ciphers == ["TLS_AES_128_GCM_SHA256", "TLS_CHACHA20_POLY1305_SHA256"],
+             "tls_ec_server_view", "OpenSSL saw %s %s" % (tls["ec-leaf"].lines,
+                                                          tls["ec-leaf"].ciphers))
+    r = call("tls.probe", host=name, port=tls["rsa-chain"].port)
+    c.expect(r.ok and r.get("sig") == "rsa_pss_rsae_sha256" and r.get("chain") == "2" and
+             r.get("depth") == "3", "tls_rsa_chain", describe(r))
+    r = call("tls.probe", host="api.nanox.test", port=tls["rsa-chain"].port)
+    c.expect(r.state == "FAILED" and r.get("detail") == "dns_notfound", "tls_dns_first",
+             describe(r))
+    for prof, detail, openssl in (("expired", "cert_expired", "certificate expired"),
+                                  ("wrong-name", "cert_name", "bad certificate"),
+                                  ("untrusted", "cert_untrusted", "unknown ca")):
+        r = call("tls.probe", host=name, port=tls[prof].port)
+        c.expect(r.state == "FAILED" and r.get("detail") == detail and r.get("class") == "tls" and
+                 r.get("code") == "TLS_ERROR", "tls_" + prof, describe(r))
+        c.expect(any(openssl in e.lower() for e in tls[prof].errors), "tls_%s_alert" % prof,
+                 "OpenSSL did not see the alert %r: %s" % (openssl, tls[prof].errors))
+        c.expect(not tls[prof].lines, "tls_%s_no_data" % prof,
+                 "application data went over a refused connection")
+    return c.problems
+
+
+SCRIPTS = {"m5-net": run_net, "m5-net-loss": run_net_lossy, "m5-tls": run_tls}

@@ -42,6 +42,31 @@ int m5_random(void *buf, uint32_t len);
  * 0 absent (out = def or ""). */
 int m5_cfg(const char *key, char *out, uint32_t cap, const char *def);
 
+/* ---- m5tls.c: one TLS connection over the guest's TCP ---- */
+
+struct m5_conn_info {
+    uint32_t ip;
+    uint16_t suite, sig;
+    uint32_t chain, depth, connect_ms, handshake_ms;
+    char detail[48];
+};
+extern struct m5_conn_info m5_conn;
+
+/* Trust anchors from the store (tls/anchor0..3), loaded once. */
+uint32_t m5_anchor_count(void);
+/* DNS + TCP + TLS 1.3 to host:port (closes a previous connection):
+ * NXE_OK or the classified failure. */
+int m5_tls_open(const char *host, uint16_t port, uint32_t suites, uint32_t timeout_ms);
+int m5_tls_is_open(void);
+int m5_tls_write(const void *buf, uint32_t len);
+/* as tls_read */
+int m5_tls_read(void *buf, uint32_t cap, uint32_t timeout_ms);
+void m5_tls_close(int graceful);
+/* Bytes written on the connection the peer has not acknowledged yet. */
+uint32_t m5_tls_unacked(void);
+int net_link_ok(void);
+op_fn m5_tls_op(const char *op);
+
 /* Fails the action with the class and name of an M5 error:
  * "FAILED code=<CLASS>_ERROR detail=<name> class=<class>". */
 void m5_fail(struct eng_action *a, struct nci_buf *b, int err, const char *effects);

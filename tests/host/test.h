@@ -41,5 +41,6 @@ void test_nci(void);
 void test_engine(void);
 void test_store(const char *data_image);
 void test_net(void);
+void test_crypto(void);
 
 #endif

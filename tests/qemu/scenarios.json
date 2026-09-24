@@ -1070,6 +1070,39 @@
           "^NANOX: m5 net=virtio-net link=up loss_rx=5 loss_tx=7 "
         ]
       }
+    },
+    {
+      "name": "m5-tls",
+      "description": "M5 criterion 2: CSPRNG from virtio-rng, TLS 1.3 over the guest's TCP against OpenSSL (AES-GCM and ChaCha20, ECDSA and RSA-PSS, intermediate), certificate verification failures (expired, wrong name, unknown CA) classified as tls",
+      "image": {
+        "cmdline": "nanox.test=m5-serve"
+      },
+      "timeout_s": 240,
+      "m5": {
+        "tls": [
+          "ec-leaf",
+          "rsa-chain",
+          "expired",
+          "wrong-name",
+          "untrusted"
+        ],
+        "anchors": [
+          "ec-leaf",
+          "rsa-chain"
+        ]
+      },
+      "bridge": {
+        "script": "m5-tls"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        },
+        "patterns": [
+          "^NANOX: USER core#4: tls anchors=2 "
+        ]
+      }
     }
   ]
 }

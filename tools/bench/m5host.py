@@ -23,9 +23,31 @@ import threading
 import time
 from pathlib import Path
 
+import ssl
+
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE.parents[0] / "store"))
+sys.path.insert(0, str(HERE.parents[0] / "net"))
 import nxstore  # noqa: E402
+import pki  # noqa: E402
+
+PKI_DIR = REPO / "out" / "m5-pki"
+
+
+def pki_dir(profile):
+    """Certificates and key of a test-PKI profile (tools/net/pki.py), cached."""
+    return pki.write(profile, PKI_DIR / profile)
+
+
+def server_context(profile):
+    """OpenSSL (Python ssl) server context: TLS 1.3 only, the profile's
+    certificate chain and key."""
+    d = pki_dir(profile)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_cert_chain(str(d / "chain.pem"), str(d / "key.pem"))
+    return ctx
 
 GUEST_HOST_ALIAS = "10.0.2.2"
 
@@ -131,6 +153,62 @@ class EchoServer:
         self.sock.close()
 
 
+class TlsEchoServer:
+    """TLS 1.3 (OpenSSL) with a test-PKI profile; echoes lines, answers
+    close_notify.  Handshake failures are recorded (OpenSSL's view)."""
+
+    def __init__(self, profile):
+        self.profile = profile
+        self.ctx = server_context(profile)
+        self.errors, self.lines, self.ciphers = [], [], []
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.stop = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _serve(self, raw):
+        raw.settimeout(30)
+        try:
+            s = self.ctx.wrap_socket(raw, server_side=True)
+            self.ciphers.append(s.cipher()[0])
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0]
+            self.lines.append(line.decode("ascii", "replace"))
+            s.sendall(line + b"\n")
+            try:
+                s = s.unwrap()
+            except (ssl.SSLError, OSError):
+                pass
+            s.close()
+        except (ssl.SSLError, OSError) as e:
+            self.errors.append(str(e))
+        finally:
+            raw.close()
+
+    def _run(self):
+        self.sock.settimeout(0.2)
+        while not self.stop:
+            try:
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def close(self):
+        self.stop = True
+        self.sock.close()
+
+
 class Qmp:
     """Minimal QMP client: the monitor socket QEMU listens on (server=on,
     wait=off); the harness connects when a script needs it."""
@@ -199,6 +277,9 @@ class Services:
                  provider.nanox.test -> 10.0.2.2)
       config     extra cfg/<key> values for the guest
       echo       true: start the TCP echo server
+      tls        test-PKI profiles to serve with TLS echo servers
+      anchors    profiles whose root certificates are provisioned as
+                 trust anchors (tls/anchor0, ...)
     """
 
     def __init__(self, spec, run_dir):
@@ -207,6 +288,7 @@ class Services:
         records = self.spec.get("dns", {"provider.nanox.test": GUEST_HOST_ALIAS})
         self.dns = DnsServer(records)
         self.echo = EchoServer() if self.spec.get("echo", True) else None
+        self.tls = {p: TlsEchoServer(p) for p in self.spec.get("tls", [])}
         self.qmp_dir = None
         self.qmp_path = None
         self.qmp = None
@@ -227,6 +309,9 @@ class Services:
     def objects(self):
         objs = [("cfg/" + k, nxstore.KIND_CONFIG, str(v).encode("ascii"))
                 for k, v in sorted(self.config().items())]
+        for i, prof in enumerate(self.spec.get("anchors", [])):
+            objs.append(("tls/anchor%d" % i, nxstore.KIND_ANCHOR,
+                         (pki_dir(prof) / "anchor.der").read_bytes()))
         return objs
 
     def provision(self, path):
@@ -240,12 +325,16 @@ class Services:
                 "echo_port": self.echo.port if self.echo else None,
                 "echo_lines": list(self.echo.lines) if self.echo else [],
                 "config": self.config(),
+                "tls": {p: {"port": t.port, "lines": list(t.lines), "ciphers": list(t.ciphers),
+                            "errors": list(t.errors)} for p, t in self.tls.items()},
                 "qmp": self.qmp.log if self.qmp else []}
 
     def close(self):
         self.dns.close()
         if self.echo:
             self.echo.close()
+        for t in self.tls.values():
+            t.close()
         if self.qmp:
             self.qmp.close()
         if self.provider:
