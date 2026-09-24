@@ -76,6 +76,71 @@ class ClassifyTest(unittest.TestCase):
                              ("FAIL", "unexpected_exit"))
 
 
+EXC_REPORT = ("NANOX: EXCEPTION #PF vector=14 error=0x2 rip=0x0000000000201000 "
+              "cr2=0x00000000dead0000\n"
+              "NANOX: BACKTRACE 0 0x0000000000201000\n"
+              "NANOX: BACKTRACE 1 0x0000000000200105\n"
+              "NANOX: PANIC unhandled #PF at rip=0x0000000000201000\n")
+
+
+class FakeSymbolizer:
+    def describe(self, addr):
+        if 0x201000 <= addr < 0x201100:
+            return "nx_fault_pagefault+0x%x" % (addr - 0x201000)
+        if 0x200100 <= addr < 0x200200:
+            return "kernel_main+0x%x" % (addr - 0x200100)
+        return None
+
+
+class ExceptionClassTest(unittest.TestCase):
+    def test_exception_exit_code(self):
+        r = harness.classify(BOOT + EXC_REPORT, 41, False)
+        self.assertEqual((r["verdict"], r["failure_class"]), ("FAIL", "exception"))
+        r = harness.classify(BOOT + "NANOX: PANIC x\n", 41, False)
+        self.assertEqual(r["failure_class"], "inconsistent")
+        r = harness.classify(BOOT + EXC_REPORT + "NANOX: TEST PASS\n", 33, False)
+        self.assertEqual(r["failure_class"], "inconsistent")
+
+    def test_report_parsing_and_symbols(self):
+        rep = harness.analyze_report(BOOT + EXC_REPORT, FakeSymbolizer())
+        exc = rep["exception"]
+        self.assertEqual((exc["mnemonic"], exc["vector"], exc["error"]), ("#PF", 14, 2))
+        self.assertEqual(exc["rip_symbol"], "nx_fault_pagefault+0x0")
+        # frame 0 is the faulting RIP; return addresses are looked up at addr - 1
+        self.assertEqual([f["symbol"] for f in rep["backtrace"]],
+                         ["nx_fault_pagefault+0x0", "kernel_main+0x4"])
+
+    def test_exception_expectations(self):
+        outcome = harness.classify(BOOT + EXC_REPORT, 41, False)
+        rep = harness.analyze_report(BOOT + EXC_REPORT, FakeSymbolizer())
+        good = {"verdict": "FAIL", "failure_class": "exception",
+                "exception": {"mnemonic": "#PF", "vector": 14, "error": 2, "cr2": "0xdead0000",
+                              "rip_function": "nx_fault_pagefault"},
+                "backtrace_functions": ["kernel_main"]}
+        self.assertEqual(harness.check_expectation(outcome, good, EXC_REPORT, {}, rep), [])
+        for key, bad in (("error", 3), ("cr2", "0xdead1000"), ("rip_function", "other"),
+                         ("cr2_is_rip", True)):
+            exp = dict(good, exception=dict(good["exception"], **{key: bad}))
+            self.assertEqual(len(harness.check_expectation(outcome, exp, EXC_REPORT, {}, rep)), 1,
+                             key)
+        exp = dict(good, backtrace_functions=["run_mode"])
+        self.assertEqual(len(harness.check_expectation(outcome, exp, EXC_REPORT, {}, rep)), 1)
+        self.assertEqual(len(harness.check_expectation(outcome, good, "", {}, None)), 2)
+
+
+class SymbolizerTest(unittest.TestCase):
+    def test_kernel_symbols(self):
+        import elfsym
+        kernel = REPO / "out" / "kernel.elf"
+        self.assertTrue(kernel.is_file(), "run make first")
+        sym = elfsym.Symbolizer(kernel)
+        start = sym.lookup(0x200000)
+        self.assertEqual(start, ("_start", 0))
+        names = {sym.describe(a) for a in range(0x200000, 0x200400, 4)}
+        self.assertTrue(any(n and n.startswith("kernel_main+") for n in names))
+        self.assertIsNone(sym.lookup(0x100))  # below the image; absolute symbols ignored
+
+
 class ExpectationTest(unittest.TestCase):
     def test_expectation_mismatch_reported(self):
         outcome = harness.classify(BOOT + "NANOX: TEST PASS\n", 33, False)
@@ -96,7 +161,10 @@ class ExpectationTest(unittest.TestCase):
 class ScenarioFileTest(unittest.TestCase):
     def test_required_scenarios_present(self):
         names = {s["name"] for s in harness.load_scenarios()}
-        for required in ("normal", "fail", "panic", "hang", "missing-kernel", "corrupt-kernel"):
+        for required in ("normal", "fail", "panic", "hang", "missing-kernel", "corrupt-kernel",
+                         "missing-initrd", "corrupt-initrd", "bad-initrd", "pagefault",
+                         "nullderef", "wprotect", "nxexec", "stackoverflow", "ud", "gp",
+                         "divzero", "doublefree"):
             self.assertIn(required, names)
 
 

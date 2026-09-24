@@ -32,5 +32,7 @@ void test_sha256(void);
 void test_elf(const char *kernel_path);
 void test_mmap(void);
 void test_initramfs(const char *initrd_path);
+void test_pt(void);
+void test_pmm(void);
 
 #endif

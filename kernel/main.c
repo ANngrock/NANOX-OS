@@ -1,15 +1,18 @@
 /*
- * NANOX kernel, M0 bench build.
+ * NANOX kernel (M1).
  *
- * In M0 the kernel only proves the boot contract: it validates the boot info
- * handed over by the loader, reports it on the serial port and finishes with
- * a verdict through isa-debug-exit.  The command line selects the scenario
- * used by the headless harness (docs/m0-bench.md):
+ * Boot sequence: own GDT/TSS/IDT, boot info validation, physical allocator,
+ * own page tables (CR3 switch), reclaim of boot memory, initramfs check,
+ * self-tests, then the scenario selected with nanox.test= on the command
+ * line (docs/m0-bench.md, docs/m1-kernel.md):
  *
- *   (none) / nanox.test=pass   boot-info self check, then TEST PASS
- *   nanox.test=fail            deliberate TEST FAIL
- *   nanox.test=panic           deliberate kernel panic
- *   nanox.test=hang            halt forever; the harness must time out
+ *   (none) / pass   self-tests, then TEST PASS
+ *   fail            deliberate TEST FAIL
+ *   panic           deliberate kernel panic
+ *   hang            halt forever; the harness must time out
+ *   ud, gp, divzero, pagefault, nullderef, wprotect, nxexec, stackoverflow
+ *                   deliberate CPU exceptions (kernel/faults.c)
+ *   doublefree      the page allocator must reject a double free (panic)
  */
 #include <stdint.h>
 
@@ -20,13 +23,15 @@
 #include <nanox/sha256.h>
 #include <nanox/string.h>
 
+#include "arch/x86_64/cpu.h"
+#include "arch/x86_64/trap.h"
 #include "bootinfo_check.h"
+#include "faults.h"
 #include "initramfs.h"
 #include "kernel.h"
+#include "mm/mm.h"
 
-enum test_mode { MODE_PASS, MODE_FAIL, MODE_PANIC, MODE_HANG, MODE_UNKNOWN };
-
-/* M0 runs on the UEFI identity mapping: physical == virtual. */
+/* M0/M1 early boot runs on the UEFI identity mapping: physical == virtual. */
 static const void *identity_map(void *opaque, uint64_t phys, uint64_t len)
 {
     (void)opaque;
@@ -35,19 +40,61 @@ static const void *identity_map(void *opaque, uint64_t phys, uint64_t len)
     return (const void *)(uintptr_t)phys;
 }
 
+enum mode_kind { K_PASS, K_FAIL, K_PANIC, K_HANG, K_FAULT };
+
+struct test_mode {
+    const char *name;
+    enum mode_kind kind;
+    void (*fault)(void);
+};
+
+static void fault_nullderef(void)
+{
+    (void)nx_fault_nullderef();
+}
+
+static void fault_stack_overflow(void)
+{
+    (void)nx_fault_stack_overflow(0);
+}
+
+/* Frees the same page twice: the allocator must refuse and the kernel panic. */
+static void fault_double_free(void)
+{
+    uint64_t p = nx_page_alloc();
+    nx_page_free(p);
+    nx_page_free(p);
+}
+
+/* nanox.test=<name> values (docs/m0-bench.md, docs/m1-kernel.md). */
+static const struct test_mode MODES[] = {
+    {"pass", K_PASS, 0},
+    {"fail", K_FAIL, 0},
+    {"panic", K_PANIC, 0},
+    {"hang", K_HANG, 0},
+    {"ud", K_FAULT, nx_fault_ud},
+    {"gp", K_FAULT, nx_fault_gp},
+    {"divzero", K_FAULT, nx_fault_divzero},
+    {"pagefault", K_FAULT, nx_fault_pagefault},
+    {"nullderef", K_FAULT, fault_nullderef},
+    {"wprotect", K_FAULT, nx_fault_wprotect},
+    {"nxexec", K_FAULT, nx_fault_nxexec},
+    {"stackoverflow", K_FAULT, fault_stack_overflow},
+    {"doublefree", K_FAULT, fault_double_free},
+};
+
 static int token_eq(const char *tok, uint32_t len, const char *lit)
 {
     uint32_t n = (uint32_t)nx_strlen(lit);
     return len == n && memcmp(tok, lit, n) == 0;
 }
 
-/* Finds "nanox.test=<value>"; the last occurrence wins. */
-static enum test_mode parse_mode(const char *cl, uint32_t len, const char **val, uint32_t *vlen)
+/* Finds "nanox.test=<value>" (the last occurrence wins); NULL if unknown. */
+static const struct test_mode *parse_mode(const char *cl, uint32_t len, uint32_t *vlen)
 {
     static const char key[] = "nanox.test=";
     const uint32_t klen = sizeof(key) - 1;
-    enum test_mode mode = MODE_PASS;
-    *val = "pass";
+    const struct test_mode *mode = &MODES[0];
     *vlen = 4;
     uint32_t i = 0;
     while (i < len) {
@@ -61,18 +108,11 @@ static enum test_mode parse_mode(const char *cl, uint32_t len, const char **val,
             continue;
         const char *v = cl + start + klen;
         uint32_t n = tlen - klen;
-        *val = v;
         *vlen = n;
-        if (token_eq(v, n, "pass"))
-            mode = MODE_PASS;
-        else if (token_eq(v, n, "fail"))
-            mode = MODE_FAIL;
-        else if (token_eq(v, n, "panic"))
-            mode = MODE_PANIC;
-        else if (token_eq(v, n, "hang"))
-            mode = MODE_HANG;
-        else
-            mode = MODE_UNKNOWN;
+        mode = 0;
+        for (unsigned m = 0; m < sizeof(MODES) / sizeof(MODES[0]); m++)
+            if (token_eq(v, n, MODES[m].name))
+                mode = &MODES[m];
     }
     return mode;
 }
@@ -129,7 +169,7 @@ static void check_initramfs(const struct nx_boot_info *bi)
 {
     if (bi->version_minor < 1 || !(bi->flags & NX_BI_HAS_INITRD))
         nx_panic("initramfs missing from boot info");
-    const uint8_t *base = (const uint8_t *)(uintptr_t)bi->initrd_phys;
+    const uint8_t *base = nx_phys_to_virt(bi->initrd_phys);
     uint8_t digest[NX_SHA256_DIGEST_SIZE];
     nx_sha256(base, bi->initrd_size, digest);
     if (memcmp(digest, bi->initrd_sha256, sizeof(digest)) != 0)
@@ -152,10 +192,139 @@ static void check_initramfs(const struct nx_boot_info *bi)
     nx_printf("\"\n");
 }
 
-__attribute__((noreturn)) void kernel_main(const struct nx_boot_info *bi)
+/* Fails the run with a TEST FAIL verdict. */
+__attribute__((noreturn)) static void test_fail(const char *why)
 {
+    nx_printf("NANOX: TEST FAIL %s\n", why);
+    nx_debug_exit(NX_EXIT_TEST_FAIL);
+}
+
+/* The exception path must also return: #BP is handled and resumed. */
+static void selftest_breakpoint(void)
+{
+    uint64_t before = nx_breakpoint_count;
+    __asm__ volatile("int3");
+    __asm__ volatile("int3");
+    if (nx_breakpoint_count != before + 2)
+        test_fail("selftest breakpoint: #BP handler did not resume");
+    nx_printf("NANOX: selftest breakpoint ok resumed=%" NX_PRIu64 "\n", nx_breakpoint_count);
+}
+
+static int region_type_of(const struct nx_mem_region *rg, uint32_t n, uint64_t phys)
+{
+    for (uint32_t i = 0; i < n; i++)
+        if (phys >= rg[i].base && phys - rg[i].base < rg[i].length)
+            return (int)rg[i].type;
+    return -1;
+}
+
+/* Allocates pages, checks where they come from and that they do not alias,
+ * frees them again and exercises the allocator's error paths. */
+static void selftest_pmm(const struct nx_mem_region *rg, uint32_t n)
+{
+    enum { N = 256 };
+    static uint64_t pages[N];
+    uint64_t free_before = nx_pmm.free_pages;
+    for (unsigned i = 0; i < N; i++) {
+        uint64_t p = nx_page_alloc();
+        int t = region_type_of(rg, n, p);
+        if ((p & 0xFFF) || p < NX_PMM_MIN_PHYS ||
+            (t != NX_MEM_USABLE && t != NX_MEM_BOOT_RECLAIMABLE && t != NX_MEM_KERNEL_STACK))
+            test_fail("selftest pmm: page outside allocatable memory");
+        for (unsigned j = 0; j < i; j++)
+            if (pages[j] == p)
+                test_fail("selftest pmm: page handed out twice");
+        uint64_t *v = nx_phys_to_virt(p);
+        v[0] = p ^ 0x4E414E4F58504D4Dull;
+        v[511] = ~p;
+        pages[i] = p;
+    }
+    for (unsigned i = 0; i < N; i++) {
+        const uint64_t *v = nx_phys_to_virt(pages[i]);
+        if (v[0] != (pages[i] ^ 0x4E414E4F58504D4Dull) || v[511] != ~pages[i])
+            test_fail("selftest pmm: page contents changed (aliasing)");
+    }
+    for (unsigned i = 0; i < N; i++)
+        nx_page_free(pages[i]);
+    if (nx_pmm.free_pages != free_before)
+        test_fail("selftest pmm: free count not restored");
+    uint64_t p = nx_page_alloc();
+    nx_page_free(p);
+    if (nx_pmm_free(&nx_pmm, p) != NX_PMM_E_DOUBLE_FREE ||
+        nx_pmm_free(&nx_pmm, (uint64_t)(uintptr_t)__kernel_start) != NX_PMM_E_UNMANAGED ||
+        nx_pmm_free(&nx_pmm, p + 8) != NX_PMM_E_ALIGN)
+        test_fail("selftest pmm: invalid free not rejected");
+    nx_printf("NANOX: selftest pmm ok pages=%u free=%" NX_PRIu64
+              " double_free=rejected unmanaged=rejected\n",
+              (unsigned)N, nx_pmm.free_pages);
+}
+
+/* Maps a fresh page at a scratch address, checks the translation and the
+ * data through both aliases, unmaps it and checks that it is gone. */
+static void selftest_vmm(void)
+{
+    uint64_t p = nx_page_alloc(), pa, flags, size;
+    if (nx_vmm_map_page(NX_VMM_SELFTEST_VA, p, NX_PTE_W | NX_PTE_NX | NX_PTE_G) != NX_PT_OK)
+        test_fail("selftest vmm: map failed");
+    *(volatile uint64_t *)NX_VMM_SELFTEST_VA = 0x56414C4944415445ull;
+    if (*(volatile uint64_t *)nx_phys_to_virt(p) != 0x56414C4944415445ull)
+        test_fail("selftest vmm: scratch page does not alias its physmap window");
+    if (nx_vmm_query(NX_VMM_SELFTEST_VA, &pa, &flags, &size) != NX_PT_OK || pa != p ||
+        size != NX_PAGE_4K || !(flags & NX_PTE_W) || !(flags & NX_PTE_NX))
+        test_fail("selftest vmm: query mismatch");
+    if (nx_vmm_unmap_page(NX_VMM_SELFTEST_VA, &pa) != NX_PT_OK || pa != p ||
+        nx_vmm_query(NX_VMM_SELFTEST_VA, &pa, &flags, &size) != NX_PT_E_NOT_MAPPED)
+        test_fail("selftest vmm: unmap failed");
+    nx_page_free(p);
+    nx_printf("NANOX: selftest vmm ok va=0x%016" NX_PRIx64 " pa=0x%" NX_PRIx64 "\n",
+              NX_VMM_SELFTEST_VA, p);
+}
+
+/* After the switch nothing uses firmware boot-services memory or the
+ * loader's stack any more: hand them to the allocator. */
+static void reclaim_boot_memory(const struct nx_mem_region *rg, uint32_t n)
+{
+    uint64_t boot, stack;
+    nx_pmm_add_type(&nx_pmm, rg, n, NX_MEM_BOOT_RECLAIMABLE, &boot);
+    nx_pmm_add_type(&nx_pmm, rg, n, NX_MEM_KERNEL_STACK, &stack);
+    nx_printf("NANOX: pmm reclaimed boot_reclaimable=%" NX_PRIu64 " loader_stack=%" NX_PRIu64
+              " pages free=%" NX_PRIu64 "\n",
+              boot, stack, nx_pmm.free_pages);
+}
+
+__attribute__((noreturn)) static void run_mode(const struct test_mode *mode, uint32_t vlen)
+{
+    if (!mode) {
+        nx_printf("NANOX: TEST FAIL unknown nanox.test value (%u bytes)\n", vlen);
+        nx_debug_exit(NX_EXIT_TEST_FAIL);
+    }
+    switch (mode->kind) {
+    case K_PASS: nx_printf("NANOX: TEST PASS\n"); nx_debug_exit(NX_EXIT_TEST_PASS);
+    case K_FAIL: test_fail("requested by nanox.test=fail");
+    case K_PANIC: nx_panic("requested by nanox.test=panic");
+    case K_HANG:
+        nx_printf("NANOX: test hang: halting with interrupts disabled\n");
+        for (;;)
+            __asm__ volatile("cli; hlt");
+    case K_FAULT:
+        nx_printf("NANOX: test fault %s: expecting a failure report\n", mode->name);
+        mode->fault();
+        test_fail("deliberate fault did not trap");
+    }
+    test_fail("bad test mode");
+}
+
+__attribute__((noreturn)) void kernel_main(const struct nx_boot_info *boot_bi)
+{
+    const struct nx_boot_info *bi = boot_bi; /* identity-mapped until nx_vmm_init */
     nx_serial_init();
     nx_printf("NANOX: kernel_main bootinfo=%p\n", (const void *)bi);
+
+    /* Own descriptor tables first, so any later fault gets a report. */
+    nx_gdt_init();
+    nx_idt_init();
+    nx_printf("NANOX: cpu gdt+tss+idt loaded boot_stack=0x%" NX_PRIx64 "-0x%" NX_PRIx64 " ist=3\n",
+              (uint64_t)(uintptr_t)__boot_stack_bottom, (uint64_t)(uintptr_t)__boot_stack_top);
 
     struct nx_bi_check chk = {
         .map = identity_map,
@@ -168,31 +337,34 @@ __attribute__((noreturn)) void kernel_main(const struct nx_boot_info *bi)
     if (nx_bootinfo_check(&chk, &res) != NX_BI_OK)
         nx_panic("bootinfo invalid: %s index=%u", nx_bi_strerror(res.error), res.index);
 
-    /* The stack we are running on must be the one the boot info describes. */
-    uint64_t rsp;
-    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
-    if (rsp < bi->stack_phys_base || rsp > bi->stack_phys_base + bi->stack_size)
-        nx_panic("running stack 0x%" NX_PRIx64 " outside boot-info stack region", rsp);
+    /* The loader must have entered with RSP at the top of its stack region;
+     * _start then switched to the kernel's own stack. */
+    if (nx_boot_entry_rsp != bi->stack_phys_base + bi->stack_size)
+        nx_panic("entry RSP 0x%" NX_PRIx64 " is not the top of the boot-info stack",
+                 nx_boot_entry_rsp);
+    uint64_t rsp = nx_read_rsp();
+    if (rsp <= (uint64_t)(uintptr_t)__boot_stack_bottom ||
+        rsp > (uint64_t)(uintptr_t)__boot_stack_top)
+        nx_panic("not running on the kernel boot stack (rsp=0x%" NX_PRIx64 ")", rsp);
 
     report(&res);
-    check_initramfs(bi);
 
-    const char *cl = (const char *)(uintptr_t)bi->cmdline_phys;
+    /* Own memory management: allocator, page tables, CR3 switch. */
+    uint64_t bi_phys = (uint64_t)(uintptr_t)boot_bi;
+    uint32_t nreg = bi->mmap_count;
+    nx_pmm_setup(res.regions, nreg);
+    nx_vmm_init(res.regions, nreg);
+    bi = nx_phys_to_virt(bi_phys); /* the identity mapping is gone now */
+    const struct nx_mem_region *rg = nx_phys_to_virt(bi->mmap_phys);
+    reclaim_boot_memory(rg, nreg);
+
+    check_initramfs(bi);
+    selftest_breakpoint();
+    selftest_pmm(rg, nreg);
+    selftest_vmm();
+
+    const char *cl = nx_phys_to_virt(bi->cmdline_phys);
     nx_printf("NANOX: cmdline \"%s\"\n", cl);
-    const char *val;
     uint32_t vlen;
-    switch (parse_mode(cl, bi->cmdline_len, &val, &vlen)) {
-    case MODE_PASS: nx_printf("NANOX: TEST PASS\n"); nx_debug_exit(NX_EXIT_TEST_PASS);
-    case MODE_FAIL:
-        nx_printf("NANOX: TEST FAIL requested by nanox.test=fail\n");
-        nx_debug_exit(NX_EXIT_TEST_FAIL);
-    case MODE_PANIC: nx_panic("requested by nanox.test=panic");
-    case MODE_HANG:
-        nx_printf("NANOX: test hang: halting with interrupts disabled\n");
-        for (;;)
-            __asm__ volatile("cli; hlt");
-    case MODE_UNKNOWN: break;
-    }
-    nx_printf("NANOX: TEST FAIL unknown nanox.test value (%u bytes)\n", vlen);
-    nx_debug_exit(NX_EXIT_TEST_FAIL);
+    run_mode(parse_mode(cl, bi->cmdline_len, &vlen), vlen);
 }

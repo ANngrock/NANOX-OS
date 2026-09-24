@@ -14,10 +14,14 @@ Guest verdict rules (both the serial marker and the exit status are required):
         "NANOX: loader exit_boot_services ok", "NANOX: kernel_main",
         "NANOX: bootinfo ok" (in this order), and no FAIL/PANIC/LOADER ERROR line
   FAIL  everything else, classified as test_fail (35 + TEST FAIL), panic
-        (37 + PANIC), loader_error (39 + LOADER ERROR), timeout (killed by the
-        harness), inconsistent (exit status and markers disagree) or
-        unexpected_exit (any other status, e.g. 0 after a triple fault with
-        -no-reboot)
+        (37 + PANIC), loader_error (39 + LOADER ERROR), exception (41 +
+        EXCEPTION report), timeout (killed by the harness), inconsistent (exit
+        status and markers disagree) or unexpected_exit (any other status, e.g.
+        0 after a triple fault with -no-reboot)
+
+Exception reports and BACKTRACE lines are parsed and symbolised with the
+symbol table of out/kernel.elf (tools/bench/elfsym.py) and stored in the run
+record.
 """
 
 import argparse
@@ -39,6 +43,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / "tools" / "image"))
 sys.path.insert(0, str(REPO / "tools"))
 import doctor  # noqa: E402
+import elfsym  # noqa: E402
 import mkimage  # noqa: E402
 import qemu  # noqa: E402
 
@@ -48,11 +53,14 @@ LOADER_EFI = OUT / "BOOTX64.EFI"
 KERNEL_ELF = OUT / "kernel.elf"
 INITRD = OUT / "initrd.img"
 
-EXIT_PASS, EXIT_FAIL, EXIT_PANIC, EXIT_LOADER = 33, 35, 37, 39
+EXIT_PASS, EXIT_FAIL, EXIT_PANIC, EXIT_LOADER, EXIT_EXCEPTION = 33, 35, 37, 39, 41
 PASS_SEQUENCE = ("NANOX: loader start", "NANOX: loader exit_boot_services ok",
                  "NANOX: kernel_main", "NANOX: bootinfo ok")
 ANSI_RE = re.compile(r"\x1b\[[0-9;=?]*[A-Za-z]")
 LOADER_ERROR_RE = re.compile(r"^NANOX: LOADER ERROR (E_[A-Z_]+) \((\d+)\)")
+EXCEPTION_RE = re.compile(r"^NANOX: EXCEPTION (\S+) vector=(\d+) error=0x([0-9a-f]+) "
+                          r"rip=0x([0-9a-f]+) cr2=0x([0-9a-f]+)$")
+BACKTRACE_RE = re.compile(r"^NANOX: BACKTRACE (\d+) 0x([0-9a-f]+)$")
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +78,7 @@ def classify(serial_text, exit_status, timed_out):
     passes = [i for i, l in enumerate(markers) if l == "NANOX: TEST PASS"]
     fails = [l for l in markers if l.startswith("NANOX: TEST FAIL")]
     panics = [l for l in markers if l.startswith("NANOX: PANIC")]
+    exceptions = [l for l in markers if l.startswith("NANOX: EXCEPTION")]
     loader_errors = [m for m in (LOADER_ERROR_RE.match(l) for l in markers) if m]
     loader_error = loader_errors[0].group(1) if loader_errors else None
 
@@ -80,7 +89,7 @@ def classify(serial_text, exit_status, timed_out):
     if timed_out:
         return result("FAIL", "timeout", "no exit before the harness timeout")
     if exit_status == EXIT_PASS:
-        if fails or panics or loader_errors:
+        if fails or panics or loader_errors or exceptions:
             return result("FAIL", "inconsistent", "exit 33 but failure markers present")
         if len(passes) != 1:
             return result("FAIL", "inconsistent",
@@ -107,15 +116,68 @@ def classify(serial_text, exit_status, timed_out):
         if loader_errors:
             return result("FAIL", "loader_error", loader_errors[0].string)
         return result("FAIL", "inconsistent", "exit 39 without 'NANOX: LOADER ERROR'")
+    if exit_status == EXIT_EXCEPTION:
+        if exceptions:
+            return result("FAIL", "exception", exceptions[0])
+        return result("FAIL", "inconsistent", "exit 41 without 'NANOX: EXCEPTION'")
     return result("FAIL", "unexpected_exit", "exit status %r" % (exit_status,))
 
 
-def check_expectation(outcome, expect, serial_text, substitutions):
+def analyze_report(serial_text, symbolizer=None):
+    """Parses the first exception report and the BACKTRACE lines.
+
+    Returns {"exception": {...} or None, "backtrace": [...]}.  Frame 0 of an
+    exception is the faulting RIP; other frames are return addresses and are
+    symbolised at address - 1 (the call instruction)."""
+    exception, backtrace = None, []
+    for line in serial_lines(serial_text):
+        m = EXCEPTION_RE.match(line)
+        if m and exception is None:
+            exception = {"mnemonic": m.group(1), "vector": int(m.group(2)),
+                         "error": int(m.group(3), 16), "rip": "0x" + m.group(4),
+                         "cr2": "0x" + m.group(5), "rip_symbol": None}
+            if symbolizer:
+                exception["rip_symbol"] = symbolizer.describe(int(m.group(4), 16))
+            continue
+        m = BACKTRACE_RE.match(line)
+        if m:
+            index, addr = int(m.group(1)), int(m.group(2), 16)
+            look = addr if (index == 0 and exception) else addr - 1
+            backtrace.append({"index": index, "addr": "0x%016x" % addr,
+                              "symbol": symbolizer.describe(look) if symbolizer else None})
+    return {"exception": exception, "backtrace": backtrace}
+
+
+def _function(symbol):
+    return symbol.split("+", 1)[0] if symbol else None
+
+
+def check_expectation(outcome, expect, serial_text, substitutions, report=None):
     """Returns a list of human-readable mismatches (empty = expectation met)."""
     problems = []
     for key in ("verdict", "failure_class", "loader_error"):
         if key in expect and outcome.get(key) != expect[key]:
             problems.append("%s: expected %r, got %r" % (key, expect[key], outcome.get(key)))
+    report = report or {"exception": None, "backtrace": []}
+    if "exception" in expect:
+        exc = report["exception"]
+        if exc is None:
+            problems.append("exception report expected, none parsed")
+        else:
+            for key, want in expect["exception"].items():
+                have = _function(exc["rip_symbol"]) if key == "rip_function" else exc.get(key)
+                if key == "cr2_is_rip":  # instruction fetch faults: CR2 is the RIP
+                    have = int(exc["cr2"], 16) == int(exc["rip"], 16)
+                if key == "cr2":
+                    have = int(exc["cr2"], 16)
+                    want = int(want, 16)
+                if have != want:
+                    problems.append("exception.%s: expected %r, got %r" % (key, want, have))
+    if "backtrace_functions" in expect:
+        have = [_function(f["symbol"]) for f in report["backtrace"]]
+        for fn in expect["backtrace_functions"]:
+            if fn not in have:
+                problems.append("backtrace lacks %s (have %s)" % (fn, have))
     text = "\n".join(serial_lines(serial_text))
     for pattern in expect.get("patterns", []):
         pattern = pattern.format(**substitutions)
@@ -242,7 +304,8 @@ def run_scenario(sc, runs_root, toolchain, echo=False):
     serial_text = serial_bytes.decode("utf-8", "replace")
     outcome = classify(serial_text, None if timed_out else exit_status, timed_out)
     subs = {"kernel_sha256": sha256_file(KERNEL_ELF), "initrd_sha256": sha256_file(INITRD)}
-    problems = check_expectation(outcome, sc["expect"], serial_text, subs)
+    report = analyze_report(serial_text, elfsym.Symbolizer(KERNEL_ELF))
+    problems = check_expectation(outcome, sc["expect"], serial_text, subs, report)
     record = {
         "schema": "nanox.run-record.v1",
         "scenario": sc["name"],
@@ -282,6 +345,8 @@ def run_scenario(sc, runs_root, toolchain, echo=False):
         "failure_class": outcome["failure_class"],
         "loader_error": outcome["loader_error"],
         "reason": outcome["reason"],
+        "exception": report["exception"],
+        "backtrace": report["backtrace"],
         "expected": sc["expect"],
         "expectation_met": not problems,
         "expectation_problems": problems,
