@@ -402,15 +402,17 @@ NANOX: USER core#4: tel ...   (раздел 9)
 Эталонная среда та же (Ubuntu 24.04, clang/lld 18.1.3, QEMU 8.2.2, TCG, без
 KVM). В рабочем дереве выполнено:
 
-- `make doctor && make && make test` — код выхода 0: host-тесты C
-  (PLACEHOLDER_HOST проверок, UBSan trap; из них сеть, криптография, JSON/HTTP/SSE/протокол
-  Messages), PLACEHOLDER_PY Python-тестов (в том числе совместимость TLS с
-  OpenSSL и тестовый provider с клиентом `http.client`), PLACEHOLDER_SC сценариев QEMU
-  с ожидаемыми вердиктами, повторяемость `normal`, `pagefault`, `m2-sched`;
+- `make doctor && make && make test` в локальном клоне ревизии `1270d55` —
+  код выхода 0: host-тесты C (2356 проверок, UBSan trap; из них сеть,
+  криптография, JSON/HTTP/SSE/протокол Messages), 114 Python-тестов (в том
+  числе совместимость TLS с OpenSSL и тестовый provider с клиентом
+  `http.client`), 54 сценария QEMU с ожидаемыми вердиктами (8 M0, 13 M1, 5
+  M2, 7 M3, 9 M4, 12 M5; серия `m4-crash` — 154 пары, 0 нарушений, 1
+  перезапуск точки), повторяемость `normal`, `pagefault`, `m2-sched`;
+  двенадцать сценариев M5 до этого дважды подряд в рабочем дереве — все с
+  ожидаемым вердиктом;
 - `make repro-check` — пять артефактов побайтово совпали в трёх сборках;
-- `make debug-check` — GDB остановился в `kernel_main`;
-- после публикации ветки: `make doctor && make && make test` в свежем
-  `git clone` — PLACEHOLDER_CLONE.
+- `make debug-check` — GDB остановился в `kernel_main`.
 
 Во время подготовки сценарии нашли: потерю SYN-ACK под slirp (тайм-аут
 соединения), тупик нулевого окна и медленное восстановление TCP при потере
