@@ -13,6 +13,7 @@
  *   ud, gp, divzero, pagefault, nullderef, wprotect, nxexec, stackoverflow
  *                   deliberate CPU exceptions (kernel/faults.c)
  *   doublefree      the page allocator must reject a double free (panic)
+ *   timer-masked    timer left masked: the timer check must report TEST FAIL
  */
 #include <stdint.h>
 
@@ -24,6 +25,7 @@
 #include <nanox/string.h>
 
 #include "arch/x86_64/cpu.h"
+#include "arch/x86_64/timer.h"
 #include "arch/x86_64/trap.h"
 #include "bootinfo_check.h"
 #include "faults.h"
@@ -40,7 +42,7 @@ static const void *identity_map(void *opaque, uint64_t phys, uint64_t len)
     return (const void *)(uintptr_t)phys;
 }
 
-enum mode_kind { K_PASS, K_FAIL, K_PANIC, K_HANG, K_FAULT };
+enum mode_kind { K_PASS, K_FAIL, K_PANIC, K_HANG, K_FAULT, K_TIMER_MASKED };
 
 struct test_mode {
     const char *name;
@@ -81,6 +83,7 @@ static const struct test_mode MODES[] = {
     {"nxexec", K_FAULT, nx_fault_nxexec},
     {"stackoverflow", K_FAULT, fault_stack_overflow},
     {"doublefree", K_FAULT, fault_double_free},
+    {"timer-masked", K_TIMER_MASKED, 0},
 };
 
 static int token_eq(const char *tok, uint32_t len, const char *lit)
@@ -280,6 +283,25 @@ static void selftest_vmm(void)
               NX_VMM_SELFTEST_VA, p);
 }
 
+/* Periodic timer interrupts must arrive at the calibrated rate.  In the
+ * timer-masked scenario the timer is deliberately left masked and this check
+ * must report the failure. */
+static void selftest_timer(int masked)
+{
+    struct nx_timer_result t = {0, 0, 0};
+    const char *err = nx_timer_check(masked, &t);
+    if (err) {
+        nx_printf("NANOX: TEST FAIL timer: %s (ticks=%" NX_PRIu64 " expected=%u)\n", err, t.ticks,
+                  NX_TIMER_WINDOW_PERIODS);
+        nx_debug_exit(NX_EXIT_TEST_FAIL);
+    }
+    nx_printf("NANOX: timer ok source=lapic vector=0x%x hz=%u lapic_per_10ms=%u window_ms=%u"
+              " ticks=%" NX_PRIu64 " expected=%u tsc_delta=%" NX_PRIu64 " spurious=%" NX_PRIu64
+              "\n",
+              NX_VEC_TIMER, NX_TIMER_HZ, t.lapic_per_period, NX_TIMER_WINDOW_PERIODS * 10, t.ticks,
+              NX_TIMER_WINDOW_PERIODS, t.tsc_delta, nx_spurious_count);
+}
+
 /* After the switch nothing uses firmware boot-services memory or the
  * loader's stack any more: hand them to the allocator. */
 static void reclaim_boot_memory(const struct nx_mem_region *rg, uint32_t n)
@@ -287,9 +309,26 @@ static void reclaim_boot_memory(const struct nx_mem_region *rg, uint32_t n)
     uint64_t boot, stack;
     nx_pmm_add_type(&nx_pmm, rg, n, NX_MEM_BOOT_RECLAIMABLE, &boot);
     nx_pmm_add_type(&nx_pmm, rg, n, NX_MEM_KERNEL_STACK, &stack);
+    /* Overwrite every reclaimed page: if anything (firmware page tables,
+     * GDT/IDT, loader data) were still in use after ExitBootServices and the
+     * CR3 switch, the rest of the boot would fail. */
+    uint64_t poisoned = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (rg[i].type != NX_MEM_BOOT_RECLAIMABLE && rg[i].type != NX_MEM_KERNEL_STACK)
+            continue;
+        for (uint64_t pa = rg[i].base; pa < rg[i].base + rg[i].length; pa += 4096) {
+            if (!nx_pmm_is_free(&nx_pmm, pa))
+                continue;
+            memset(nx_phys_to_virt(pa), 0xCC, 4096);
+            poisoned++;
+        }
+    }
+    if (poisoned != boot + stack)
+        nx_panic("reclaim: poisoned %" NX_PRIu64 " pages, expected %" NX_PRIu64, poisoned,
+                 boot + stack);
     nx_printf("NANOX: pmm reclaimed boot_reclaimable=%" NX_PRIu64 " loader_stack=%" NX_PRIu64
-              " pages free=%" NX_PRIu64 "\n",
-              boot, stack, nx_pmm.free_pages);
+              " pages poisoned=%" NX_PRIu64 " free=%" NX_PRIu64 "\n",
+              boot, stack, poisoned, nx_pmm.free_pages);
 }
 
 __attribute__((noreturn)) static void run_mode(const struct test_mode *mode, uint32_t vlen)
@@ -310,6 +349,7 @@ __attribute__((noreturn)) static void run_mode(const struct test_mode *mode, uin
         nx_printf("NANOX: test fault %s: expecting a failure report\n", mode->name);
         mode->fault();
         test_fail("deliberate fault did not trap");
+    case K_TIMER_MASKED: test_fail("timer-masked: the timer check did not detect the masked timer");
     }
     test_fail("bad test mode");
 }
@@ -366,5 +406,7 @@ __attribute__((noreturn)) void kernel_main(const struct nx_boot_info *boot_bi)
     const char *cl = nx_phys_to_virt(bi->cmdline_phys);
     nx_printf("NANOX: cmdline \"%s\"\n", cl);
     uint32_t vlen;
-    run_mode(parse_mode(cl, bi->cmdline_len, &vlen), vlen);
+    const struct test_mode *mode = parse_mode(cl, bi->cmdline_len, &vlen);
+    selftest_timer(mode && mode->kind == K_TIMER_MASKED);
+    run_mode(mode, vlen);
 }

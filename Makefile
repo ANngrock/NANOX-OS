@@ -46,7 +46,7 @@ KERNEL_LDFLAGS := -nostdlib -static --build-id=none -z max-page-size=4096 \
 
 KERNEL_CSRCS := kernel/main.c kernel/panic.c kernel/bootinfo_check.c \
     kernel/initramfs.c kernel/faults.c kernel/arch/x86_64/gdt.c \
-    kernel/arch/x86_64/idt.c kernel/mm/pmm.c kernel/mm/pt.c kernel/mm/vmm.c \
+    kernel/arch/x86_64/idt.c kernel/arch/x86_64/timer.c kernel/mm/pmm.c kernel/mm/pt.c kernel/mm/vmm.c \
     lib/serial.c lib/printf.c lib/string.c lib/sha256.c
 KERNEL_ASRCS := kernel/arch/x86_64/entry.S kernel/arch/x86_64/isr.S
 KERNEL_OBJS := $(patsubst %.c,$(BUILD)/kernel/%.o,$(KERNEL_CSRCS)) \
@@ -123,8 +123,11 @@ host-test: $(OUT)/host/test_host $(KERNEL_ELF) $(INITRD)
 py-test: all
 	$(PYTHON) -m unittest discover -s tests/host -p 'test_*.py' -v
 
+# All scenarios, then repeatability: the normal boot and the page-fault crash
+# must produce identical serial markers in three runs.
 qemu-test: all
 	$(PYTHON) tools/bench/harness.py test
+	$(PYTHON) tools/bench/harness.py repeat normal pagefault --count 3
 
 test: host-test py-test qemu-test
 

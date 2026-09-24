@@ -141,6 +141,17 @@ class SymbolizerTest(unittest.TestCase):
         self.assertIsNone(sym.lookup(0x100))  # below the image; absolute symbols ignored
 
 
+class RepeatTest(unittest.TestCase):
+    def test_only_timing_fields_are_masked(self):
+        a = ["NANOX: timer ok ticks=29 tsc_delta=123 lapic_per_10ms=5 hz=100", "NANOX: x=1"]
+        b = ["NANOX: timer ok ticks=30 tsc_delta=999 lapic_per_10ms=6 hz=100", "NANOX: x=1"]
+        self.assertEqual(harness.normalized_markers(a), harness.normalized_markers(b))
+        c = ["NANOX: timer ok ticks=29 tsc_delta=123 lapic_per_10ms=5 hz=200", "NANOX: x=1"]
+        self.assertNotEqual(harness.normalized_markers(a), harness.normalized_markers(c))
+        self.assertNotEqual(harness.normalized_markers(["NANOX: rip=0x1"]),
+                            harness.normalized_markers(["NANOX: rip=0x2"]))
+
+
 class ExpectationTest(unittest.TestCase):
     def test_expectation_mismatch_reported(self):
         outcome = harness.classify(BOOT + "NANOX: TEST PASS\n", 33, False)
@@ -164,7 +175,7 @@ class ScenarioFileTest(unittest.TestCase):
         for required in ("normal", "fail", "panic", "hang", "missing-kernel", "corrupt-kernel",
                          "missing-initrd", "corrupt-initrd", "bad-initrd", "pagefault",
                          "nullderef", "wprotect", "nxexec", "stackoverflow", "ud", "gp",
-                         "divzero", "doublefree"):
+                         "divzero", "doublefree", "timer-masked"):
             self.assertIn(required, names)
 
 

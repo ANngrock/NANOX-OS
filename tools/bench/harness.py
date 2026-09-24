@@ -4,6 +4,10 @@
   harness.py test [NAME ...]    run scenarios (all by default); exit 0 iff every
                                 scenario produced its expected verdict
   harness.py run NAME [--echo]  run one scenario, exit 0 iff the guest verdict is PASS
+  harness.py repeat NAME... [--count N]
+                                run each scenario N times (default 3) and require the
+                                expected verdict every time and identical serial
+                                markers (after masking timing values)
   harness.py list               list scenarios
 
 Every run writes out/runs/<UTC time>-<scenario>/ with record.json (schema
@@ -247,7 +251,7 @@ def build_scenario_image(sc):
                               corrupt_initrd=spec.get("corrupt_initrd", False))
     path = OUT / "images" / ("%s.img" % sc["name"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".img.tmp")
+    tmp = path.with_suffix(".img.tmp%d" % os.getpid())
     tmp.write_bytes(img)
     os.replace(tmp, path)
     return path
@@ -256,12 +260,15 @@ def build_scenario_image(sc):
 def new_run_dir(runs_root, name):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     base = Path(runs_root) / ("%s-%s" % (stamp, name))
+    Path(runs_root).mkdir(parents=True, exist_ok=True)
     path, n = base, 1
-    while path.exists():
-        n += 1
-        path = Path("%s-%d" % (base, n))
-    path.mkdir(parents=True)
-    return path
+    while True:
+        try:
+            path.mkdir()  # atomic: concurrent harness processes get distinct dirs
+            return path
+        except FileExistsError:
+            n += 1
+            path = Path("%s-%d" % (base, n))
 
 
 def run_scenario(sc, runs_root, toolchain, echo=False):
@@ -420,6 +427,56 @@ def cmd_run(args):
     return 0 if record["verdict"] == "PASS" else 1
 
 
+# Serial values that legitimately differ between runs (timing measurements).
+VOLATILE_RE = re.compile(r"\b(tsc_delta|ticks|lapic_per_10ms)=[0-9]+")
+
+
+def normalized_markers(markers):
+    return [VOLATILE_RE.sub(lambda m: m.group(1) + "=*", l) for l in markers]
+
+
+def cmd_repeat(args):
+    require_artifacts()
+    scenarios = {s["name"]: s for s in load_scenarios()}
+    unknown = [n for n in args.names if n not in scenarios]
+    if unknown:
+        sys.stderr.write("harness: unknown scenario(s): %s\n" % ", ".join(unknown))
+        return 2
+    toolchain = toolchain_snapshot()
+    all_ok = True
+    for name in args.names:
+        runs, reference, problems = [], None, []
+        for i in range(args.count):
+            record, run_dir = run_scenario(scenarios[name], args.runs_dir, toolchain)
+            markers = normalized_markers(record["serial"]["markers"])
+            runs.append({"record": str(run_dir / "record.json"),
+                         "expectation_met": record["expectation_met"],
+                         "markers_sha256": hashlib.sha256(
+                             "\n".join(markers).encode()).hexdigest()})
+            if not record["expectation_met"]:
+                problems.append("run %d: %s" % (i + 1, "; ".join(record["expectation_problems"])))
+            if reference is None:
+                reference = markers
+            elif markers != reference:
+                diff = [(a, b) for a, b in zip(reference, markers) if a != b][:3]
+                problems.append("run %d: markers differ from run 1 (%d vs %d lines), first: %s"
+                                % (i + 1, len(reference), len(markers), diff))
+        ok = not problems
+        all_ok &= ok
+        out_dir = new_run_dir(args.runs_dir, "repeat-" + name)
+        (out_dir / "repeat.json").write_text(json.dumps({
+            "schema": "nanox.repeat.v1", "scenario": name, "count": args.count,
+            "volatile_fields": VOLATILE_RE.pattern, "source": git_source(), "runs": runs,
+            "identical_markers": len({r["markers_sha256"] for r in runs}) == 1,
+            "problems": problems, "ok": ok}, indent=2) + "\n")
+        print("%-4s repeat %-13s %d runs, %d marker lines each, identical=%s  %s" % (
+            "ok" if ok else "FAIL", name, args.count, len(reference or []),
+            len({r["markers_sha256"] for r in runs}) == 1, display_path(out_dir)))
+        for p in problems:
+            print("       " + p)
+    return 0 if all_ok else 1
+
+
 def cmd_list(args):
     for sc in load_scenarios():
         print("%-15s %s" % (sc["name"], sc.get("description", "")))
@@ -437,6 +494,10 @@ def main(argv=None):
     r.add_argument("name")
     r.add_argument("--echo", action="store_true")
     r.set_defaults(func=cmd_run)
+    rp = sub.add_parser("repeat")
+    rp.add_argument("names", nargs="+")
+    rp.add_argument("--count", type=int, default=3)
+    rp.set_defaults(func=cmd_repeat)
     sub.add_parser("list").set_defaults(func=cmd_list)
     args = ap.parse_args(argv)
     return args.func(args)

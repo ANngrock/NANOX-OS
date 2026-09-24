@@ -4,7 +4,7 @@
   "scenarios": [
     {
       "name": "normal",
-      "description": "Normal boot: loader verifies and loads the kernel, kernel validates boot info, TEST PASS.",
+      "description": "Normal boot: verified kernel and initramfs, boot info check, own GDT/IDT/stacks, allocator, page tables, reclaim, self-tests, timer, TEST PASS.",
       "image": {
         "cmdline": ""
       },
@@ -19,9 +19,11 @@
           "^NANOX: selftest breakpoint ok resumed=2$",
           "^NANOX: pmm ok span_pages=[0-9]+ managed=[1-9][0-9]* ",
           "^NANOX: vmm ok root=0x[0-9a-f]+ physmap=0xffff800000000000 .* text=r-x rodata=r-- data=rw- guards=4 null=unmapped$",
-          "^NANOX: pmm reclaimed boot_reclaimable=[1-9][0-9]* loader_stack=16 ",
+          "^NANOX: pmm reclaimed boot_reclaimable=([1-9][0-9]*) loader_stack=16 pages poisoned=[1-9][0-9]* free=[0-9]+$",
           "^NANOX: selftest pmm ok pages=256 ",
-          "^NANOX: selftest vmm ok "
+          "^NANOX: selftest vmm ok ",
+          "^NANOX: timer ok source=lapic vector=0x40 hz=100 lapic_per_10ms=[0-9]+ window_ms=300 ticks=[0-9]+ expected=30 ",
+          "^NANOX: vmm ok .* ram_mapped=2(5[0-9]|6[0-2])[0-9][0-9][0-9]KiB "
         ]
       }
     },
@@ -354,6 +356,20 @@
         "backtrace_functions": [
           "nx_page_free",
           "kernel_main"
+        ]
+      }
+    },
+    {
+      "name": "timer-masked",
+      "description": "Timer LVT deliberately left masked: the kernel's timer check must detect missing interrupts.",
+      "image": {
+        "cmdline": "nanox.test=timer-masked"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail",
+        "patterns": [
+          "^NANOX: TEST FAIL timer: no timer interrupts in the window \\(ticks=0 expected=30\\)$"
         ]
       }
     }

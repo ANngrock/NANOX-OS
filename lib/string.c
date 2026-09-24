@@ -1,4 +1,6 @@
 /* Built with -fno-builtin so these loops are not turned back into calls. */
+#include <stdint.h>
+
 #include <nanox/string.h>
 
 void *memcpy(void *restrict dst, const void *restrict src, size_t n)
@@ -28,9 +30,19 @@ void *memmove(void *dst, const void *src, size_t n)
     return dst;
 }
 
+typedef uint64_t __attribute__((may_alias)) word_alias;
+
 void *memset(void *dst, int c, size_t n)
 {
     unsigned char *d = dst;
+    while (n && ((uintptr_t)d & 7)) {
+        *d++ = (unsigned char)c;
+        n--;
+    }
+    /* Aligned middle in 8-byte stores (the kernel poisons megabytes). */
+    uint64_t w = 0x0101010101010101ull * (unsigned char)c;
+    for (; n >= 8; n -= 8, d += 8)
+        *(word_alias *)d = w;
     while (n--)
         *d++ = (unsigned char)c;
     return dst;
