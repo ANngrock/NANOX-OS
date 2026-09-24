@@ -56,6 +56,12 @@ void nx_m2_set_initramfs(const uint8_t *base, uint64_t size)
     initrd_size = size;
 }
 
+void nx_initramfs_get(const uint8_t **base, uint64_t *size)
+{
+    *base = initrd_base;
+    *size = initrd_size;
+}
+
 __attribute__((noreturn, format(printf, 1, 2))) static void fail(const char *fmt, ...)
 {
     va_list ap;
@@ -341,4 +347,27 @@ void nx_m2_ipc(void)
 void nx_m2_ipc_overgrant(void)
 {
     ipc_test("m2-ipc-overgrant", 1);
+}
+
+/* ---- shared with the M3 controller (kernel/m3test.c) --------------------- */
+
+void nx_test_pass(void)
+{
+    pass();
+}
+
+void nx_test_snapshot(struct nx_test_snapshot *out)
+{
+    struct snapshot s = snap();
+    out->free_pages = s.free_pages;
+    out->tables = s.tables;
+    out->tasks = s.tasks;
+    out->vmos = s.vmos;
+    out->endpoints = s.endpoints;
+}
+
+struct nx_task *nx_test_spawn(const char *mode, const char *name, const char *path,
+                              const uint64_t args[4])
+{
+    return spawn(mode, name, path, args);
 }

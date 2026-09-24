@@ -235,6 +235,18 @@ class ExpectationTest(unittest.TestCase):
                                                        {"kernel_sha256": "def456"})), 1)
 
 
+class RepeatMaskTest(unittest.TestCase):
+    def test_scratch_registers_masked_in_reports_only(self):
+        a = harness.normalized_markers(["NANOX: REGS r9=0x1d r10=0xfef4 r12=0x9",
+                                        "NANOX: m4 r9=0x1d"])
+        b = harness.normalized_markers(["NANOX: REGS r9=0x1e r10=0xfef4 r12=0x9",
+                                        "NANOX: m4 r9=0x1d"])
+        self.assertEqual(a, b)
+        self.assertEqual(a[0], "NANOX: REGS r9=* r10=* r12=0x9")
+        self.assertNotEqual(harness.normalized_markers(["NANOX: REGS r12=0x9"]),
+                            harness.normalized_markers(["NANOX: REGS r12=0xa"]))
+
+
 class ScenarioFileTest(unittest.TestCase):
     def test_required_scenarios_present(self):
         names = {s["name"] for s in harness.load_scenarios()}
@@ -242,7 +254,10 @@ class ScenarioFileTest(unittest.TestCase):
                          "missing-initrd", "corrupt-initrd", "bad-initrd", "pagefault",
                          "nullderef", "wprotect", "nxexec", "stackoverflow", "ud", "gp",
                          "divzero", "doublefree", "timer-masked", "m2-user", "m2-sched",
-                         "m2-sched-nopreempt", "m2-ipc", "m2-ipc-overgrant"):
+                         "m2-sched-nopreempt", "m2-ipc", "m2-ipc-overgrant", "m4-blk",
+                         "m4-persist", "m4-persist-amnesia", "m4-corrupt-root",
+                         "m4-unmountable", "m4-full", "m4-retention", "m4-crash",
+                         "m4-crash-noflush"):
             self.assertIn(required, names)
 
     def test_scenario_patterns_are_valid(self):
@@ -250,10 +265,16 @@ class ScenarioFileTest(unittest.TestCase):
         import re
         subs = {"kernel_sha256": "0" * 64, "initrd_sha256": "0" * 64}
         for sc in harness.load_scenarios():
-            for pattern in sc["expect"].get("patterns", []):
-                re.compile(pattern.format(**subs))
-            if "interleave" in sc["expect"]:
-                self.assertEqual(re.compile(sc["expect"]["interleave"]["pattern"]).groups, 1)
+            # M4: multi-boot scenarios carry one expectation per boot.
+            expects = [sc.get("expect", {})] + [b["expect"] for b in sc.get("boots", [])]
+            for expect in expects:
+                for pattern in expect.get("patterns", []):
+                    re.compile(pattern.format(**subs))
+                if "interleave" in expect:
+                    self.assertEqual(re.compile(expect["interleave"]["pattern"]).groups, 1)
+            if sc.get("kind") == "crash-sweep":
+                for key in ("work_cmdline", "check_cmdline", "expect"):
+                    self.assertIn(key, sc)
             if "repeat" in sc:
                 re.compile(sc["repeat"]["unordered"])
 

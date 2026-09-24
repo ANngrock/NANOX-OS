@@ -36,5 +36,12 @@ void test_pt(void);
 void test_pmm(void);
 void test_handle(void);
 void test_ipc(void);
+void test_event(void);
+void test_nci(void);
+void test_engine(void);
+void test_store(const char *data_image);
+void test_net(void);
+void test_crypto(void);
+void test_http(void);
 
 #endif

@@ -185,12 +185,12 @@ void test_initramfs(const char *initrd_path)
             size_t len = fread(img, 1, sizeof(img), f);
             fclose(f);
             CHECK_EQ_INT(nx_cpio_validate(img, len, &n, &bad), NX_CPIO_OK);
-            CHECK_EQ_INT(n, 8); /* etc, etc/nanox, release, bin and 4 programs */
+            CHECK_EQ_INT(n, 10); /* etc, etc/nanox, release, bin and 6 programs */
             CHECK_EQ_INT(nx_cpio_find(img, len, "etc/nanox/release", &e), NX_CPIO_OK);
-            CHECK(e.size == 22 && memcmp(e.data, "NANOX-OS initramfs M2\n", 22) == 0);
-            /* The M2 user programs pass the kernel's loader rules. */
-            static const char *const progs[] = {"bin/hello", "bin/spin", "bin/ipc-send",
-                                                "bin/ipc-recv"};
+            CHECK(e.size == 22 && memcmp(e.data, "NANOX-OS initramfs M3\n", 22) == 0);
+            /* The M2 and M3 user programs pass the kernel's loader rules. */
+            static const char *const progs[] = {"bin/hello",    "bin/spin", "bin/ipc-send",
+                                                "bin/ipc-recv", "bin/load", "bin/core"};
             for (unsigned i = 0; i < sizeof(progs) / sizeof(progs[0]); i++) {
                 struct nx_elf_plan plan;
                 CHECK_EQ_INT(nx_cpio_find(img, len, progs[i], &e), NX_CPIO_OK);

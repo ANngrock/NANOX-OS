@@ -77,6 +77,11 @@ struct nx_task {
     int64_t exit_code;
     uint64_t fault_vector, fault_error, fault_rip, fault_cr2;
     uint32_t killer_id;
+    /* M3: lifecycle revision (one per event), timestamps, sleep deadline. */
+    uint64_t rev;
+    uint64_t created_tick, ended_tick;
+    uint64_t wake_tick;
+    int started; /* nx_task_start has made it runnable once */
 };
 
 extern struct nx_task *nx_current;
@@ -124,6 +129,25 @@ extern uint64_t nx_sched_switches;
 extern uint64_t nx_sched_preemptions;
 /* Global count of NX_SYS_DEBUG_WRITE calls (kernel/syscall.c). */
 extern uint64_t nx_debug_write_seq;
+
+/* ---- M3 (docs/m3-core.md) ---- */
+
+struct nx_evlog;
+struct nx_task_info;
+/* Kernel state events of user tasks: created, started, ended, reaped. */
+extern struct nx_evlog nx_events;
+/* Random per boot (set by the M3 controller before any task exists). */
+extern uint64_t nx_boot_id;
+/* Blocks the current task for `ticks` timer ticks (interrupts disabled). */
+void nx_task_sleep(uint64_t ticks);
+/* Starts the kernel thread "reaper", which releases the resources of every
+ * task that ends while nobody waits for it in nx_task_wait_reap. */
+void nx_reaper_start(void);
+void nx_task_fill_info(const struct nx_task *t, struct nx_task_info *out);
+/* Fills up to `cap` entries for the allocated task slots; returns their number. */
+uint32_t nx_task_list(struct nx_task_info *out, uint32_t cap);
+/* Identifier the next task will get (all smaller ones were issued). */
+uint32_t nx_task_next_id(void);
 
 /* True when [rbp, rbp+16) lies in a mapped task kernel stack. */
 int nx_task_stack_readable(uint64_t rbp);

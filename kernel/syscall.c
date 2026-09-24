@@ -16,9 +16,18 @@
 #include <nanox/syscall.h>
 
 #include "arch/x86_64/cpu.h"
+#include "arch/x86_64/timer.h"
 #include "arch/x86_64/trap.h"
+#include "chan.h"
+#include "dev/blk.h"
+#include "dev/rtc.h"
+#include "dev/virtio_net.h"
+#include "initramfs.h"
+#include "kernel.h"
+#include "m2test.h"
 #include "mm/mm.h"
 #include "mm/uaccess.h"
+#include "obj/event.h"
 #include "obj/ipc.h"
 #include "obj/vmo.h"
 #include "syscall.h"
@@ -26,6 +35,7 @@
 
 int nx_inject_uaccess_unchecked;
 int nx_inject_ipc_overgrant;
+int nx_inject_kill_noop;
 int nx_trace_ipc;
 
 /* Rights a task handle opened through the Sovereign object carries. */
@@ -323,8 +333,370 @@ static int64_t sys_task_kill(struct nx_task *t, uint64_t th)
     int st = open_task(t, th, NX_RIGHT_MANAGE, &target);
     if (st != NX_OK)
         return -st;
+    if (nx_inject_kill_noop)
+        return 0; /* deliberately broken (nanox.test=m3-kill-noop): success, no effect */
     nx_task_terminate(target, NX_END_KILLED, t->id); /* does not return if target == t */
     return 0;
+}
+
+/* ---- M3: control interface of the Cognitive Core executor --------------- */
+
+static int sovereign_check(struct nx_task *t, uint64_t sh)
+{
+    return sh > UINT32_MAX ? NX_EBADHANDLE
+                           : nx_ht_lookup(&t->handles, (uint32_t)sh, NX_OBJ_SOVEREIGN,
+                                          NX_RIGHT_SOVEREIGN, 0, 0);
+}
+
+static int64_t sys_sleep(uint64_t ticks)
+{
+    if (ticks > NX_SLEEP_MAX)
+        return -NX_EINVAL;
+    if (ticks == 0)
+        nx_yield();
+    else
+        nx_task_sleep(ticks);
+    return 0;
+}
+
+static int64_t sys_sys_info(struct nx_task *t, uint64_t va)
+{
+    struct nx_sys_info info;
+    memset(&info, 0, sizeof(info));
+    info.boot_id = nx_boot_id;
+    info.ticks = nx_timer_ticks;
+    info.hz = NX_TIMER_HZ;
+    info.tasks = nx_task_live_count();
+    info.free_pages = nx_pmm.free_pages;
+    info.managed_pages = nx_pmm.managed_pages;
+    info.page_tables = nx_vmm_tables();
+    info.events_next = nx_events.next;
+    info.next_task_id = nx_task_next_id();
+    int st = copy_out(t, va, &info, sizeof(info));
+    return st == NX_OK ? 0 : -st;
+}
+
+/* Creates a user task from an initramfs program under bin/ and starts it;
+ * the caller gets a task handle with the rights of SOV_TASK_OPEN. */
+static int64_t sys_sov_task_spawn(struct nx_task *t, uint64_t sh, uint64_t path_va,
+                                  uint64_t path_len, uint64_t args_va)
+{
+    int st = sovereign_check(t, sh);
+    if (st != NX_OK)
+        return -st;
+    if (path_len < 5 || path_len > NX_SPAWN_PATH_MAX)
+        return -NX_EINVAL;
+    char path[NX_SPAWN_PATH_MAX + 1];
+    uint64_t args[4] = {0, 0, 0, 0};
+    st = copy_in(t, path, path_va, path_len);
+    if (st == NX_OK && args_va)
+        st = copy_in(t, args, args_va, sizeof(args));
+    if (st != NX_OK)
+        return -st;
+    path[path_len] = 0;
+    if (memcmp(path, "bin/", 4) != 0)
+        return -NX_EINVAL;
+    for (uint64_t i = 4; i < path_len; i++)
+        if (!((path[i] >= 'a' && path[i] <= 'z') || (path[i] >= '0' && path[i] <= '9') ||
+              path[i] == '-' || path[i] == '_'))
+            return -NX_EINVAL;
+    const uint8_t *base;
+    uint64_t size;
+    nx_initramfs_get(&base, &size);
+    struct nx_cpio_entry e;
+    if (!base || nx_cpio_find(base, size, path, &e) != NX_CPIO_OK ||
+        (e.mode & NX_CPIO_MODE_TYPE) != NX_CPIO_MODE_REG)
+        return -NX_ENOENT;
+    if (nx_ht_count(&t->handles) >= NX_HANDLE_SLOTS)
+        return -NX_ENOMEM; /* checked first: nothing to undo later */
+    int err = 0;
+    struct nx_task *n = nx_utask_create(path + 4, e.data, e.size, args, &err);
+    if (!n)
+        return -err;
+    uint32_t h;
+    if (nx_ht_install(&t->handles, &n->base, SOV_TASK_RIGHTS, &h) != NX_OK)
+        nx_panic("spawn: handle slot vanished");
+    nx_task_start(n);
+    return (int64_t)h;
+}
+
+static int64_t sys_task_info(struct nx_task *t, uint64_t th, uint64_t va)
+{
+    struct nx_object *o;
+    int st = th > UINT32_MAX ? NX_EBADHANDLE
+                             : nx_ht_lookup(&t->handles, (uint32_t)th, NX_OBJ_TASK,
+                                            NX_RIGHT_INSPECT, &o, 0);
+    if (st != NX_OK)
+        return -st;
+    struct nx_task_info info;
+    nx_task_fill_info((struct nx_task *)o, &info);
+    st = copy_out(t, va, &info, sizeof(info));
+    return st == NX_OK ? 0 : -st;
+}
+
+static int64_t sys_sov_task_list(struct nx_task *t, uint64_t sh, uint64_t va, uint64_t cap)
+{
+    static struct nx_task_info list[NX_TASK_MAX];
+    int st = sovereign_check(t, sh);
+    if (st != NX_OK)
+        return -st;
+    if (cap > NX_TASK_MAX)
+        return -NX_EINVAL;
+    uint32_t n = nx_task_list(list, NX_TASK_MAX);
+    uint32_t copy = n < cap ? n : (uint32_t)cap;
+    st = copy ? copy_out(t, va, list, copy * sizeof(list[0])) : NX_OK;
+    return st == NX_OK ? (int64_t)n : -st;
+}
+
+#define EVENT_READ_MAX 32u
+
+static int64_t sys_sov_event_read(struct nx_task *t, uint64_t sh, uint64_t since, uint64_t va,
+                                  uint64_t cap)
+{
+    static struct nx_event ev[EVENT_READ_MAX];
+    int st = sovereign_check(t, sh);
+    if (st != NX_OK)
+        return -st;
+    if (cap == 0 || cap > EVENT_READ_MAX)
+        return -NX_EINVAL;
+    st = check_out(t, va, cap * sizeof(ev[0]));
+    if (st != NX_OK)
+        return -st;
+    uint32_t n = nx_evlog_read(&nx_events, since, ev, (uint32_t)cap);
+    if (n)
+        copy_out(t, va, ev, n * sizeof(ev[0]));
+    return n;
+}
+
+static struct nx_chan *chan_lookup(struct nx_task *t, uint64_t ch, uint32_t need, int *st)
+{
+    struct nx_object *o = 0;
+    *st = ch > UINT32_MAX ? NX_EBADHANDLE
+                          : nx_ht_lookup(&t->handles, (uint32_t)ch, NX_OBJ_CHANNEL, need, &o, 0);
+    return (struct nx_chan *)o;
+}
+
+/* Polled receive: spin briefly (the host may be refilling the UART FIFO),
+ * then sleep one tick between polls until `timeout` ticks have passed. */
+#define CHAN_SPIN_POLLS 20000u
+
+static int64_t sys_chan_read(struct nx_task *t, uint64_t ch, uint64_t va, uint64_t cap,
+                             uint64_t timeout)
+{
+    static uint8_t tmp[NX_CHAN_IO_MAX];
+    int st;
+    if (!chan_lookup(t, ch, NX_RIGHT_READ, &st))
+        return -st;
+    if (cap == 0 || cap > NX_CHAN_IO_MAX || timeout > NX_CHAN_TIMEOUT_MAX)
+        return -NX_EINVAL;
+    st = check_out(t, va, cap);
+    if (st != NX_OK)
+        return -st;
+    for (uint64_t waited = 0;; waited++) {
+        struct nx_chan *c = chan_lookup(t, ch, NX_RIGHT_READ, &st); /* again after sleeping */
+        if (!c)
+            return -st;
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < CHAN_SPIN_POLLS && n == 0; i++)
+            n = nx_chan_poll(c, tmp, (uint32_t)cap);
+        if (n) {
+            copy_out(t, va, tmp, n);
+            return n;
+        }
+        if (waited >= timeout)
+            return 0;
+        nx_task_sleep(1);
+    }
+}
+
+static int64_t sys_chan_write(struct nx_task *t, uint64_t ch, uint64_t va, uint64_t len)
+{
+    static uint8_t tmp[NX_CHAN_IO_MAX];
+    int st;
+    struct nx_chan *c = chan_lookup(t, ch, NX_RIGHT_WRITE, &st);
+    if (!c)
+        return -st;
+    if (len > NX_CHAN_IO_MAX)
+        return -NX_EINVAL;
+    st = copy_in(t, tmp, va, len);
+    if (st != NX_OK)
+        return -st;
+    nx_chan_write(c, tmp, (uint32_t)len);
+    return (int64_t)len;
+}
+
+/* ---- M4: block device ------------------------------------------------------ */
+
+static struct nx_blkdev *blk_lookup(struct nx_task *t, uint64_t h, uint32_t need, int *st)
+{
+    struct nx_object *o = 0;
+    *st = h > UINT32_MAX ? NX_EBADHANDLE
+                         : nx_ht_lookup(&t->handles, (uint32_t)h, NX_OBJ_BLOCKDEV, need, &o, 0);
+    return (struct nx_blkdev *)o;
+}
+
+/* Data of one block request (not on the 16 KiB kernel stack). */
+static uint8_t blkbuf[NX_BLK_IO_MAX * NX_BLK_SIZE];
+
+static int64_t sys_blk_info(struct nx_task *t, uint64_t h, uint64_t va)
+{
+    int st;
+    struct nx_blkdev *b = blk_lookup(t, h, NX_RIGHT_READ, &st);
+    if (!b)
+        return -st;
+    struct nx_blk_info info;
+    memset(&info, 0, sizeof(info));
+    info.blocks = b->blocks;
+    info.block_size = NX_BLK_SIZE;
+    info.flags = (b->dev->read_only ? NX_BLK_INFO_READ_ONLY : 0) |
+                 (b->dev->has_flush ? NX_BLK_INFO_FLUSH : 0) |
+                 (nx_blk_test.enabled && nx_blk_test.volatile_cache ? NX_BLK_INFO_TEST_CACHE : 0);
+    info.reads = b->reads;
+    info.writes = b->writes;
+    info.flushes = b->flushes;
+    for (uint32_t i = 0; i < NX_VBLK_SERIAL_MAX && b->dev->serial[i]; i++)
+        info.serial[i] = b->dev->serial[i];
+    st = copy_out(t, va, &info, sizeof(info));
+    return st == NX_OK ? 0 : -st;
+}
+
+static int64_t sys_blk_read(struct nx_task *t, uint64_t h, uint64_t blk, uint64_t count,
+                            uint64_t va)
+{
+    int st;
+    struct nx_blkdev *b = blk_lookup(t, h, NX_RIGHT_READ, &st);
+    if (!b)
+        return -st;
+    if (count == 0 || count > NX_BLK_IO_MAX || blk >= b->blocks || count > b->blocks - blk)
+        return -NX_EINVAL;
+    st = check_out(t, va, count * NX_BLK_SIZE);
+    if (st == NX_OK)
+        st = nx_blk_read(b, blk, (uint32_t)count, blkbuf);
+    if (st != NX_OK)
+        return -st;
+    copy_out(t, va, blkbuf, count * NX_BLK_SIZE);
+    return (int64_t)count;
+}
+
+static int64_t sys_blk_write(struct nx_task *t, uint64_t h, uint64_t blk, uint64_t count,
+                             uint64_t va)
+{
+    int st;
+    struct nx_blkdev *b = blk_lookup(t, h, NX_RIGHT_WRITE, &st);
+    if (!b)
+        return -st;
+    if (count == 0 || count > NX_BLK_IO_MAX || blk >= b->blocks || count > b->blocks - blk)
+        return -NX_EINVAL;
+    st = copy_in(t, blkbuf, va, count * NX_BLK_SIZE);
+    if (st == NX_OK)
+        st = nx_blk_write(b, blk, (uint32_t)count, blkbuf);
+    return st == NX_OK ? (int64_t)count : -st;
+}
+
+static int64_t sys_blk_flush(struct nx_task *t, uint64_t h)
+{
+    int st;
+    struct nx_blkdev *b = blk_lookup(t, h, NX_RIGHT_WRITE, &st);
+    if (!b)
+        return -st;
+    st = nx_blk_flush(b);
+    return st == NX_OK ? 0 : -st;
+}
+
+/* ---- M5: network device, entropy, clock --------------------------------------- */
+
+static struct nx_netdev *net_lookup(struct nx_task *t, uint64_t h, uint32_t need, int *st)
+{
+    struct nx_object *o = 0;
+    *st = h > UINT32_MAX ? NX_EBADHANDLE
+                         : nx_ht_lookup(&t->handles, (uint32_t)h, NX_OBJ_NETDEV, need, &o, 0);
+    return (struct nx_netdev *)o;
+}
+
+static uint8_t netbuf[NX_NET_FRAME_MAX];
+
+static int64_t sys_net_info(struct nx_task *t, uint64_t h, uint64_t va)
+{
+    int st;
+    struct nx_netdev *n = net_lookup(t, h, NX_RIGHT_READ, &st);
+    if (!n)
+        return -st;
+    struct nx_net_info info;
+    nx_net_info(n, &info);
+    st = copy_out(t, va, &info, sizeof(info));
+    return st == NX_OK ? 0 : -st;
+}
+
+static int64_t sys_net_send(struct nx_task *t, uint64_t h, uint64_t va, uint64_t len)
+{
+    int st;
+    struct nx_netdev *n = net_lookup(t, h, NX_RIGHT_WRITE, &st);
+    if (!n)
+        return -st;
+    if (len < NX_NET_FRAME_MIN || len > NX_NET_FRAME_MAX)
+        return -NX_EINVAL;
+    st = copy_in(t, netbuf, va, len);
+    if (st == NX_OK)
+        st = nx_net_send(n, netbuf, (uint32_t)len);
+    return st == NX_OK ? (int64_t)len : -st;
+}
+
+/* Polled receive like CHAN_READ: poll the used ring, then sleep one tick
+ * between polls until `timeout` ticks have passed (0: do not wait). */
+#define NET_SPIN_POLLS 2000u
+
+static int64_t sys_net_recv(struct nx_task *t, uint64_t h, uint64_t va, uint64_t cap,
+                            uint64_t timeout)
+{
+    int st;
+    if (!net_lookup(t, h, NX_RIGHT_READ, &st))
+        return -st;
+    if (cap < NX_NET_FRAME_MAX || cap > 65536 || timeout > NX_NET_TIMEOUT_MAX)
+        return -NX_EINVAL;
+    st = check_out(t, va, NX_NET_FRAME_MAX);
+    if (st != NX_OK)
+        return -st;
+    for (uint64_t waited = 0;; waited++) {
+        struct nx_netdev *n = net_lookup(t, h, NX_RIGHT_READ, &st); /* again after sleeping */
+        if (!n)
+            return -st;
+        uint32_t len = 0;
+        for (uint32_t i = 0; i < NET_SPIN_POLLS && len == 0; i++)
+            len = nx_net_poll(n, netbuf);
+        if (len) {
+            copy_out(t, va, netbuf, len);
+            return len;
+        }
+        if (waited >= timeout)
+            return 0;
+        nx_task_sleep(1);
+    }
+}
+
+static int64_t sys_entropy(struct nx_task *t, uint64_t va, uint64_t len)
+{
+    static uint8_t tmp[NX_ENTROPY_MAX];
+    if (len == 0 || len > NX_ENTROPY_MAX)
+        return -NX_EINVAL;
+    int st = check_out(t, va, len);
+    if (st == NX_OK)
+        st = nx_rng_read(tmp, (uint32_t)len);
+    if (st != NX_OK)
+        return -st;
+    copy_out(t, va, tmp, len);
+    return (int64_t)len;
+}
+
+static int64_t sys_clock(struct nx_task *t, uint64_t va)
+{
+    struct nx_clock c;
+    memset(&c, 0, sizeof(c));
+    c.ticks = nx_timer_ticks;
+    c.hz = NX_TIMER_HZ;
+    c.unix_s = nx_rtc_now(c.ticks, c.hz);
+    c.source = c.unix_s ? NX_CLOCK_SRC_RTC : 0;
+    int st = copy_out(t, va, &c, sizeof(c));
+    return st == NX_OK ? 0 : -st;
 }
 
 void nx_syscall(struct nx_trap_frame *f)
@@ -360,6 +732,23 @@ void nx_syscall(struct nx_trap_frame *f)
     case NX_SYS_SOV_TASK_OPEN: r = sys_sov_task_open(t, a, b); break;
     case NX_SYS_TASK_READ: r = sys_task_read(t, a, b, c, d); break;
     case NX_SYS_TASK_KILL: r = sys_task_kill(t, a); break;
+    case NX_SYS_SLEEP: r = sys_sleep(a); break;
+    case NX_SYS_SYS_INFO: r = sys_sys_info(t, a); break;
+    case NX_SYS_SOV_TASK_SPAWN: r = sys_sov_task_spawn(t, a, b, c, d); break;
+    case NX_SYS_TASK_INFO: r = sys_task_info(t, a, b); break;
+    case NX_SYS_SOV_TASK_LIST: r = sys_sov_task_list(t, a, b, c); break;
+    case NX_SYS_SOV_EVENT_READ: r = sys_sov_event_read(t, a, b, c, d); break;
+    case NX_SYS_CHAN_READ: r = sys_chan_read(t, a, b, c, d); break;
+    case NX_SYS_CHAN_WRITE: r = sys_chan_write(t, a, b, c); break;
+    case NX_SYS_BLK_INFO: r = sys_blk_info(t, a, b); break;
+    case NX_SYS_BLK_READ: r = sys_blk_read(t, a, b, c, d); break;
+    case NX_SYS_BLK_WRITE: r = sys_blk_write(t, a, b, c, d); break;
+    case NX_SYS_BLK_FLUSH: r = sys_blk_flush(t, a); break;
+    case NX_SYS_NET_INFO: r = sys_net_info(t, a, b); break;
+    case NX_SYS_NET_SEND: r = sys_net_send(t, a, b, c); break;
+    case NX_SYS_NET_RECV: r = sys_net_recv(t, a, b, c, d); break;
+    case NX_SYS_ENTROPY: r = sys_entropy(t, a, b); break;
+    case NX_SYS_CLOCK: r = sys_clock(t, a); break;
     default: r = -NX_ENOSYS; break;
     }
     f->rax = (uint64_t)r;

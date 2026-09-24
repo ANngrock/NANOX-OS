@@ -16,6 +16,7 @@
 #define NX_EXIT_PANIC 0x12u        /* QEMU exit status 37 */
 #define NX_EXIT_LOADER_ERROR 0x13u /* QEMU exit status 39 */
 #define NX_EXIT_EXCEPTION 0x14u    /* QEMU exit status 41: unhandled CPU exception */
+#define NX_EXIT_CRASH_POINT 0x15u  /* QEMU exit status 43: M4 test stop at a crash point */
 
 /* Loader error codes, printed as "NANOX: LOADER ERROR <NAME> (<code>): ...". */
 enum nx_loader_error {

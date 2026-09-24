@@ -13,7 +13,16 @@ QEMU/UEFI, версии toolchain, сборку образа, headless harness, 
 решения M1 — в [m1-kernel.md](m1-kernel.md). На этапе M2 добавлены
 пользовательские программы в initramfs, проверка чередования вывода задач
 (`interleave`) и неупорядоченное сравнение строк при проверке повторяемости;
-решения M2 — в [m2-kernel.md](m2-kernel.md).
+решения M2 — в [m2-kernel.md](m2-kernel.md). На этапе M3 добавлены второй
+последовательный порт как канал host bridge, сеанс bridge внутри запуска
+сценария и ожидание `bridge`; решения M3 — в [m3-core.md](m3-core.md). На
+этапе M4 добавлены диск данных (второй virtio-blk), код выхода 43 и класс
+`crash_point`, сценарии из нескольких загрузок на одном диске, ожидание
+`store` и серия сбоев (`"kind": "crash-sweep"`); решения M4 — в
+[m4-store.md](m4-store.md). На этапе M5 добавлены сетевая карта, источник
+энтропии, QMP-сокет, RTC с фиксированной датой, сервисы стенда (DNS, echo,
+TLS, тестовый provider) и ключ сценария `"m5"`; решения M5 — в
+[m5-net.md](m5-net.md).
 
 ## 1. Одна последовательность от чистого checkout
 
@@ -24,8 +33,8 @@ make doctor && make && make test
 | Цель | Что делает | Нужны QEMU/OVMF |
 | --- | --- | --- |
 | `make doctor` | сверяет инструменты с `toolchain.lock`, пишет `out/doctor.json` | да (проверяются версии и хеши) |
-| `make` | собирает `out/BOOTX64.EFI`, `out/kernel.elf`, программы `user/` (с M2, в `out/build/user/bin/`), `out/initrd.img` (с M1), `out/nanox.img`, `out/SHA256SUMS` | нет |
-| `make test` | `host-test` + `py-test` + `qemu-test` (все сценарии, затем повторяемость `normal`, `pagefault` и `m2-sched`) | да |
+| `make` | собирает `out/BOOTX64.EFI`, `out/kernel.elf`, программы `user/` (с M2, в `out/build/user/bin/`), `out/initrd.img` (с M1), `out/nanox.img`, диск данных `out/data.img` (с M4), `out/SHA256SUMS` | нет |
+| `make test` | `host-test` + `py-test` + `qemu-test` (все сценарии, включая серии сбоев M4, затем повторяемость `normal`, `pagefault` и `m2-sched`) | да |
 | `make run` | сценарий `normal` с выводом serial в терминал и записью запуска | да |
 | `make debug` | QEMU с `-s -S`, serial в терминал; см. раздел 8 | да |
 | `make debug-check` | автоматическая проверка GDB-процедуры | да, плюс gdb |
@@ -77,9 +86,23 @@ qemu-system-x86_64 -no-user-config -nodefaults -machine pc-q35-8.2 -accel tcg
 Пути переопределяются переменными `NANOX_OVMF_CODE` / `NANOX_OVMF_VARS`,
 бинарник QEMU — `NANOX_QEMU`; `make doctor` проверит хеши выбранных файлов.
 
-Единственное отклонение от канонической конфигурации — сценарий
-`framebuffer`, который добавляет ровно одно устройство `-device VGA`, чтобы
-проверить необязательные поля framebuffer в boot info.
+Отклонения от канонической конфигурации: сценарий `framebuffer` добавляет
+ровно одно устройство `-device VGA`, чтобы проверить необязательные поля
+framebuffer в boot info; сценарии M3 (`m3-*`) добавляют второй
+последовательный порт — канал host bridge:
+`-chardev socket,id=nxbridge,path=<сокет>,server=off -serial chardev:nxbridge`
+(COM2, I/O `0x2F8`; unix-сокет слушает harness во временном каталоге,
+[m3-core.md §2](m3-core.md#2-граница-guesthost)); сценарии M4 (`m4-*`)
+добавляют диск данных — второе устройство virtio-blk с копией
+`out/data.img` из каталога запуска:
+`-drive if=none,id=nxdata,format=raw,file=<run>/data.img -device
+virtio-blk-pci,drive=nxdata,serial=nanox-data`
+([m4-store.md §11](m4-store.md#11-сценарии-стенда)); сценарии M5 (`m5-*`)
+добавляют к этому сетевую карту и источник энтропии:
+`-netdev user,id=nxnet,ipv6=off -device
+virtio-net-pci,netdev=nxnet,mac=52:54:00:4e:58:05,romfile= -object
+rng-builtin,id=nxrng -device virtio-rng-pci,rng=nxrng -qmp
+unix:<сокет>,server=on,wait=off` ([m5-net.md §3](m5-net.md#3-устройства-virtio-net-virtio-rng-часы)).
 
 ## 3. Toolchain
 
@@ -140,6 +163,10 @@ LBA 2048, FAT32 с кластерами 512 байт, только имена 8.
 \NANOX\CMDLINE.TXT        командная строка ядра (в образе make — пустая)
 ```
 
+С M4 сборка создаёт и диск данных `out/data.img` (1 МиБ, пустое хранилище
+nxstore, `tools/store/nxstore.py format`); сценарии работают на его копиях,
+сам файл запусками не меняется.
+
 Метки времени FAT берутся из `SOURCE_DATE_EPOCH`, если переменная задана,
 иначе 1980-01-01 00:00:00. Ключи `--omit-kernel`, `--corrupt-kernel`,
 `--omit-initrd`, `--corrupt-initrd` использует только harness для сценариев
@@ -154,8 +181,8 @@ LBA 2048, FAT32 с кластерами 512 байт, только имена 8.
 `make repro-check` (`tools/repro_check.py`) копирует текущее дерево
 (отслеживаемые и неигнорируемые файлы) в два новых каталога с разными
 абсолютными путями, собирает `make all` там и в рабочем дереве и требует
-побайтового совпадения `BOOTX64.EFI`, `kernel.elf`, `initrd.img` (с M1) и
-`nanox.img` во всех трёх сборках. Отчёт: `out/repro-check.json`. Отрицательный контроль при подготовке
+побайтового совпадения `BOOTX64.EFI`, `kernel.elf`, `initrd.img` (с M1),
+`nanox.img` и `data.img` (с M4) во всех трёх сборках. Отчёт: `out/repro-check.json`. Отрицательный контроль при подготовке
 M0: сборка с пустым `REPRO_FLAGS` в двух путях дала разные `kernel.elf`
 (абсолютный путь в DWARF), то есть проверка обнаруживает такие различия.
 
@@ -164,7 +191,10 @@ M0: сборка с пустым `REPRO_FLAGS` в двух путях дала �
 `tools/bench/harness.py` (только стандартная библиотека Python). Сценарии —
 `tests/qemu/scenarios.json`. Ниже — сценарии M0; сценарии M1 перечислены в
 [m1-kernel.md](m1-kernel.md#сценарии-стенда), сценарии M2 — в
-[m2-kernel.md §10](m2-kernel.md#10-сценарии-стенда).
+[m2-kernel.md §10](m2-kernel.md#10-сценарии-стенда), сценарии M3 — в
+[m3-core.md §8](m3-core.md#8-сценарии-стенда), сценарии M4 — в
+[m4-store.md §11](m4-store.md#11-сценарии-стенда), сценарии M5 — в
+[m5-net.md §10](m5-net.md#10-стенд).
 
 | Сценарий | Образ | Ожидание |
 | --- | --- | --- |
@@ -187,9 +217,33 @@ M0: сборка с пустым `REPRO_FLAGS` в двух путях дала �
 `{"pattern": ..., "groups": N}` — строки, совпавшие с выражением, должны
 прийти ровно от N источников (группа 1 выражения), и первая строка каждого
 источника должна стоять раньше последней строки любого источника.
+`bridge` (M3): `{"ok": true|false, "problems": [выражение, ...]}` —
+результат host-проверок сеанса bridge и выражения, каждому из которых должна
+соответствовать одна из найденных host-проблем (для отрицательных
+контролей). Сценарий с полем `"bridge": {"script": ..., "adapter": ...}`
+запускается вместе с сеансом host bridge: harness слушает unix-сокет, QEMU
+подключает к нему COM2, отдельный поток ведёт сеанс
+(`tools/bridge/session.py`).
+
+M4: `"data_disk": true` подключает копию `out/data.img`; `store` —
+ожидания к диску данных после загрузки, которые проверяет host-реализация
+формата (`mounted`, `check_ok`, `gen`, `gen_min`, `label`, `config`, `blobs`,
+`pins`, `tasks`, `slot_states`); `data_disk_unchanged` — загрузка не должна
+менять диск. Сценарий `"boots": [...]` — несколько загрузок на одном диске,
+у каждой свои `image`, `bridge`, `expect`, а также `"after": {"corrupt":
+...}` (повреждение диска перед следующей загрузкой) и `"data_disk":
+"fresh"` (эта загрузка получает чистый диск); общий словарь `carry` передаёт
+сценариям host то, что они узнали в прежней загрузке. Сценарий `"kind":
+"crash-sweep"` — серия сбоев (`work_cmdline`, `check_cmdline`, `points`,
+`policies`, `expect.violations` / `violations_min`,
+`violation_patterns`, `points_min`), описана в
+[m4-store.md §10](m4-store.md#10-проверка-устойчивости-к-сбоям).
 
 `harness.py repeat` сравнивает маркеры запусков по порядку, маскируя
-значения, которые законно меняются: измерения времени (`ticks=`,
+значения, которые законно меняются: регистры r8–r11 в строках
+`NANOX: REGS` (с M4: это остатки прежних вызовов, например число тиков
+самопроверки таймера, 29 или 30 в зависимости от хоста; расхождение
+наблюдалось и на ревизии до M4), измерения времени (`ticks=`,
 `tsc_delta=`, `lapic_per_10ms=`) и статистики планирования (`preempted=`,
 `preemptions=`, `switches=`, `latest_first=`, `earliest_last=`). Сценарий
 может объявить строки с непостоянным порядком (`"repeat": {"unordered":
@@ -206,7 +260,8 @@ M0: сборка с пустым `REPRO_FLAGS` в двух путях дала �
   `PANIC`, `LOADER ERROR`, `EXCEPTION`.
 - Иначе **FAIL** с классом: `test_fail` (35 + `TEST FAIL`), `panic`
   (37 + `PANIC`), `loader_error` (39 + `LOADER ERROR`), `exception`
-  (41 + `EXCEPTION`, с M1), `timeout` (процесс
+  (41 + `EXCEPTION`, с M1), `crash_point` (43 + ровно одна строка
+  `NANOX: CRASH POINT`, с M4: остановка в точке сбоя), `timeout` (процесс
   завершён harness; маркер PASS в логе не спасает), `inconsistent` (статус и
   маркеры не согласованы, например 33 без `TEST PASS`), `unexpected_exit`
   (любой другой статус, например 0 после тройной ошибки).
@@ -234,6 +289,8 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `NANOX: cpu ...`, `NANOX: pmm ...`, `NANOX: vmm ...`, `NANOX: initramfs ...`, `NANOX: selftest ...`, `NANOX: timer ...` | ядро, шаги загрузки M1 ([m1-kernel.md §2](m1-kernel.md#2-последовательность-загрузки-ядра)) |
 | `NANOX: sched ...`, `NANOX: task ...`, `NANOX: ipc ...`, `NANOX: m2-<режим> ...` | ядро, режимы M2 ([m2-kernel.md §2](m2-kernel.md#2-где-начинается-m2-в-загрузке)) |
 | `NANOX: USER <имя>#<id>: <текст>` | ядро от имени пользовательской задачи (`NX_SYS_DEBUG_WRITE`, M2); задача не может напечатать строку, начинающуюся с другого маркера |
+| `NANOX: m3 ...`, `NANOX: m3-<режим> ...`, `NANOX: USER core#4: act ...` | контроллер режимов M3 и трасса исполнителя ([m3-core.md §9](m3-core.md#9-serial-маркеры-m3)) |
+| `NANOX: blk ...`, `NANOX: m4 ...`, `NANOX: m4-<режим> ...`, `NANOX: CRASH POINT ...`, `NANOX: USER core#4: store ...` | драйвер, контроллер и слой сбоев M4, хранилище исполнителя ([m4-store.md §12](m4-store.md#12-serial-маркеры-m4)) |
 
 ### Коды выхода
 
@@ -244,6 +301,7 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `0x12` | 37 | PANIC |
 | `0x13` | 39 | LOADER ERROR |
 | `0x14` | 41 | необработанное исключение CPU (с M1) |
+| `0x15` | 43 | остановка в точке сбоя (с M4, только режимы `m4-*` с `nanox.m4.crash`) |
 | — | 0 | сброс/выключение без isa-debug-exit |
 | — | нет | таймаут, процесс остановлен harness |
 
@@ -257,6 +315,10 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `record.json` | запись `nanox.run-record.v1` |
 | `serial.log` | сырой вывод COM1 |
 | `qemu-output.log` | stdout/stderr QEMU |
+| `bridge-trace.jsonl`, `bridge-wire.log` | только сценарии M3: трасса host bridge и все строки канала ([m3-core.md §7](m3-core.md#7-host-bridge)) |
+| `data.img` | только сценарии M4: диск данных после запуска |
+| `boot-<n>/` | многозагрузочные сценарии M4: каталог каждой загрузки со своим `record.json`; общий `record.json` содержит список `boots` |
+| `k<K>-<политика>/{crash,check}/` | серия сбоев M4: две загрузки точки; `record.json` серии (схема `nanox.crash-sweep.v1`) — эталон, точки, итог |
 
 Поля `record.json`:
 
@@ -273,6 +335,8 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `serial.sha256`, `serial.markers`, `serial.raw` | хеш, маркеры и полный текст serial-лога |
 | `verdict`, `failure_class`, `loader_error`, `reason` | вердикт harness |
 | `exception`, `backtrace` | разобранный отчёт об исключении и backtrace с символами из `kernel.elf` (с M1) |
+| `bridge` | сеанс host bridge (M3): `ok`, `problems`, `hello`, `close`, итог задачи агента, число действий, путь к трассе |
+| `data_disk` | диск данных (M4): хеши до и после, состояние хранилища по host-реализации формата и её проверка целостности |
 | `expected`, `expectation_met`, `expectation_problems` | ожидание сценария и расхождения |
 
 `make test` дополнительно пишет `out/runs/<время>-suite/summary.json` со
