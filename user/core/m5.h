@@ -67,6 +67,56 @@ uint32_t m5_tls_unacked(void);
 int net_link_ok(void);
 op_fn m5_tls_op(const char *op);
 
+/* ---- provider.c: the provider client ---- */
+
+#define PRV_BODY_MAX 49152u
+
+struct prv_cfg {
+    char host[64];
+    char model[64];
+    char key_ref[32];
+    uint32_t port, timeout_ms, attempts, max_tokens, key_len;
+    int err; /* NXE_OK, NXE_LOC_CONFIG or NXE_LOC_NO_KEY */
+};
+extern struct prv_cfg prv;
+
+/* One attempt. */
+struct prv_info {
+    uint32_t http, retry_after_s, connect_ms;
+    int reconnected;
+    char error_type[48];
+};
+
+/* One model request (all its attempts). */
+struct prv_summary {
+    uint32_t attempts, retries, reconnects, http;
+    char error_type[48];
+};
+
+/* Telemetry counters of this boot (telemetry.status). */
+struct m5_tel {
+    uint64_t by_class[7]; /* indexed by enum nx_err_class; [0] = successes */
+    uint64_t model_attempts, retries, reconnects, connects;
+    uint64_t asks, asks_ok, actions, actions_failed;
+    int last_err, last_class;
+};
+extern struct m5_tel m5_tel;
+
+/* Loads the provider configuration and the key once: NXE_OK,
+ * NXE_LOC_CONFIG or NXE_LOC_NO_KEY. */
+int prv_load(void);
+/* One model request with retries: NXE_OK with the response in *m. */
+struct msg_stream;
+int prv_request(const char *ask, uint32_t step, const char *body, uint32_t blen,
+                struct msg_stream *m, struct prv_summary *sum);
+const char *prv_key_state(void);
+/* Counts an outcome in the telemetry counters by its class. */
+void m5_tel_count(int err);
+
+/* ---- agent.c: the agent loop and the provider/telemetry operations ---- */
+
+op_fn m5_agent_op(const char *op);
+
 /* Fails the action with the class and name of an M5 error:
  * "FAILED code=<CLASS>_ERROR detail=<name> class=<class>". */
 void m5_fail(struct eng_action *a, struct nci_buf *b, int err, const char *effects);

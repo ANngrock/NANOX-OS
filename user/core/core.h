@@ -28,6 +28,10 @@ void res_end(struct nci_buf *b, const char *id);
 /* One request line; returns the exit code once the session is closed, else -1. */
 int64_t core_handle(const char *line, uint32_t len);
 
+/* M5: runs a request line of the agent loop; the response stays in *b
+ * (the shared response buffer).  0 executed, -1 rejected. */
+int core_exec(const char *line, uint32_t len, struct nci_buf *b);
+
 typedef void (*op_fn)(struct eng_action *, const struct nci_req *, struct nci_buf *);
 
 /* ---- persist.c ---- */

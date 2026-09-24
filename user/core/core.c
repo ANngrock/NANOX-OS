@@ -850,6 +850,64 @@ static void action_status(const struct nci_req *r)
              a ? eng_state_name(a->state) : "-");
 }
 
+static op_fn find_op(const char *op)
+{
+    op_fn fn = ps_op(op);
+    if (!fn && m5_enabled)
+        fn = m5_op(op);
+    for (uint32_t i = 0; i < sizeof(OPTAB) / sizeof(OPTAB[0]); i++)
+        if (nci_streq(op, OPTAB[i].name))
+            fn = OPTAB[i].fn;
+    return fn;
+}
+
+static void reject_into(struct nci_buf *b, const char *id, const char *code, const char *detail)
+{
+    res_begin(b, id, "REJECTED");
+    nb_kv(b, "code", code);
+    if (detail)
+        nb_kv(b, "detail", detail);
+    res_end(b, id);
+}
+
+/* M5: one request line of the agent loop (a tool call of the model), run
+ * through the task engine exactly like a request of the bridge, but with
+ * the response left in *b instead of being written.  0 executed (the
+ * response tells the outcome), -1 rejected before execution. */
+int core_exec(const char *line, uint32_t len, struct nci_buf *b)
+{
+    static struct nci_req req; /* not core_handle's: that one is still in use */
+    int ps = nci_parse(line, len, &req);
+    if (ps != NCI_OK) {
+        reject_into(b, req.id, "BAD_REQUEST", nci_strerror(ps));
+        return -1;
+    }
+    op_fn fn = find_op(req.op);
+    if (!fn) {
+        reject_into(b, req.id, "UNKNOWN_OP", 0);
+        return -1;
+    }
+    struct eng_action *a;
+    int br = eng_begin(&eng, req.id, req.op, nci_fingerprint(&req), &a);
+    if (br != ENG_NEW) {
+        reject_into(b, req.id, br == ENG_REPLAY ? "DUPLICATE" : br == ENG_ID_REUSED ? "ID_REUSED"
+                                                                                  : "BUSY",
+                    0);
+        return -1;
+    }
+    u_printf("act %s %s CREATED request=\"%s\" by=agent\n", a->id, a->op, line);
+    fn(a, &req, b);
+    if (b->overflow) {
+        a->state = ACT_VERIFYING;
+        fail_action(a, b, "RESPONSE_TOO_LARGE", 0, "unknown");
+    }
+    if (a->persist == PS_INTENT)
+        ps_final(a, b);
+    if (eng_store(a, b->p, b->len) != 0)
+        u_printf("act %s: response not stored (%u bytes)\n", a->id, b->len);
+    return 0;
+}
+
 /* Returns the exit code when the session is closed, else -1. */
 int64_t core_handle(const char *line, uint32_t len)
 {
@@ -885,12 +943,7 @@ int64_t core_handle(const char *line, uint32_t len)
                  verify_failures, code);
         return code;
     }
-    op_fn fn = ps_op(req.op);
-    if (!fn && m5_enabled)
-        fn = m5_op(req.op);
-    for (uint32_t i = 0; i < sizeof(OPTAB) / sizeof(OPTAB[0]); i++)
-        if (nci_streq(req.op, OPTAB[i].name))
-            fn = OPTAB[i].fn;
+    op_fn fn = find_op(req.op);
     if (!fn) {
         u_printf("reject id=%s: unknown operation %s\n", req.id, req.op);
         reply_simple(req.id, "REJECTED", "code", "UNKNOWN_OP", 0, 0);

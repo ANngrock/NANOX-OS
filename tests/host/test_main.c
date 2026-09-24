@@ -22,6 +22,7 @@ int main(int argc, char **argv)
     test_store(argc > 3 ? argv[3] : NULL);
     test_net();
     test_crypto();
+    test_http();
     printf("host tests: %d checks, %d failed\n", nx_test_checks, nx_test_failures);
     return nx_test_failures ? 1 : 0;
 }

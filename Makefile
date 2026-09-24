@@ -1,4 +1,4 @@
-# NANOX-OS build (M0 bench, M1-M3 kernel and user programs).  One documented sequence from a
+# NANOX-OS build (M0 bench, M1-M5 kernel, user programs and data disk).  One documented sequence from a
 # fresh checkout:
 #
 #     make doctor && make && make test
@@ -74,12 +74,16 @@ USER_PROGS := hello spin ipc-send ipc-recv load core
 CRYPTO_SRCS := lib/crypto/sha512.c lib/crypto/hash.c lib/crypto/drbg.c lib/crypto/aes.c \
     lib/crypto/chacha.c lib/crypto/x25519.c lib/crypto/bn.c lib/crypto/rsa.c lib/crypto/ecdsa.c \
     lib/tls/x509.c lib/tls/tls13.c
+# M5: JSON, HTTP/1.1, event stream and the provider protocol (pure code).
+HTTP_SRCS := lib/http/json.c lib/http/http.c lib/http/messages.c
 USER_ELFS := $(patsubst %,$(BUILD)/user/bin/%,$(USER_PROGS))
 # bin/core (M3): the Cognitive Core executor, several sources.
 CORE_OBJS := $(BUILD)/user/user/core/core.o $(BUILD)/user/user/core/nci.o \
     $(BUILD)/user/user/core/engine.o $(BUILD)/user/user/core/persist.o \
     $(BUILD)/user/lib/store.o $(BUILD)/user/lib/crc32.o \
     $(BUILD)/user/user/core/m5net.o $(BUILD)/user/user/core/m5tls.o \
+    $(BUILD)/user/user/core/provider.o $(BUILD)/user/user/core/agent.o \
+    $(patsubst %.c,$(BUILD)/user/%.o,$(HTTP_SRCS)) \
     $(BUILD)/user/lib/net/nerr.o $(BUILD)/user/lib/net/net.o $(BUILD)/user/lib/net/tcp.o \
     $(BUILD)/user/lib/sha256.o $(patsubst %.c,$(BUILD)/user/%.o,$(CRYPTO_SRCS))
 
@@ -169,11 +173,11 @@ HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_initramfs.c tests/host/test_pt.c tests/host/test_pmm.c \
     tests/host/test_handle.c tests/host/test_ipc.c tests/host/test_event.c \
     tests/host/test_nci.c tests/host/test_engine.c tests/host/test_store.c \
-    tests/host/test_net.c tests/host/test_crypto.c \
+    tests/host/test_net.c tests/host/test_crypto.c tests/host/test_http.c \
     kernel/bootinfo_check.c kernel/initramfs.c kernel/mm/pt.c kernel/mm/pmm.c \
     kernel/obj/handle.c kernel/obj/ipc.c kernel/obj/event.c user/core/nci.c user/core/engine.c \
     lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c lib/store.c lib/crc32.c \
-    lib/net/nerr.c lib/net/net.c lib/net/tcp.c $(CRYPTO_SRCS)
+    lib/net/nerr.c lib/net/net.c lib/net/tcp.c $(CRYPTO_SRCS) $(HTTP_SRCS)
 
 $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
     $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h kernel/mm/*.h kernel/obj/*.h \

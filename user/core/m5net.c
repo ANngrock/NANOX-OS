@@ -499,7 +499,8 @@ static void op_rng_status(struct eng_action *a, const struct nci_req *r, struct 
     res_end(b, a->id);
 }
 
-const char M5_OPS[] = ",net.status,net.ping,net.resolve,net.probe,rng.status,tls.probe";
+const char M5_OPS[] = ",net.status,net.ping,net.resolve,net.probe,rng.status,tls.probe,"
+                      "agent.ask,provider.status,telemetry.status";
 
 op_fn m5_op(const char *op)
 {
@@ -514,5 +515,6 @@ op_fn m5_op(const char *op)
     for (uint32_t i = 0; i < sizeof(T) / sizeof(T[0]); i++)
         if (nci_streq(op, T[i].name))
             return T[i].fn;
-    return m5_tls_op(op);
+    op_fn fn = m5_tls_op(op);
+    return fn ? fn : m5_agent_op(op);
 }

@@ -42,5 +42,6 @@ void test_engine(void);
 void test_store(const char *data_image);
 void test_net(void);
 void test_crypto(void);
+void test_http(void);
 
 #endif
