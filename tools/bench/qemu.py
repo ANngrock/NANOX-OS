@@ -61,13 +61,17 @@ def prepare_vars(dest):
     return dest
 
 
-def base_argv(image, vars_path, serial, extra=()):
+def base_argv(image, vars_path, serial, extra=(), bridge_socket=None):
     """Returns the canonical argv.
 
     image     raw disk image (opened read-only)
     vars_path writable copy of the OVMF NVRAM template
     serial    QEMU -serial backend, e.g. "file:out/runs/x/serial.log" or "stdio"
     extra     additional arguments appended at the end (scenario specific)
+    bridge_socket
+              M3 host bridge: the second serial port (COM2) is connected, as a
+              client, to this unix socket, on which the host bridge listens
+              (docs/m3-core.md)
     """
     argv = [
         QEMU_BINARY,
@@ -89,6 +93,9 @@ def base_argv(image, vars_path, serial, extra=()):
         "-device", "isa-debug-exit,iobase=0x%x,iosize=0x01" % DEBUG_EXIT_IOBASE,
         "-serial", serial,
     ]
+    if bridge_socket:
+        argv += ["-chardev", "socket,id=nxbridge,path=%s,server=off" % bridge_socket,
+                 "-serial", "chardev:nxbridge"]
     argv.extend(extra)
     return argv
 

@@ -38,8 +38,12 @@ import os
 import platform
 import re
 import shlex
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -48,10 +52,12 @@ REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / "tools" / "image"))
 sys.path.insert(0, str(REPO / "tools"))
+sys.path.insert(0, str(REPO / "tools" / "bridge"))
 import doctor  # noqa: E402
 import elfsym  # noqa: E402
 import mkimage  # noqa: E402
 import qemu  # noqa: E402
+import session as bridge_session  # noqa: E402
 
 OUT = REPO / "out"
 SCENARIOS = REPO / "tests" / "qemu" / "scenarios.json"
@@ -158,7 +164,24 @@ def _function(symbol):
     return symbol.split("+", 1)[0] if symbol else None
 
 
-def check_expectation(outcome, expect, serial_text, substitutions, report=None):
+def check_bridge(expect, bridge):
+    """M3: compares the host bridge session with expect["bridge"] =
+    {"ok": bool, "problems": [regex, ...]}: every regex must match one of
+    the problems the host-side checks reported."""
+    problems = []
+    if bridge is None:
+        return ["bridge: expected a host bridge session, none ran"]
+    if "ok" in expect and bridge.get("ok") != expect["ok"]:
+        problems.append("bridge.ok: expected %r, got %r (problems: %s)" % (
+            expect["ok"], bridge.get("ok"), "; ".join(bridge.get("problems", [])[:5])))
+    for pattern in expect.get("problems", []):
+        if not any(re.search(pattern, p) for p in bridge.get("problems", [])):
+            problems.append("bridge: no host-side problem matches %s (have %s)" % (
+                pattern, bridge.get("problems", [])[:5]))
+    return problems
+
+
+def check_expectation(outcome, expect, serial_text, substitutions, report=None, bridge=None):
     """Returns a list of human-readable mismatches (empty = expectation met)."""
     problems = []
     for key in ("verdict", "failure_class", "loader_error"):
@@ -191,6 +214,8 @@ def check_expectation(outcome, expect, serial_text, substitutions, report=None):
             problems.append("serial pattern not found: %s" % pattern)
     if "interleave" in expect:
         problems += check_interleave(serial_text, expect["interleave"])
+    if "bridge" in expect:
+        problems += check_bridge(expect["bridge"], bridge)
     return problems
 
 
@@ -303,13 +328,67 @@ def new_run_dir(runs_root, name):
             path = Path("%s-%d" % (base, n))
 
 
-def run_scenario(sc, runs_root, toolchain, echo=False):
+class BridgeRunner:
+    """M3: the host bridge for one run.  Listens on a unix socket (in a short
+    temporary directory: socket paths are limited to ~100 bytes), QEMU
+    connects COM2 to it, and a thread runs the scenario's bridge session."""
+
+    ACCEPT_TIMEOUT_S = 120
+
+    def __init__(self, spec, run_dir, adapter_override=None):
+        self.spec = dict(spec)
+        if adapter_override:
+            self.spec["adapter"] = adapter_override
+        self.run_dir = run_dir
+        self.dir = tempfile.mkdtemp(prefix="nxb-")
+        self.path = os.path.join(self.dir, "bridge.sock")
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(self.path)
+        self.listener.listen(1)
+        self.conn = None
+        self.result = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def _run(self):
+        try:
+            self.listener.settimeout(self.ACCEPT_TIMEOUT_S)
+            self.conn, _ = self.listener.accept()
+            self.result = bridge_session.run_session(
+                self.conn, self.spec["script"], self.spec.get("adapter"),
+                self.spec.get("request"), str(self.run_dir / "bridge-trace.jsonl"),
+                str(self.run_dir / "bridge-wire.log"))
+        except OSError as e:
+            self.result = {"ok": False, "problems": ["bridge_error: %s" % e]}
+
+    def finish(self):
+        self.thread.join(timeout=15)
+        if self.thread.is_alive() and self.conn:
+            try:
+                self.conn.shutdown(socket.SHUT_RDWR)  # unblocks a pending read
+            except OSError:
+                pass
+            self.thread.join(timeout=5)
+        for s in (self.conn, self.listener):
+            if s:
+                s.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+        res = self.result or {"ok": False, "problems": ["bridge_error: session did not finish"]}
+        res["spec"] = self.spec
+        return res
+
+
+def run_scenario(sc, runs_root, toolchain, echo=False, adapter_override=None):
     image = build_scenario_image(sc)
     run_dir = new_run_dir(runs_root, sc["name"])
     serial_path = run_dir / "serial.log"
     serial_path.touch()
     vars_path = qemu.prepare_vars(run_dir / "OVMF_VARS.fd")
-    argv = qemu.base_argv(image, vars_path, "file:%s" % serial_path, extra=sc["qemu_extra"])
+    bridge = BridgeRunner(sc["bridge"], run_dir, adapter_override) if sc.get("bridge") else None
+    argv = qemu.base_argv(image, vars_path, "file:%s" % serial_path, extra=sc["qemu_extra"],
+                          bridge_socket=bridge.path if bridge else None)
 
     started = datetime.datetime.now(datetime.timezone.utc)
     t0 = time.monotonic()
@@ -317,6 +396,8 @@ def run_scenario(sc, runs_root, toolchain, echo=False):
     with open(run_dir / "qemu-output.log", "wb") as qout, open(serial_path, "rb") as tail:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=qout,
                                 stderr=subprocess.STDOUT)
+        if bridge:
+            bridge.start()
         deadline = t0 + sc["timeout_s"]
         while proc.poll() is None:
             if echo:
@@ -337,6 +418,7 @@ def run_scenario(sc, runs_root, toolchain, echo=False):
             sys.stdout.flush()
     duration = time.monotonic() - t0
     exit_status = proc.returncode
+    bridge_result = bridge.finish() if bridge else None
     os.unlink(vars_path)  # 540 KiB per run; the template hash is recorded instead
 
     serial_bytes = serial_path.read_bytes()
@@ -344,7 +426,7 @@ def run_scenario(sc, runs_root, toolchain, echo=False):
     outcome = classify(serial_text, None if timed_out else exit_status, timed_out)
     subs = {"kernel_sha256": sha256_file(KERNEL_ELF), "initrd_sha256": sha256_file(INITRD)}
     report = analyze_report(serial_text, elfsym.Symbolizer(KERNEL_ELF))
-    problems = check_expectation(outcome, sc["expect"], serial_text, subs, report)
+    problems = check_expectation(outcome, sc["expect"], serial_text, subs, report, bridge_result)
     record = {
         "schema": "nanox.run-record.v1",
         "scenario": sc["name"],
@@ -386,6 +468,7 @@ def run_scenario(sc, runs_root, toolchain, echo=False):
         "reason": outcome["reason"],
         "exception": report["exception"],
         "backtrace": report["backtrace"],
+        "bridge": bridge_result,
         "expected": sc["expect"],
         "expectation_met": not problems,
         "expectation_problems": problems,
@@ -452,7 +535,7 @@ def cmd_run(args):
         sys.stderr.write("harness: unknown scenario %s\n" % args.name)
         return 2
     record, run_dir = run_scenario(scenarios[args.name], args.runs_dir, toolchain_snapshot(),
-                                   echo=args.echo)
+                                   echo=args.echo, adapter_override=args.adapter)
     print("\nharness: %s verdict=%s class=%s exit=%s record=%s" % (
         args.name, record["verdict"], record["failure_class"] or "-",
         record["result"]["exit_status"], run_dir / "record.json"))
@@ -552,6 +635,8 @@ def main(argv=None):
     r = sub.add_parser("run")
     r.add_argument("name")
     r.add_argument("--echo", action="store_true")
+    r.add_argument("--adapter", default=None,
+                   help="M3: model adapter of the host bridge (mock, unavailable, anthropic)")
     r.set_defaults(func=cmd_run)
     rp = sub.add_parser("repeat")
     rp.add_argument("names", nargs="+")
