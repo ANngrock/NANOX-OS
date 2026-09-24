@@ -9,9 +9,18 @@
 #include "arch/x86_64/trap.h"
 #include "kernel.h"
 #include "mm/mm.h"
+#include "obj/event.h"
 #include "obj/ipc.h"
 #include "obj/vmo.h"
 #include "task.h"
+
+_Static_assert(NX_TASK_READY == NX_TS_READY && NX_TASK_RUNNING == NX_TS_RUNNING &&
+                   NX_TASK_BLOCKED == NX_TS_BLOCKED && NX_TASK_DEAD == NX_TS_DEAD &&
+                   NX_TASK_REAPED == NX_TS_REAPED,
+               "task states in the ABI");
+_Static_assert(NX_END_EXIT == NX_TE_EXIT && NX_END_FAULT == NX_TE_FAULT &&
+                   NX_END_KILLED == NX_TE_KILLED && NX_END_KERNEL == NX_TE_KERNEL,
+               "task ends in the ABI");
 
 struct nx_task *nx_current;
 uint64_t nx_sched_switches;
@@ -23,6 +32,10 @@ static uint32_t next_id = 1;
 static int preempt_enabled;
 static uint64_t watchdog_deadline;
 static const char *watchdog_what;
+static struct nx_task *reaper;
+static char sleep_token; /* blocked_on value of sleeping tasks */
+struct nx_evlog nx_events = {.next = 1};
+uint64_t nx_boot_id;
 
 /* ---- helpers ------------------------------------------------------------ */
 
@@ -37,6 +50,15 @@ static void irq_restore(uint64_t f)
 {
     if (f & NX_RFLAGS_IF)
         nx_sti();
+}
+
+/* Lifecycle event of a user task; bumps its revision. */
+static void task_event(struct nx_task *t, uint32_t type, int64_t arg)
+{
+    if (!t->user)
+        return;
+    t->rev++;
+    nx_evlog_push(&nx_events, nx_timer_ticks, type, t->id, arg);
 }
 
 static void release_slot(struct nx_object *o)
@@ -175,6 +197,10 @@ static void sched_tick(struct nx_trap_frame *f)
     nx_current->ticks++;
     if (nx_current->slice)
         nx_current->slice--;
+    for (uint32_t s = 0; s < NX_TASK_MAX; s++)
+        if (tasks[s].state == NX_TASK_BLOCKED && tasks[s].blocked_on == &sleep_token &&
+            nx_timer_ticks >= tasks[s].wake_tick)
+            nx_task_wake(&tasks[s]);
     if (watchdog_deadline && nx_timer_ticks >= watchdog_deadline) {
         nx_printf("NANOX: TEST FAIL watchdog: %s not finished in time (running %s#%u,"
                   " preemption %s)\n",
@@ -205,6 +231,12 @@ void nx_task_block(void *on)
     nx_current->state = NX_TASK_BLOCKED;
     nx_current->blocked_on = on;
     nx_schedule();
+}
+
+void nx_task_sleep(uint64_t ticks)
+{
+    nx_current->wake_tick = nx_timer_ticks + ticks;
+    nx_task_block(&sleep_token);
 }
 
 void nx_task_wake(struct nx_task *t)
@@ -392,6 +424,8 @@ struct nx_task *nx_utask_create(const char *name, const uint8_t *elf, uint64_t s
     for (int i = 0; i < 6; i++)
         *--sp = 0;
     t->saved_rsp = (uint64_t)(uintptr_t)sp;
+    t->created_tick = nx_timer_ticks;
+    task_event(t, NX_EV_TASK_CREATED, 0);
     return t;
 }
 
@@ -411,8 +445,11 @@ void nx_task_set_arg(struct nx_task *t, unsigned index, uint64_t value)
 void nx_task_start(struct nx_task *t)
 {
     uint64_t f = irq_save();
-    if (t->state == NX_TASK_BLOCKED && !t->blocked_on)
+    if (t->state == NX_TASK_BLOCKED && !t->blocked_on && !t->started) {
         t->state = NX_TASK_READY;
+        t->started = 1;
+        task_event(t, NX_EV_TASK_STARTED, 0);
+    }
     irq_restore(f);
 }
 
@@ -421,13 +458,21 @@ void nx_task_start(struct nx_task *t)
 static void end_task(struct nx_task *t, int end)
 {
     struct nx_endpoint *ep = t->blocked_on;
-    if (t->state == NX_TASK_BLOCKED && ep && ep->waiter == t)
+    if (t->state == NX_TASK_BLOCKED && ep && t->blocked_on != &sleep_token && ep->waiter == t)
         ep->waiter = 0;
     t->blocked_on = 0;
     t->end = end;
     t->state = NX_TASK_DEAD;
+    t->ended_tick = nx_timer_ticks;
+    switch (end) {
+    case NX_END_EXIT: task_event(t, NX_EV_TASK_EXITED, t->exit_code); break;
+    case NX_END_FAULT: task_event(t, NX_EV_TASK_FAULTED, (int64_t)t->fault_vector); break;
+    default: task_event(t, NX_EV_TASK_KILLED, t->killer_id); break;
+    }
     if (t->waiter)
         nx_task_wake(t->waiter);
+    else if (reaper)
+        nx_task_wake(reaper);
 }
 
 void nx_task_exit_current(int64_t code)
@@ -505,6 +550,7 @@ static void reap(struct nx_task *t)
     }
     kstack_free(t);
     t->state = NX_TASK_REAPED;
+    task_event(t, NX_EV_TASK_REAPED, 0);
     nx_obj_unref(&t->base);
 }
 
@@ -537,4 +583,63 @@ uint32_t nx_task_live_count(void)
     for (uint32_t s = 0; s < NX_TASK_MAX; s++)
         n += tasks[s].state != NX_TASK_FREE && tasks[s].state != NX_TASK_REAPED;
     return n;
+}
+
+/* ---- M3: reaper, task information --------------------------------------- */
+
+static int64_t reaper_main(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        for (uint32_t s = 0; s < NX_TASK_MAX; s++) {
+            struct nx_task *t = &tasks[s];
+            if (t->state == NX_TASK_DEAD && !t->waiter)
+                reap(t);
+        }
+        nx_task_block(0);
+    }
+}
+
+void nx_reaper_start(void)
+{
+    reaper = nx_kthread_create("reaper", reaper_main, 0);
+    if (!reaper)
+        nx_panic("sched: cannot create the reaper thread");
+    nx_task_start(reaper);
+}
+
+void nx_task_fill_info(const struct nx_task *t, struct nx_task_info *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->id = t->id;
+    out->state = (uint32_t)t->state;
+    out->end = (uint32_t)t->end;
+    out->flags = t->user ? NX_TASK_INFO_USER : 0;
+    out->exit_code = t->exit_code;
+    out->ticks = t->ticks;
+    out->syscalls = t->syscalls;
+    out->rev = t->rev;
+    out->created_tick = t->created_tick;
+    out->ended_tick = t->ended_tick;
+    out->killer_id = t->killer_id;
+    for (uint32_t i = 0; i < NX_TASK_NAME && t->name[i]; i++)
+        out->name[i] = t->name[i];
+}
+
+uint32_t nx_task_list(struct nx_task_info *out, uint32_t cap)
+{
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < NX_TASK_MAX; s++) {
+        if (tasks[s].state == NX_TASK_FREE)
+            continue;
+        if (n < cap)
+            nx_task_fill_info(&tasks[s], &out[n]);
+        n++;
+    }
+    return n;
+}
+
+uint32_t nx_task_next_id(void)
+{
+    return next_id;
 }

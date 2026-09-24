@@ -25,6 +25,7 @@ enum nx_obj_type {
     NX_OBJ_ENDPOINT = 2,
     NX_OBJ_VMO = 3,
     NX_OBJ_SOVEREIGN = 4,
+    NX_OBJ_CHANNEL = 5, /* M3: host bridge serial channel */
 };
 
 struct nx_object {

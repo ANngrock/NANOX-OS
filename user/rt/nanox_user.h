@@ -82,6 +82,61 @@ static inline int64_t nx_ipc_recv(uint64_t ep, void *buf, uint64_t cap, struct n
                   (uint64_t)(uintptr_t)info, 0);
 }
 
+static inline int64_t nx_sov_task_open(uint64_t sov, uint64_t id)
+{
+    return nx_sys(NX_SYS_SOV_TASK_OPEN, sov, id, 0, 0, 0);
+}
+
+static inline int64_t nx_task_kill(uint64_t th)
+{
+    return nx_sys(NX_SYS_TASK_KILL, th, 0, 0, 0, 0);
+}
+
+/* ---- M3 ---- */
+
+static inline int64_t nx_sleep(uint64_t ticks)
+{
+    return nx_sys(NX_SYS_SLEEP, ticks, 0, 0, 0, 0);
+}
+
+static inline int64_t nx_sys_info(struct nx_sys_info *info)
+{
+    return nx_sys(NX_SYS_SYS_INFO, (uint64_t)(uintptr_t)info, 0, 0, 0, 0);
+}
+
+static inline int64_t nx_sov_task_spawn(uint64_t sov, const char *path, uint64_t len,
+                                        const uint64_t args[4])
+{
+    return nx_sys(NX_SYS_SOV_TASK_SPAWN, sov, (uint64_t)(uintptr_t)path, len,
+                  (uint64_t)(uintptr_t)args, 0);
+}
+
+static inline int64_t nx_task_info(uint64_t th, struct nx_task_info *info)
+{
+    return nx_sys(NX_SYS_TASK_INFO, th, (uint64_t)(uintptr_t)info, 0, 0, 0);
+}
+
+static inline int64_t nx_sov_task_list(uint64_t sov, struct nx_task_info *list, uint64_t cap)
+{
+    return nx_sys(NX_SYS_SOV_TASK_LIST, sov, (uint64_t)(uintptr_t)list, cap, 0, 0);
+}
+
+static inline int64_t nx_sov_event_read(uint64_t sov, uint64_t since, struct nx_event *ev,
+                                        uint64_t cap)
+{
+    return nx_sys(NX_SYS_SOV_EVENT_READ, sov, since, (uint64_t)(uintptr_t)ev, cap, 0);
+}
+
+static inline int64_t nx_chan_read(uint64_t ch, void *buf, uint64_t cap, uint64_t timeout)
+{
+    return nx_sys(NX_SYS_CHAN_READ, ch, (uint64_t)(uintptr_t)buf, cap, timeout, 0);
+}
+
+static inline int64_t nx_chan_write(uint64_t ch, const void *buf, uint64_t len)
+{
+    return nx_sys(NX_SYS_CHAN_WRITE, ch, (uint64_t)(uintptr_t)buf, len, 0, 0);
+}
+
 /* Current privilege level (low bits of CS). */
 static inline uint64_t u_cpl(void)
 {

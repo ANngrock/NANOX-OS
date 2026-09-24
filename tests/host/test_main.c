@@ -15,6 +15,9 @@ int main(int argc, char **argv)
     test_pmm();
     test_handle();
     test_ipc();
+    test_event();
+    test_nci();
+    test_engine();
     test_initramfs(argc > 2 ? argv[2] : NULL);
     printf("host tests: %d checks, %d failed\n", nx_test_checks, nx_test_failures);
     return nx_test_failures ? 1 : 0;

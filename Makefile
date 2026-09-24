@@ -1,4 +1,4 @@
-# NANOX-OS build (M0 bench, M1/M2 kernel).  One documented sequence from a
+# NANOX-OS build (M0 bench, M1-M3 kernel and user programs).  One documented sequence from a
 # fresh checkout:
 #
 #     make doctor && make && make test
@@ -49,8 +49,8 @@ KERNEL_CSRCS := kernel/main.c kernel/panic.c kernel/bootinfo_check.c \
     kernel/initramfs.c kernel/faults.c kernel/arch/x86_64/gdt.c \
     kernel/arch/x86_64/idt.c kernel/arch/x86_64/timer.c kernel/mm/pmm.c kernel/mm/pt.c \
     kernel/mm/vmm.c kernel/mm/uaccess.c kernel/obj/handle.c kernel/obj/ipc.c \
-    kernel/obj/objects.c kernel/task.c kernel/syscall.c kernel/m2test.c \
-    lib/elf_plan.c lib/serial.c lib/printf.c lib/string.c lib/sha256.c
+    kernel/obj/objects.c kernel/obj/event.c kernel/task.c kernel/syscall.c kernel/m2test.c \
+    kernel/chan.c kernel/m3test.c lib/elf_plan.c lib/serial.c lib/printf.c lib/string.c lib/sha256.c
 KERNEL_ASRCS := kernel/arch/x86_64/entry.S kernel/arch/x86_64/isr.S
 KERNEL_OBJS := $(patsubst %.c,$(BUILD)/kernel/%.o,$(KERNEL_CSRCS)) \
     $(patsubst %.S,$(BUILD)/kernel/%.o,$(KERNEL_ASRCS))
@@ -67,8 +67,11 @@ USER_LDFLAGS := -nostdlib -static --build-id=none -z max-page-size=4096 \
     -z noexecstack -T user/user.ld
 USER_RT_OBJS := $(BUILD)/user/user/rt/start.o $(BUILD)/user/user/rt/rt.o \
     $(BUILD)/user/lib/string.o
-USER_PROGS := hello spin ipc-send ipc-recv
+USER_PROGS := hello spin ipc-send ipc-recv load core
 USER_ELFS := $(patsubst %,$(BUILD)/user/bin/%,$(USER_PROGS))
+# bin/core (M3): the Cognitive Core executor, several sources.
+CORE_OBJS := $(BUILD)/user/user/core/core.o $(BUILD)/user/user/core/nci.o \
+    $(BUILD)/user/user/core/engine.o
 
 LOADER_EFI := $(OUT)/BOOTX64.EFI
 KERNEL_ELF := $(OUT)/kernel.elf
@@ -109,6 +112,10 @@ $(BUILD)/user/%.o: %.S
 	@mkdir -p $(@D)
 	$(CLANG) $(USER_ASFLAGS) -MMD -MP -c $< -o $@
 
+$(BUILD)/user/bin/core: $(CORE_OBJS) $(USER_RT_OBJS) user/user.ld
+	@mkdir -p $(@D)
+	$(LD_LLD) $(USER_LDFLAGS) -o $@ $(USER_RT_OBJS) $(CORE_OBJS)
+
 $(BUILD)/user/bin/%: $(BUILD)/user/user/test/%.o $(USER_RT_OBJS) user/user.ld
 	@mkdir -p $(@D)
 	$(LD_LLD) $(USER_LDFLAGS) -o $@ $(USER_RT_OBJS) $<
@@ -128,7 +135,7 @@ $(OUT)/SHA256SUMS: $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) $(IMAGE)
 	@cat $@
 
 -include $(LOADER_OBJS:.obj=.d) $(KERNEL_OBJS:.o=.d) $(USER_RT_OBJS:.o=.d) \
-    $(patsubst %,$(BUILD)/user/user/test/%.d,$(USER_PROGS))
+    $(CORE_OBJS:.o=.d) $(patsubst %,$(BUILD)/user/user/test/%.d,$(filter-out core,$(USER_PROGS)))
 
 # ---- Environment check ------------------------------------------------------
 doctor:
@@ -138,18 +145,19 @@ doctor:
 # Host unit tests: loader/kernel C code compiled for the host.
 HOST_SAN ?= -fsanitize=undefined -fsanitize-trap=undefined
 HOST_CFLAGS := -std=c17 -O1 -g $(WARN_FLAGS) $(HOST_SAN) -Iabi -Ilib/include \
-    -Ikernel -Iboot/uefi
+    -Ikernel -Iboot/uefi -Iuser/core
 HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_sha256.c tests/host/test_elf.c tests/host/test_mmap.c \
     tests/host/test_initramfs.c tests/host/test_pt.c tests/host/test_pmm.c \
-    tests/host/test_handle.c tests/host/test_ipc.c \
+    tests/host/test_handle.c tests/host/test_ipc.c tests/host/test_event.c \
+    tests/host/test_nci.c tests/host/test_engine.c \
     kernel/bootinfo_check.c kernel/initramfs.c kernel/mm/pt.c kernel/mm/pmm.c \
-    kernel/obj/handle.c kernel/obj/ipc.c \
+    kernel/obj/handle.c kernel/obj/ipc.c kernel/obj/event.c user/core/nci.c user/core/engine.c \
     lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c
 
 $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
     $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h kernel/mm/*.h kernel/obj/*.h \
-        boot/uefi/*.h)
+        boot/uefi/*.h user/core/*.h)
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_TEST_SRCS)
 

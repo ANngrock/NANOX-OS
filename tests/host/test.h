@@ -36,5 +36,8 @@ void test_pt(void);
 void test_pmm(void);
 void test_handle(void);
 void test_ipc(void);
+void test_event(void);
+void test_nci(void);
+void test_engine(void);
 
 #endif

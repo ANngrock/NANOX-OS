@@ -16,6 +16,9 @@
  *   timer-masked    timer left masked: the timer check must report TEST FAIL
  *   m2-user, m2-sched, m2-sched-nopreempt, m2-ipc, m2-ipc-overgrant
  *                   scheduler, user tasks and IPC (kernel/m2test.c)
+ *   m3-serve, m3-kill-noop, m3-events-off, m3-nodedup
+ *                   Cognitive Core executor serving the host bridge
+ *                   (kernel/m3test.c)
  */
 #include <stdint.h>
 
@@ -34,6 +37,7 @@
 #include "initramfs.h"
 #include "kernel.h"
 #include "m2test.h"
+#include "m3test.h"
 #include "mm/mm.h"
 
 /* M0/M1 early boot runs on the UEFI identity mapping: physical == virtual. */
@@ -92,6 +96,10 @@ static const struct test_mode MODES[] = {
     {"m2-sched-nopreempt", K_M2, nx_m2_sched_nopreempt},
     {"m2-ipc", K_M2, nx_m2_ipc},
     {"m2-ipc-overgrant", K_M2, nx_m2_ipc_overgrant},
+    {"m3-serve", K_M2, nx_m3_serve},
+    {"m3-kill-noop", K_M2, nx_m3_kill_noop},
+    {"m3-events-off", K_M2, nx_m3_events_off},
+    {"m3-nodedup", K_M2, nx_m3_nodedup},
 };
 
 static int token_eq(const char *tok, uint32_t len, const char *lit)
@@ -361,7 +369,7 @@ __attribute__((noreturn)) static void run_mode(const struct test_mode *mode, uin
     case K_TIMER_MASKED: test_fail("timer-masked: the timer check did not detect the masked timer");
     case K_M2:
         mode->fn();
-        test_fail("M2 test returned without a verdict");
+        test_fail("M2/M3 test returned without a verdict");
     }
     test_fail("bad test mode");
 }

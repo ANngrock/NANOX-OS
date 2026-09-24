@@ -13,8 +13,8 @@
         "patterns": [
           "^NANOX: kernel sha256 {kernel_sha256}$",
           "^NANOX: bootinfo acpi_rsdp=0x[0-9a-f]+$",
-          "^NANOX: initramfs ok entries=8 bytes=[0-9]+ sha256={initrd_sha256}$",
-          "^NANOX: initramfs release \"NANOX-OS initramfs M2\"$",
+          "^NANOX: initramfs ok entries=10 bytes=[0-9]+ sha256={initrd_sha256}$",
+          "^NANOX: initramfs release \"NANOX-OS initramfs M3\"$",
           "^NANOX: cpu gdt\\+tss\\+idt loaded ",
           "^NANOX: selftest breakpoint ok resumed=2$",
           "^NANOX: pmm ok span_pages=[0-9]+ managed=[1-9][0-9]* ",

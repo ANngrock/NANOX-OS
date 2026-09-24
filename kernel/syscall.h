@@ -13,6 +13,9 @@ extern int nx_inject_uaccess_unchecked;
 /* Fault injection: deliver transferred handles with all of the sender's
  * rights (negative control nanox.test=m2-ipc-overgrant). */
 extern int nx_inject_ipc_overgrant;
+/* Fault injection: NX_SYS_TASK_KILL reports success without terminating
+ * the task (negative control nanox.test=m3-kill-noop). */
+extern int nx_inject_kill_noop;
 /* Print one serial line per IPC send/receive (nanox.test=m2-ipc*). */
 extern int nx_trace_ipc;
 
