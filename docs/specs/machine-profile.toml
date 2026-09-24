@@ -1,0 +1,24 @@
+schema_version = 1
+profile = "M0 q35 TCG"
+machine = "pc-q35-9.2"
+qemu_version = "9.2.4"
+qemu_patch = "nanox-replay-exit-v1; tools/qemu/replay-exit-code.patch; trace version 0xe0200d"
+cpu = "qemu64,+nx,-rdrand,-rdseed"
+vcpu = 1
+ram_mib = 512
+accelerator = "tcg,thread=single"
+rtc = "base=2026-09-22T00:00:00,clock=vm"
+network = "none"
+display = "none"
+boot_controller = "ide-hd on q35 AHCI ide.0"
+serial = "COM1, 0x3f8, file backend"
+debug_exit = "isa-debug-exit,iobase=0xf4,iosize=4"
+timeout_seconds = 30
+rust = "1.90.0"
+firmware = "Nix OVMF 202411, Secure Boot disabled"
+firmware_code_sha256 = "dbdf27ebd6373f56035b3b2389c9bfbe8de320651e2a085293329e1b6c8170c4"
+firmware_vars_sha256 = "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e"
+firmware_mapping = "pflash0=CODE readonly, pflash1=VARS with fresh qcow2 overlay"
+replay = "icount shift=3; disk blkreplay; synchronous pflash without filter; initial and final VARS bytes checked"
+inputs = "fresh disk overlay; VARS from the same original template for record and replay"
+evidence = "See docs/STATUS.md; complete argv and hashes are in each RunRecord"

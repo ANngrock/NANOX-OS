@@ -1,0 +1,8 @@
+/target/
+/out/
+/.env
+/.env.*
+/.local/
+*.qcow2
+*.img
+*.fd
