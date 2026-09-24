@@ -80,6 +80,7 @@ typedef enum {
 #define NX_EFI_TYPE_KERNEL_IMAGE 0x80000001u
 #define NX_EFI_TYPE_KERNEL_STACK 0x80000002u
 #define NX_EFI_TYPE_BOOT_INFO 0x80000003u
+#define NX_EFI_TYPE_INITRD 0x80000004u
 
 typedef enum { AllocateAnyPages = 0, AllocateMaxAddress = 1, AllocateAddress = 2 } EFI_ALLOCATE_TYPE;
 

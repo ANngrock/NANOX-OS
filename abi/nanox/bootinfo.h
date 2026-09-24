@@ -1,5 +1,5 @@
 /*
- * NANOX boot info ABI, version 1.0.
+ * NANOX boot info ABI, version 1.1.
  *
  * Passed by the UEFI loader (boot/uefi) to the kernel entry point after
  * ExitBootServices().  The byte layout is normative and documented in
@@ -14,8 +14,11 @@
  *  - version_minor changes only when fields or flag bits are appended at the
  *    end; existing offsets and meanings never change within a major.
  *  - `size` is the number of bytes of struct nx_boot_info written by the
- *    loader.  It must be >= NX_BOOTINFO_V1_SIZE; when version_minor equals
- *    the kernel's minor it must be exactly sizeof(struct nx_boot_info).
+ *    loader.  For a minor the kernel knows it must equal that minor's size
+ *    (1.0: 192, 1.1: 224); for a newer minor it must be at least the
+ *    kernel's sizeof(struct nx_boot_info).
+ *  - A newer minor may also add memory region types; a kernel treats types
+ *    it does not know as reserved only when version_minor is newer.
  */
 #ifndef NANOX_ABI_BOOTINFO_H
 #define NANOX_ABI_BOOTINFO_H
@@ -26,15 +29,19 @@
 /* "NANOX_BI" in little-endian byte order. */
 #define NX_BOOTINFO_MAGIC 0x49425F584F4E414EULL
 #define NX_BOOTINFO_VERSION_MAJOR 1u
-#define NX_BOOTINFO_VERSION_MINOR 0u
-#define NX_BOOTINFO_V1_SIZE 192u
+#define NX_BOOTINFO_VERSION_MINOR 1u
+/* Size of the structure as defined by each minor of major 1. */
+#define NX_BOOTINFO_V1_SIZE 192u   /* 1.0 */
+#define NX_BOOTINFO_V1_1_SIZE 224u /* 1.1: + initrd_sha256 */
 /* Upper bound accepted by the validator for `size` (future minors). */
 #define NX_BOOTINFO_MAX_SIZE 4096u
 
 /* flags */
 #define NX_BI_HAS_ACPI_RSDP (1ull << 0)
 #define NX_BI_HAS_FRAMEBUFFER (1ull << 1)
+#define NX_BI_HAS_INITRD (1ull << 2) /* since 1.1 */
 #define NX_BI_KNOWN_FLAGS_V1_0 (NX_BI_HAS_ACPI_RSDP | NX_BI_HAS_FRAMEBUFFER)
+#define NX_BI_KNOWN_FLAGS_V1_1 (NX_BI_KNOWN_FLAGS_V1_0 | NX_BI_HAS_INITRD)
 
 /* Memory region types (nx_mem_region.type). */
 enum nx_mem_type {
@@ -47,10 +54,12 @@ enum nx_mem_type {
     NX_MEM_KERNEL_IMAGE = 7,     /* loaded kernel segments (whole span) */
     NX_MEM_KERNEL_STACK = 8,     /* initial kernel stack */
     NX_MEM_BOOT_INFO = 9,        /* this struct, cmdline, memory map */
-    NX_MEM_FIRMWARE_RUNTIME = 10 /* UEFI runtime services code/data */
+    NX_MEM_FIRMWARE_RUNTIME = 10, /* UEFI runtime services code/data */
+    NX_MEM_INITRD = 11            /* initramfs image (since 1.1) */
 };
 #define NX_MEM_TYPE_MIN 1u
-#define NX_MEM_TYPE_MAX 10u
+#define NX_MEM_TYPE_MAX_V1_0 10u
+#define NX_MEM_TYPE_MAX 11u
 
 #define NX_PAGE_SIZE 4096u
 /* Validator limit for mmap_count. */
@@ -97,8 +106,8 @@ struct nx_boot_info {
     uint32_t cmdline_len;  /*  88 bytes, excluding NUL */
     uint32_t reserved0;    /*  92 must be 0 */
 
-    uint64_t initrd_phys; /*  96 reserved for M1, must be 0 in v1.0 */
-    uint64_t initrd_size; /* 104 reserved for M1, must be 0 in v1.0 */
+    uint64_t initrd_phys; /*  96 1.1: initramfs, page aligned, iff NX_BI_HAS_INITRD; 1.0: 0 */
+    uint64_t initrd_size; /* 104 1.1: bytes (not rounded); 1.0: 0 */
 
     uint64_t acpi_rsdp_phys; /* 112 valid iff NX_BI_HAS_ACPI_RSDP, else 0 */
 
@@ -112,7 +121,10 @@ struct nx_boot_info {
     uint64_t uefi_system_table_phys; /* 152 informational; boot services are gone */
 
     uint8_t kernel_sha256[32]; /* 160 SHA-256 of KERNEL.ELF verified by the loader */
-};                             /* 192 */
+
+    /* ---- 1.1 ---- */
+    uint8_t initrd_sha256[32]; /* 192 SHA-256 of the initramfs verified by the loader */
+};                             /* 224 */
 
 #define NX_BI_ASSERT_OFFSET(field, off)                                       \
     _Static_assert(offsetof(struct nx_boot_info, field) == (off),           \
@@ -145,7 +157,8 @@ NX_BI_ASSERT_OFFSET(fb_pitch, 144);
 NX_BI_ASSERT_OFFSET(fb_format, 148);
 NX_BI_ASSERT_OFFSET(uefi_system_table_phys, 152);
 NX_BI_ASSERT_OFFSET(kernel_sha256, 160);
-_Static_assert(sizeof(struct nx_boot_info) == NX_BOOTINFO_V1_SIZE, "nx_boot_info size");
+NX_BI_ASSERT_OFFSET(initrd_sha256, 192);
+_Static_assert(sizeof(struct nx_boot_info) == NX_BOOTINFO_V1_1_SIZE, "nx_boot_info size");
 
 _Static_assert(offsetof(struct nx_mem_region, base) == 0, "nx_mem_region.base");
 _Static_assert(offsetof(struct nx_mem_region, length) == 8, "nx_mem_region.length");

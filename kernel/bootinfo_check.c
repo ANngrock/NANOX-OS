@@ -1,7 +1,8 @@
 #include "bootinfo_check.h"
 
 #define PAGE_MASK ((uint64_t)NX_PAGE_SIZE - 1)
-#define TYPE_BIT(t) (1u << (t))
+/* Types >= 32 can only come from a newer minor and are never in a mask. */
+#define TYPE_BIT(t) ((t) < 32u ? 1u << (t) : 0u)
 
 static int fail(struct nx_bi_result *r, int err, uint32_t index)
 {
@@ -48,6 +49,40 @@ static int overlaps_types(const struct nx_mem_region *rg, uint32_t n, uint64_t s
             return 1;
     }
     return 0;
+}
+
+/* Size and known flags of each minor of major 1 this kernel understands. */
+static uint32_t minor_size(uint16_t minor)
+{
+    return minor == 0 ? NX_BOOTINFO_V1_SIZE : NX_BOOTINFO_V1_1_SIZE;
+}
+
+static uint64_t minor_flags(uint16_t minor)
+{
+    return minor == 0 ? NX_BI_KNOWN_FLAGS_V1_0 : NX_BI_KNOWN_FLAGS_V1_1;
+}
+
+static uint32_t minor_max_type(uint16_t minor)
+{
+    return minor == 0 ? NX_MEM_TYPE_MAX_V1_0 : NX_MEM_TYPE_MAX;
+}
+
+static int check_initrd(const struct nx_boot_info *bi, const struct nx_mem_region *rg, uint32_t n)
+{
+    if (bi->version_minor == 0 || !(bi->flags & NX_BI_HAS_INITRD)) {
+        if (bi->initrd_phys != 0 || bi->initrd_size != 0)
+            return 0;
+        if (bi->version_minor >= 1)
+            for (unsigned i = 0; i < sizeof(bi->initrd_sha256); i++)
+                if (bi->initrd_sha256[i])
+                    return 0;
+        return 1;
+    }
+    if (bi->initrd_phys == 0 || (bi->initrd_phys & PAGE_MASK) || bi->initrd_size == 0 ||
+        bi->initrd_size > UINT64_MAX - PAGE_MASK)
+        return 0;
+    uint64_t span = (bi->initrd_size + PAGE_MASK) & ~PAGE_MASK;
+    return covered_by(rg, n, bi->initrd_phys, span, NX_MEM_INITRD);
 }
 
 static int checksum_ok(const uint8_t *p, uint32_t len)
@@ -107,7 +142,7 @@ static int check_framebuffer(const struct nx_boot_info *bi, const struct nx_mem_
         return 0;
     uint32_t ram = TYPE_BIT(NX_MEM_USABLE) | TYPE_BIT(NX_MEM_KERNEL_IMAGE) |
                    TYPE_BIT(NX_MEM_KERNEL_STACK) | TYPE_BIT(NX_MEM_BOOT_INFO) |
-                   TYPE_BIT(NX_MEM_BOOT_RECLAIMABLE);
+                   TYPE_BIT(NX_MEM_BOOT_RECLAIMABLE) | TYPE_BIT(NX_MEM_INITRD);
     return !overlaps_types(rg, n, bi->fb_phys, bi->fb_size, ram);
 }
 
@@ -123,18 +158,19 @@ int nx_bootinfo_check(const struct nx_bi_check *c, struct nx_bi_result *r)
         return fail(r, NX_BI_E_MAGIC, 0);
     if (hdr->version_major != NX_BOOTINFO_VERSION_MAJOR)
         return fail(r, NX_BI_E_VERSION, 0);
-    if (hdr->size < NX_BOOTINFO_V1_SIZE || hdr->size > NX_BOOTINFO_MAX_SIZE ||
-        (hdr->version_minor <= NX_BOOTINFO_VERSION_MINOR &&
-         hdr->size != sizeof(struct nx_boot_info)))
+    int newer = hdr->version_minor > NX_BOOTINFO_VERSION_MINOR;
+    if (hdr->size > NX_BOOTINFO_MAX_SIZE ||
+        (!newer && hdr->size != minor_size(hdr->version_minor)) ||
+        (newer && hdr->size < sizeof(struct nx_boot_info)))
         return fail(r, NX_BI_E_SIZE, 0);
     const struct nx_boot_info *bi = c->map(c->opaque, c->bi_phys, hdr->size);
     if (!bi)
         return fail(r, NX_BI_E_NULL, 0);
 
-    if (bi->version_minor <= NX_BOOTINFO_VERSION_MINOR &&
-        (bi->flags & ~(uint64_t)NX_BI_KNOWN_FLAGS_V1_0))
+    if (!newer && (bi->flags & ~minor_flags(bi->version_minor)))
         return fail(r, NX_BI_E_FLAGS, 0);
-    if (bi->reserved0 != 0 || bi->initrd_phys != 0 || bi->initrd_size != 0)
+    if (bi->reserved0 != 0 ||
+        (bi->version_minor == 0 && (bi->initrd_phys != 0 || bi->initrd_size != 0)))
         return fail(r, NX_BI_E_RESERVED, 0);
 
     /* ---- memory map ---- */
@@ -159,7 +195,8 @@ int nx_bootinfo_check(const struct nx_bi_check *c, struct nx_bi_result *r)
             return fail(r, NX_BI_E_MMAP_ALIGN, i);
         if (e->length > UINT64_MAX - e->base)
             return fail(r, NX_BI_E_MMAP_OVERFLOW, i);
-        if (e->type < NX_MEM_TYPE_MIN || e->type > NX_MEM_TYPE_MAX)
+        /* A newer minor may add region types; they count as reserved. */
+        if (e->type < NX_MEM_TYPE_MIN || (!newer && e->type > minor_max_type(bi->version_minor)))
             return fail(r, NX_BI_E_MMAP_TYPE, i);
         if (e->flags != 0)
             return fail(r, NX_BI_E_MMAP_FLAGS, i);
@@ -212,6 +249,8 @@ int nx_bootinfo_check(const struct nx_bi_check *c, struct nx_bi_result *r)
         return fail(r, NX_BI_E_RSDP, 0);
     if (!check_framebuffer(bi, rg, n))
         return fail(r, NX_BI_E_FRAMEBUFFER, 0);
+    if (!check_initrd(bi, rg, n))
+        return fail(r, NX_BI_E_INITRD, 0);
 
     r->error = NX_BI_OK;
     r->index = 0;
@@ -250,6 +289,7 @@ const char *nx_bi_strerror(int e)
         [NX_BI_E_CMDLINE] = "E_CMDLINE",
         [NX_BI_E_RSDP] = "E_RSDP",
         [NX_BI_E_FRAMEBUFFER] = "E_FRAMEBUFFER",
+        [NX_BI_E_INITRD] = "E_INITRD",
     };
     if (e < 0 || e >= NX_BI_E__COUNT)
         return "E_UNKNOWN";

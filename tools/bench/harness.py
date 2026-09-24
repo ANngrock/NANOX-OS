@@ -46,6 +46,7 @@ OUT = REPO / "out"
 SCENARIOS = REPO / "tests" / "qemu" / "scenarios.json"
 LOADER_EFI = OUT / "BOOTX64.EFI"
 KERNEL_ELF = OUT / "kernel.elf"
+INITRD = OUT / "initrd.img"
 
 EXIT_PASS, EXIT_FAIL, EXIT_PANIC, EXIT_LOADER = 33, 35, 37, 39
 PASS_SEQUENCE = ("NANOX: loader start", "NANOX: loader exit_boot_services ok",
@@ -173,10 +174,15 @@ def load_scenarios():
 
 def build_scenario_image(sc):
     spec = sc["image"]
-    img = mkimage.build_image(LOADER_EFI.read_bytes(), KERNEL_ELF.read_bytes(),
+    initrd = INITRD.read_bytes()
+    if "initrd_text" in spec:  # replacement initramfs, still described by the manifest
+        initrd = spec["initrd_text"].encode("ascii")
+    img = mkimage.build_image(LOADER_EFI.read_bytes(), KERNEL_ELF.read_bytes(), initrd,
                               cmdline=spec.get("cmdline", ""),
                               omit_kernel=spec.get("omit_kernel", False),
-                              corrupt_kernel=spec.get("corrupt_kernel", False))
+                              corrupt_kernel=spec.get("corrupt_kernel", False),
+                              omit_initrd=spec.get("omit_initrd", False),
+                              corrupt_initrd=spec.get("corrupt_initrd", False))
     path = OUT / "images" / ("%s.img" % sc["name"])
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".img.tmp")
@@ -235,9 +241,8 @@ def run_scenario(sc, runs_root, toolchain, echo=False):
     serial_bytes = serial_path.read_bytes()
     serial_text = serial_bytes.decode("utf-8", "replace")
     outcome = classify(serial_text, None if timed_out else exit_status, timed_out)
-    kernel_sha = sha256_file(KERNEL_ELF)
-    problems = check_expectation(outcome, sc["expect"], serial_text,
-                                 {"kernel_sha256": kernel_sha})
+    subs = {"kernel_sha256": sha256_file(KERNEL_ELF), "initrd_sha256": sha256_file(INITRD)}
+    problems = check_expectation(outcome, sc["expect"], serial_text, subs)
     record = {
         "schema": "nanox.run-record.v1",
         "scenario": sc["name"],
@@ -255,6 +260,7 @@ def run_scenario(sc, runs_root, toolchain, echo=False):
             "image": artifact(image),
             "loader_efi": artifact(LOADER_EFI),
             "kernel_elf": artifact(KERNEL_ELF),
+            "initrd": artifact(INITRD),
             "ovmf_code": artifact(qemu.ovmf_code_path()),
             "ovmf_vars_template": artifact(qemu.ovmf_vars_template_path()),
         },
@@ -291,7 +297,7 @@ def toolchain_snapshot():
 
 
 def require_artifacts():
-    missing = [str(p) for p in (LOADER_EFI, KERNEL_ELF) if not p.is_file()]
+    missing = [str(p) for p in (LOADER_EFI, KERNEL_ELF, INITRD) if not p.is_file()]
     if missing:
         sys.stderr.write("harness: missing %s; run `make` first\n" % ", ".join(missing))
         sys.exit(2)

@@ -44,19 +44,21 @@ KERNEL_LDFLAGS := -nostdlib -static --build-id=none -z max-page-size=4096 \
     -z noexecstack -T kernel/arch/x86_64/kernel.ld
 
 KERNEL_CSRCS := kernel/main.c kernel/panic.c kernel/bootinfo_check.c \
-    lib/serial.c lib/printf.c lib/string.c
+    kernel/initramfs.c lib/serial.c lib/printf.c lib/string.c lib/sha256.c
 KERNEL_ASRCS := kernel/arch/x86_64/entry.S
 KERNEL_OBJS := $(patsubst %.c,$(BUILD)/kernel/%.o,$(KERNEL_CSRCS)) \
     $(patsubst %.S,$(BUILD)/kernel/%.o,$(KERNEL_ASRCS))
 
 LOADER_EFI := $(OUT)/BOOTX64.EFI
 KERNEL_ELF := $(OUT)/kernel.elf
+INITRD     := $(OUT)/initrd.img
 IMAGE      := $(OUT)/nanox.img
+INITRD_FILES := $(shell find initrd -type f 2>/dev/null | LC_ALL=C sort)
 
 .PHONY: all doctor test host-test py-test qemu-test run debug debug-check \
     repro-check clean distclean
 
-all: $(LOADER_EFI) $(KERNEL_ELF) $(IMAGE) $(OUT)/SHA256SUMS
+all: $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) $(IMAGE) $(OUT)/SHA256SUMS
 
 $(BUILD)/loader/%.obj: %.c
 	@mkdir -p $(@D)
@@ -78,11 +80,16 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/arch/x86_64/kernel.ld
 	@mkdir -p $(@D)
 	$(LD_LLD) $(KERNEL_LDFLAGS) -o $@ $(KERNEL_OBJS)
 
-$(IMAGE): $(LOADER_EFI) $(KERNEL_ELF) tools/image/mkimage.py
-	$(PYTHON) tools/image/mkimage.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) --out $@
+$(INITRD): $(INITRD_FILES) tools/image/mkinitrd.py
+	@mkdir -p $(@D)
+	$(PYTHON) tools/image/mkinitrd.py --root initrd --out $@
 
-$(OUT)/SHA256SUMS: $(LOADER_EFI) $(KERNEL_ELF) $(IMAGE)
-	cd $(OUT) && sha256sum BOOTX64.EFI kernel.elf nanox.img > SHA256SUMS
+$(IMAGE): $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) tools/image/mkimage.py
+	$(PYTHON) tools/image/mkimage.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) \
+	    --initrd $(INITRD) --out $@
+
+$(OUT)/SHA256SUMS: $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) $(IMAGE)
+	cd $(OUT) && sha256sum BOOTX64.EFI kernel.elf initrd.img nanox.img > SHA256SUMS
 	@cat $@
 
 -include $(LOADER_OBJS:.obj=.d) $(KERNEL_OBJS:.o=.d)
@@ -98,15 +105,17 @@ HOST_CFLAGS := -std=c17 -O1 -g $(WARN_FLAGS) $(HOST_SAN) -Iabi -Ilib/include \
     -Ikernel -Iboot/uefi
 HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_sha256.c tests/host/test_elf.c tests/host/test_mmap.c \
-    kernel/bootinfo_check.c boot/uefi/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c
+    tests/host/test_initramfs.c \
+    kernel/bootinfo_check.c kernel/initramfs.c boot/uefi/elf_plan.c \
+    boot/uefi/mmap_convert.c lib/sha256.c
 
 $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
     $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h boot/uefi/*.h)
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_TEST_SRCS)
 
-host-test: $(OUT)/host/test_host $(KERNEL_ELF)
-	$(OUT)/host/test_host $(KERNEL_ELF)
+host-test: $(OUT)/host/test_host $(KERNEL_ELF) $(INITRD)
+	$(OUT)/host/test_host $(KERNEL_ELF) $(INITRD)
 
 py-test: all
 	$(PYTHON) -m unittest discover -s tests/host -p 'test_*.py' -v
@@ -130,8 +139,8 @@ repro-check:
 	$(PYTHON) tools/repro_check.py
 
 clean:
-	rm -rf $(BUILD) $(OUT)/host $(OUT)/images $(LOADER_EFI) $(KERNEL_ELF) $(IMAGE) \
-	    $(OUT)/SHA256SUMS
+	rm -rf $(BUILD) $(OUT)/host $(OUT)/images $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) \
+	    $(IMAGE) $(OUT)/SHA256SUMS
 
 # Also removes run records (out/runs).
 distclean:

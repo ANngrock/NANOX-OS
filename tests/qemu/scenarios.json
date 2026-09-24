@@ -5,58 +5,149 @@
     {
       "name": "normal",
       "description": "Normal boot: loader verifies and loads the kernel, kernel validates boot info, TEST PASS.",
-      "image": {"cmdline": ""},
+      "image": {
+        "cmdline": ""
+      },
       "expect": {
         "verdict": "PASS",
-        "patterns": ["^NANOX: kernel sha256 {kernel_sha256}$", "^NANOX: bootinfo acpi_rsdp=0x[0-9a-f]+$"]
+        "patterns": [
+          "^NANOX: kernel sha256 {kernel_sha256}$",
+          "^NANOX: bootinfo acpi_rsdp=0x[0-9a-f]+$",
+          "^NANOX: initramfs ok entries=3 bytes=[0-9]+ sha256={initrd_sha256}$",
+          "^NANOX: initramfs release \"NANOX-OS initramfs M1\"$"
+        ]
       }
     },
     {
       "name": "fail",
       "description": "Kernel reports a deliberate test failure (nanox.test=fail).",
-      "image": {"cmdline": "nanox.test=fail"},
-      "expect": {"verdict": "FAIL", "failure_class": "test_fail"}
+      "image": {
+        "cmdline": "nanox.test=fail"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail"
+      }
     },
     {
       "name": "unknown-test",
       "description": "Unknown nanox.test value is a test failure, not a silent pass.",
-      "image": {"cmdline": "nanox.test=bogus"},
-      "expect": {"verdict": "FAIL", "failure_class": "test_fail"}
+      "image": {
+        "cmdline": "nanox.test=bogus"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail"
+      }
     },
     {
       "name": "panic",
       "description": "Kernel panic path (nanox.test=panic).",
-      "image": {"cmdline": "nanox.test=panic"},
-      "expect": {"verdict": "FAIL", "failure_class": "panic",
-                 "patterns": ["^NANOX: PANIC requested by nanox.test=panic$"]}
+      "image": {
+        "cmdline": "nanox.test=panic"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "panic",
+        "patterns": [
+          "^NANOX: PANIC requested by nanox.test=panic$"
+        ]
+      }
     },
     {
       "name": "hang",
       "description": "Kernel halts forever; only the harness timeout ends the run.",
-      "image": {"cmdline": "nanox.test=hang"},
+      "image": {
+        "cmdline": "nanox.test=hang"
+      },
       "timeout_s": 20,
-      "expect": {"verdict": "FAIL", "failure_class": "timeout",
-                 "patterns": ["^NANOX: kernel_main ", "^NANOX: test hang"]}
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "timeout",
+        "patterns": [
+          "^NANOX: kernel_main ",
+          "^NANOX: test hang"
+        ]
+      }
     },
     {
       "name": "missing-kernel",
       "description": "KERNEL.ELF absent from the ESP.",
-      "image": {"omit_kernel": true},
-      "expect": {"verdict": "FAIL", "failure_class": "loader_error", "loader_error": "E_KERNEL_OPEN"}
+      "image": {
+        "omit_kernel": true
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "loader_error",
+        "loader_error": "E_KERNEL_OPEN"
+      }
     },
     {
       "name": "corrupt-kernel",
       "description": "One byte of KERNEL.ELF flipped after the manifest was written.",
-      "image": {"corrupt_kernel": true},
-      "expect": {"verdict": "FAIL", "failure_class": "loader_error", "loader_error": "E_KERNEL_HASH"}
+      "image": {
+        "corrupt_kernel": true
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "loader_error",
+        "loader_error": "E_KERNEL_HASH"
+      }
     },
     {
       "name": "framebuffer",
       "description": "Canonical config plus one VGA device: exercises the optional framebuffer fields.",
-      "image": {"cmdline": ""},
-      "qemu_extra": ["-device", "VGA"],
-      "expect": {"verdict": "PASS",
-                 "patterns": ["^NANOX: bootinfo framebuffer [0-9]+x[0-9]+ pitch=[0-9]+ format=[12] base=0x[0-9a-f]+$"]}
+      "image": {
+        "cmdline": ""
+      },
+      "qemu_extra": [
+        "-device",
+        "VGA"
+      ],
+      "expect": {
+        "verdict": "PASS",
+        "patterns": [
+          "^NANOX: bootinfo framebuffer [0-9]+x[0-9]+ pitch=[0-9]+ format=[12] base=0x[0-9a-f]+$"
+        ]
+      }
+    },
+    {
+      "name": "missing-initrd",
+      "description": "INITRD.IMG absent from the ESP.",
+      "image": {
+        "omit_initrd": true
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "loader_error",
+        "loader_error": "E_INITRD_OPEN"
+      }
+    },
+    {
+      "name": "corrupt-initrd",
+      "description": "One byte of INITRD.IMG flipped after the manifest was written.",
+      "image": {
+        "corrupt_initrd": true
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "loader_error",
+        "loader_error": "E_INITRD_HASH"
+      }
+    },
+    {
+      "name": "bad-initrd",
+      "description": "Initramfs that matches the manifest but is not a cpio archive (150 bytes of text): rejected by the kernel.",
+      "image": {
+        "initrd_text": "NANOX test: this text is not a cpio newc archive. NANOX test: this text is not a cpio newc archive. NANOX test: this text is not a cpio newc archive. "
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "panic",
+        "patterns": [
+          "^NANOX: PANIC initramfs invalid: E_MAGIC at offset 0$"
+        ]
+      }
     }
   ]
 }

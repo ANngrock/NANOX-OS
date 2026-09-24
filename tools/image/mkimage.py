@@ -15,12 +15,13 @@ Layout (docs/m0-bench.md, "Образ диска"):
 ESP content:
   \\EFI\\BOOT\\BOOTX64.EFI  loader (removable-media default path, UEFI 2.11 3.5.1)
   \\NANOX\\KERNEL.ELF       kernel
-  \\NANOX\\MANIFEST.BIN     struct nx_manifest (abi/nanox/manifest.h)
+  \\NANOX\\INITRD.IMG       initramfs (cpio newc, tools/image/mkinitrd.py)
+  \\NANOX\\MANIFEST.BIN     struct nx_manifest v2 (abi/nanox/manifest.h)
   \\NANOX\\CMDLINE.TXT      kernel command line (may be empty)
 
 Fault-injection switches (used by the harness, never by `make`):
-  --omit-kernel     leave KERNEL.ELF out (manifest still describes it)
-  --corrupt-kernel  flip one byte of KERNEL.ELF after hashing it
+  --omit-kernel / --omit-initrd        leave the file out (manifest still describes it)
+  --corrupt-kernel / --corrupt-initrd  flip one byte after hashing it
 """
 
 import argparse
@@ -56,8 +57,8 @@ FAT32_SEC_PER_CLUS = 1
 FAT32_MIN_CLUSTERS = 65525
 
 MANIFEST_MAGIC = 0x464D584E
-MANIFEST_VERSION = 1
-MANIFEST_SIZE = 64
+MANIFEST_VERSION = 2
+MANIFEST_SIZE = 128
 
 FAT_EPOCH = 315532800  # 1980-01-01T00:00:00Z, earliest FAT timestamp
 ATTR_DIRECTORY = 0x10
@@ -81,12 +82,18 @@ def fat_datetime(epoch):
     return date, tod
 
 
-def build_manifest(kernel_bytes):
-    digest = hashlib.sha256(kernel_bytes).digest()
-    data = struct.pack("<IHHQ32s16s", MANIFEST_MAGIC, MANIFEST_VERSION, MANIFEST_SIZE,
-                       len(kernel_bytes), digest, b"\0" * 16)
+def build_manifest(kernel_bytes, initrd_bytes):
+    data = struct.pack("<IHHQ32sQ32s40s", MANIFEST_MAGIC, MANIFEST_VERSION, MANIFEST_SIZE,
+                       len(kernel_bytes), hashlib.sha256(kernel_bytes).digest(),
+                       len(initrd_bytes), hashlib.sha256(initrd_bytes).digest(), b"\0" * 40)
     assert len(data) == MANIFEST_SIZE
     return data
+
+
+def _flip_middle(data):
+    out = bytearray(data)
+    out[len(out) // 2] ^= 0xFF
+    return bytes(out)
 
 
 class Fat32Builder:
@@ -254,18 +261,17 @@ def write_gpt(img):
                                                                  backup_entries_lba, crc)
 
 
-def build_image(loader, kernel, cmdline="", omit_kernel=False, corrupt_kernel=False,
-                timestamp=None):
+def build_image(loader, kernel, initrd, cmdline="", omit_kernel=False, corrupt_kernel=False,
+                omit_initrd=False, corrupt_initrd=False, timestamp=None):
     """Returns the disk image as bytes."""
     if timestamp is None:
         timestamp = source_date_epoch()
-    manifest = build_manifest(kernel)
-    payload = bytearray(kernel)
-    if corrupt_kernel:
-        payload[len(payload) // 2] ^= 0xFF
+    manifest = build_manifest(kernel, initrd)
     nanox = {"MANIFEST.BIN": manifest, "CMDLINE.TXT": cmdline.encode("ascii")}
     if not omit_kernel:
-        nanox["KERNEL.ELF"] = bytes(payload)
+        nanox["KERNEL.ELF"] = _flip_middle(kernel) if corrupt_kernel else kernel
+    if not omit_initrd:
+        nanox["INITRD.IMG"] = _flip_middle(initrd) if corrupt_initrd else initrd
     tree = {"EFI": {"BOOT": {"BOOTX64.EFI": loader}}, "NANOX": nanox}
 
     img = bytearray(DISK_BYTES)
@@ -281,16 +287,22 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--loader", required=True)
     ap.add_argument("--kernel", required=True)
+    ap.add_argument("--initrd", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--cmdline", default="")
     ap.add_argument("--omit-kernel", action="store_true")
     ap.add_argument("--corrupt-kernel", action="store_true")
+    ap.add_argument("--omit-initrd", action="store_true")
+    ap.add_argument("--corrupt-initrd", action="store_true")
     args = ap.parse_args(argv)
     with open(args.loader, "rb") as f:
         loader = f.read()
     with open(args.kernel, "rb") as f:
         kernel = f.read()
-    img = build_image(loader, kernel, args.cmdline, args.omit_kernel, args.corrupt_kernel)
+    with open(args.initrd, "rb") as f:
+        initrd = f.read()
+    img = build_image(loader, kernel, initrd, args.cmdline, args.omit_kernel,
+                      args.corrupt_kernel, args.omit_initrd, args.corrupt_initrd)
     tmp = args.out + ".tmp"
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(tmp, "wb") as f:

@@ -3,9 +3,11 @@
  *
  * Sequence (docs/boot-info.md, "Последовательность загрузчика"):
  *   1. serial init, "NANOX: loader start"
- *   2. read \NANOX\MANIFEST.BIN, \NANOX\KERNEL.ELF, optional \NANOX\CMDLINE.TXT
- *   3. verify kernel size + SHA-256 against the manifest
- *   4. validate ELF64, load PT_LOAD segments at their fixed physical addresses
+ *   2. read \NANOX\MANIFEST.BIN, \NANOX\KERNEL.ELF, \NANOX\INITRD.IMG and the
+ *      optional \NANOX\CMDLINE.TXT
+ *   3. verify kernel and initramfs size + SHA-256 against the manifest
+ *   4. validate ELF64, load PT_LOAD segments at their fixed physical addresses;
+ *      copy the initramfs to pages of type NX_EFI_TYPE_INITRD
  *   5. allocate initial stack and the boot-info block, collect ACPI RSDP / GOP
  *   6. GetMemoryMap + ExitBootServices, convert memory map
  *   7. jump to the kernel entry: RDI = boot info, RSP = stack top, IF = 0
@@ -35,6 +37,7 @@
 #define BI_MMAP_OFFSET (BI_CMDLINE_OFFSET + NX_CMDLINE_MAX + 1u)
 #define MMAP_SLACK_DESCRIPTORS 32u
 #define EBS_ATTEMPTS 4
+#define INITRD_MAX_BYTES (64ull << 20)
 
 _Static_assert(BI_CMDLINE_OFFSET >= sizeof(struct nx_boot_info), "boot info block layout");
 _Static_assert(BI_MMAP_OFFSET % 8 == 0, "mmap array alignment");
@@ -59,6 +62,10 @@ static const char *loader_error_name(enum nx_loader_error e)
     case NX_LE_MEMMAP: return "E_MEMMAP";
     case NX_LE_EXIT_BOOT_SERVICES: return "E_EXIT_BOOT_SERVICES";
     case NX_LE_OUT_OF_MEMORY: return "E_OUT_OF_MEMORY";
+    case NX_LE_INITRD_OPEN: return "E_INITRD_OPEN";
+    case NX_LE_INITRD_READ: return "E_INITRD_READ";
+    case NX_LE_INITRD_SIZE: return "E_INITRD_SIZE";
+    case NX_LE_INITRD_HASH: return "E_INITRD_HASH";
     }
     return "E_UNKNOWN";
 }
@@ -249,9 +256,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab)
         return loader_fail(NX_LE_MANIFEST_INVALID, "manifest size", EFI_SUCCESS);
     memcpy(&mf, mf_buf, sizeof(mf));
     BS->FreePool(mf_buf);
-    static const uint8_t zero16[16];
+    static const uint8_t zero_reserved[sizeof(mf.reserved)];
     if (mf.magic != NX_MANIFEST_MAGIC || mf.version != NX_MANIFEST_VERSION ||
-        mf.size != NX_MANIFEST_SIZE || memcmp(mf.reserved, zero16, sizeof(zero16)) != 0)
+        mf.size != NX_MANIFEST_SIZE ||
+        memcmp(mf.reserved, zero_reserved, sizeof(zero_reserved)) != 0)
         return loader_fail(NX_LE_MANIFEST_INVALID, "manifest magic/version/size/reserved",
                            EFI_SUCCESS);
 
@@ -301,6 +309,40 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab)
               " entry=0x%" NX_PRIx64 " segments=%u\n",
               plan.span_base, plan.span_end, plan.entry, plan.segment_count);
 
+    /* ---- initramfs file + integrity ---- */
+    uint8_t *ifile;
+    uint64_t isize;
+    st = read_file(root, u"\\NANOX\\INITRD.IMG", INITRD_MAX_BYTES, &ifile, &isize, &missing);
+    if (EFI_ERROR(st) && missing)
+        return loader_fail(NX_LE_INITRD_OPEN, "\\NANOX\\INITRD.IMG not found", st);
+    if (EFI_ERROR(st))
+        return loader_fail(NX_LE_INITRD_READ, "initramfs read failed or too large", st);
+    nx_printf("NANOX: loader initrd size=%" NX_PRIu64 "\n", isize);
+    if (isize != mf.initrd_size || isize == 0)
+        return loader_fail(NX_LE_INITRD_SIZE, "initramfs size differs from manifest", EFI_SUCCESS);
+    uint8_t idigest[NX_SHA256_DIGEST_SIZE];
+    nx_sha256(ifile, isize, idigest);
+    if (memcmp(idigest, mf.initrd_sha256, sizeof(idigest)) != 0) {
+        nx_printf("NANOX: loader initrd sha256 actual=");
+        nx_print_hex_bytes(idigest, sizeof(idigest));
+        nx_printf(" expected=");
+        nx_print_hex_bytes(mf.initrd_sha256, sizeof(mf.initrd_sha256));
+        nx_printf("\n");
+        return loader_fail(NX_LE_INITRD_HASH, "initramfs sha256 differs from manifest",
+                           EFI_SUCCESS);
+    }
+    uint64_t initrd_pages = (isize + NX_PAGE_SIZE - 1) / NX_PAGE_SIZE;
+    EFI_PHYSICAL_ADDRESS initrd = 0;
+    st = BS->AllocatePages(AllocateAnyPages, NX_EFI_TYPE_INITRD, initrd_pages, &initrd);
+    if (EFI_ERROR(st))
+        return loader_fail(NX_LE_OUT_OF_MEMORY, "initramfs pages", st);
+    memset((void *)(uintptr_t)initrd, 0, initrd_pages * NX_PAGE_SIZE);
+    memcpy((void *)(uintptr_t)initrd, ifile, isize);
+    BS->FreePool(ifile);
+    nx_printf("NANOX: loader initrd sha256 ok ");
+    nx_print_hex_bytes(idigest, sizeof(idigest));
+    nx_printf(" at 0x%" NX_PRIx64 "\n", (uint64_t)initrd);
+
     /* ---- stack ---- */
     EFI_PHYSICAL_ADDRESS stack = 0;
     st = BS->AllocatePages(AllocateAnyPages, NX_EFI_TYPE_KERNEL_STACK, KERNEL_STACK_PAGES, &stack);
@@ -348,6 +390,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab)
     bi->cmdline_phys = (uint64_t)(uintptr_t)cmdline;
     bi->uefi_system_table_phys = (uint64_t)(uintptr_t)systab;
     memcpy(bi->kernel_sha256, digest, sizeof(digest));
+    bi->flags |= NX_BI_HAS_INITRD;
+    bi->initrd_phys = initrd;
+    bi->initrd_size = isize;
+    memcpy(bi->initrd_sha256, idigest, sizeof(idigest));
 
     /* ---- command line (optional file) ---- */
     uint8_t *cl_buf;

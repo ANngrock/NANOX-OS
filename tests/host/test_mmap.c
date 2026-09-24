@@ -93,5 +93,6 @@ void test_mmap(void)
     CHECK_EQ_INT(nx_mmap_translate_type(EfiUnacceptedMemoryType), NX_MEM_RESERVED);
     CHECK_EQ_INT(nx_mmap_translate_type(NX_EFI_TYPE_KERNEL_STACK), NX_MEM_KERNEL_STACK);
     CHECK_EQ_INT(nx_mmap_translate_type(NX_EFI_TYPE_BOOT_INFO), NX_MEM_BOOT_INFO);
+    CHECK_EQ_INT(nx_mmap_translate_type(NX_EFI_TYPE_INITRD), NX_MEM_INITRD);
     CHECK_EQ_INT(nx_mmap_translate_type(0x80000099u), NX_MEM_RESERVED);
 }

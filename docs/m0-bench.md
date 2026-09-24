@@ -19,7 +19,7 @@ make doctor && make && make test
 | Цель | Что делает | Нужны QEMU/OVMF |
 | --- | --- | --- |
 | `make doctor` | сверяет инструменты с `toolchain.lock`, пишет `out/doctor.json` | да (проверяются версии и хеши) |
-| `make` | собирает `out/BOOTX64.EFI`, `out/kernel.elf`, `out/nanox.img`, `out/SHA256SUMS` | нет |
+| `make` | собирает `out/BOOTX64.EFI`, `out/kernel.elf`, `out/initrd.img` (с M1), `out/nanox.img`, `out/SHA256SUMS` | нет |
 | `make test` | `host-test` + `py-test` + `qemu-test` (все сценарии) | да |
 | `make run` | сценарий `normal` с выводом serial в терминал и записью запуска | да |
 | `make debug` | QEMU с `-s -S`, serial в терминал; см. раздел 8 | да |
@@ -130,13 +130,15 @@ LBA 2048, FAT32 с кластерами 512 байт, только имена 8.
 ```text
 \EFI\BOOT\BOOTX64.EFI     загрузчик (путь съёмного носителя по умолчанию)
 \NANOX\KERNEL.ELF         ядро
-\NANOX\MANIFEST.BIN       размер и SHA-256 ядра (boot-info.md §7)
+\NANOX\INITRD.IMG         initramfs, cpio newc (с M1, см. m1-kernel.md)
+\NANOX\MANIFEST.BIN       размеры и SHA-256 ядра и initramfs (boot-info.md §7)
 \NANOX\CMDLINE.TXT        командная строка ядра (в образе make — пустая)
 ```
 
 Метки времени FAT берутся из `SOURCE_DATE_EPOCH`, если переменная задана,
-иначе 1980-01-01 00:00:00. Ключи `--omit-kernel` и `--corrupt-kernel`
-использует только harness для сценариев отказа.
+иначе 1980-01-01 00:00:00. Ключи `--omit-kernel`, `--corrupt-kernel`,
+`--omit-initrd`, `--corrupt-initrd` использует только harness для сценариев
+отказа.
 
 ## 5. Воспроизводимость
 
@@ -147,15 +149,16 @@ LBA 2048, FAT32 с кластерами 512 байт, только имена 8.
 `make repro-check` (`tools/repro_check.py`) копирует текущее дерево
 (отслеживаемые и неигнорируемые файлы) в два новых каталога с разными
 абсолютными путями, собирает `make all` там и в рабочем дереве и требует
-побайтового совпадения `BOOTX64.EFI`, `kernel.elf`, `nanox.img` во всех трёх
-сборках. Отчёт: `out/repro-check.json`. Отрицательный контроль при подготовке
+побайтового совпадения `BOOTX64.EFI`, `kernel.elf`, `initrd.img` (с M1) и
+`nanox.img` во всех трёх сборках. Отчёт: `out/repro-check.json`. Отрицательный контроль при подготовке
 M0: сборка с пустым `REPRO_FLAGS` в двух путях дала разные `kernel.elf`
 (абсолютный путь в DWARF), то есть проверка обнаруживает такие различия.
 
 ## 6. Headless harness
 
 `tools/bench/harness.py` (только стандартная библиотека Python). Сценарии —
-`tests/qemu/scenarios.json`:
+`tests/qemu/scenarios.json`. Ниже — сценарии M0; сценарии M1 перечислены в
+[m1-kernel.md](m1-kernel.md#сценарии-стенда).
 
 | Сценарий | Образ | Ожидание |
 | --- | --- | --- |

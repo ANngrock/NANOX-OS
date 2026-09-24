@@ -23,21 +23,25 @@ import mkimage  # noqa: E402
 
 LOADER = b"MZ" + bytes(range(256)) * 40
 KERNEL = b"\x7fELF" + bytes((i * 7) & 0xFF for i in range(70000))
+INITRD = b"070701" + bytes((i * 13) & 0xFF for i in range(3000))
 
 
 class MkimageTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = mkimage.build_image(LOADER, KERNEL, cmdline="nanox.test=pass", timestamp=0)
+        cls.img = mkimage.build_image(LOADER, KERNEL, INITRD, cmdline="nanox.test=pass",
+                                      timestamp=0)
 
     def test_deterministic(self):
-        again = mkimage.build_image(LOADER, KERNEL, cmdline="nanox.test=pass", timestamp=0)
+        again = mkimage.build_image(LOADER, KERNEL, INITRD, cmdline="nanox.test=pass",
+                                    timestamp=0)
         self.assertEqual(hashlib.sha256(self.img).digest(), hashlib.sha256(again).digest())
 
     def test_inputs_change_output(self):
-        other = mkimage.build_image(LOADER, KERNEL, cmdline="nanox.test=fail", timestamp=0)
+        other = mkimage.build_image(LOADER, KERNEL, INITRD, cmdline="nanox.test=fail",
+                                    timestamp=0)
         self.assertNotEqual(self.img, other)
-        dated = mkimage.build_image(LOADER, KERNEL, cmdline="nanox.test=pass",
+        dated = mkimage.build_image(LOADER, KERNEL, INITRD, cmdline="nanox.test=pass",
                                     timestamp=1767225600)
         self.assertNotEqual(self.img, dated)
 
@@ -70,11 +74,14 @@ class MkimageTest(unittest.TestCase):
         self.assertEqual(self.img[(2048 + 6) * 512:(2048 + 7) * 512], bs)  # backup boot
 
     def test_manifest(self):
-        m = mkimage.build_manifest(KERNEL)
-        magic, ver, size, ksize, digest = struct.unpack_from("<IHHQ32s", m)
-        self.assertEqual((magic, ver, size, ksize), (0x464D584E, 1, 64, len(KERNEL)))
-        self.assertEqual(digest, hashlib.sha256(KERNEL).digest())
-        self.assertEqual(m[48:], b"\0" * 16)
+        m = mkimage.build_manifest(KERNEL, INITRD)
+        magic, ver, size, ksize, kdigest, isize, idigest = struct.unpack_from("<IHHQ32sQ32s", m)
+        self.assertEqual((magic, ver, size, ksize, isize),
+                         (0x464D584E, 2, 128, len(KERNEL), len(INITRD)))
+        self.assertEqual(kdigest, hashlib.sha256(KERNEL).digest())
+        self.assertEqual(idigest, hashlib.sha256(INITRD).digest())
+        self.assertEqual(len(m), 128)
+        self.assertEqual(m[88:], b"\0" * 40)
 
     def test_mtools_readback(self):
         with tempfile.TemporaryDirectory() as d:
@@ -87,22 +94,27 @@ class MkimageTest(unittest.TestCase):
                                       stdout=subprocess.PIPE, check=True).stdout
             self.assertEqual(read("/EFI/BOOT/BOOTX64.EFI"), LOADER)
             self.assertEqual(read("/NANOX/KERNEL.ELF"), KERNEL)
+            self.assertEqual(read("/NANOX/INITRD.IMG"), INITRD)
             self.assertEqual(read("/NANOX/CMDLINE.TXT"), b"nanox.test=pass")
-            self.assertEqual(read("/NANOX/MANIFEST.BIN"), mkimage.build_manifest(KERNEL))
+            self.assertEqual(read("/NANOX/MANIFEST.BIN"), mkimage.build_manifest(KERNEL, INITRD))
 
     def test_fault_injection(self):
         with tempfile.TemporaryDirectory() as d:
-            for kwargs, check in (({"omit_kernel": True}, "omit"),
-                                  ({"corrupt_kernel": True}, "corrupt")):
-                path = os.path.join(d, check + ".img")
-                Path(path).write_bytes(mkimage.build_image(LOADER, KERNEL, timestamp=0, **kwargs))
-                r = subprocess.run(["mcopy", "-n", "-i", path + "@@1M", "::/NANOX/KERNEL.ELF",
+            cases = (({"omit_kernel": True}, "KERNEL.ELF", KERNEL, "omit"),
+                     ({"corrupt_kernel": True}, "KERNEL.ELF", KERNEL, "corrupt"),
+                     ({"omit_initrd": True}, "INITRD.IMG", INITRD, "omit"),
+                     ({"corrupt_initrd": True}, "INITRD.IMG", INITRD, "corrupt"))
+            for i, (kwargs, name, original, check) in enumerate(cases):
+                path = os.path.join(d, "%d.img" % i)
+                Path(path).write_bytes(mkimage.build_image(LOADER, KERNEL, INITRD, timestamp=0,
+                                                           **kwargs))
+                r = subprocess.run(["mcopy", "-n", "-i", path + "@@1M", "::/NANOX/" + name,
                                     "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 if check == "omit":
                     self.assertNotEqual(r.returncode, 0)
                 else:
-                    self.assertEqual(len(r.stdout), len(KERNEL))
-                    self.assertNotEqual(r.stdout, KERNEL)
+                    self.assertEqual(len(r.stdout), len(original))
+                    self.assertNotEqual(r.stdout, original)
 
 
 if __name__ == "__main__":

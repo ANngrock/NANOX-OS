@@ -37,6 +37,7 @@ enum nx_bi_error {
     NX_BI_E_CMDLINE,           /* cmdline not in BOOT_INFO, not NUL-terminated, bad chars */
     NX_BI_E_RSDP,              /* RSDP flag/field inconsistent, signature or checksum */
     NX_BI_E_FRAMEBUFFER,       /* framebuffer flag/fields inconsistent */
+    NX_BI_E_INITRD,            /* initramfs flag/fields inconsistent or not in INITRD */
     NX_BI_E__COUNT
 };
 

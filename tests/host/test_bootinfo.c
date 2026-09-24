@@ -52,6 +52,7 @@ static const struct nx_mem_region FIXTURE_MAP[] = {
     {0x00214000, 0x07DEC000, NX_MEM_USABLE, 0},
     {0xE0000000, 0x10000000, NX_MEM_RESERVED, 0},
     {0xFFC00000, 0x00400000, NX_MEM_MMIO, 0},
+    {0x100000000ull, 0x00001000, NX_MEM_INITRD, 0},
 };
 #define FIXTURE_COUNT (sizeof(FIXTURE_MAP) / sizeof(FIXTURE_MAP[0]))
 
@@ -108,6 +109,10 @@ static void make_valid(void)
     BI->cmdline_phys = CMDLINE_PHYS;
     BI->cmdline_len = sizeof(cmdline) - 1;
     BI->acpi_rsdp_phys = RSDP_PHYS;
+    BI->flags |= NX_BI_HAS_INITRD;
+    BI->initrd_phys = 0x100000000ull;
+    BI->initrd_size = 0x800;
+    memset(BI->initrd_sha256, 0xA5, sizeof(BI->initrd_sha256));
 
     CHK.map = arena_map;
     CHK.opaque = NULL;
@@ -159,7 +164,7 @@ static void test_valid(void)
     EXPECT(NX_BI_OK);
 
     make_valid(); /* no RSDP at all */
-    BI->flags = 0;
+    BI->flags &= ~NX_BI_HAS_ACPI_RSDP;
     BI->acpi_rsdp_phys = 0;
     EXPECT(NX_BI_OK);
 
@@ -174,10 +179,31 @@ static void test_valid(void)
     *(char *)at(CMDLINE_PHYS) = 0;
     EXPECT(NX_BI_OK);
 
-    make_valid(); /* newer minor: larger struct and unknown flags are tolerated */
+    make_valid(); /* newer minor: larger struct, unknown flags and types are tolerated */
     BI->version_minor = NX_BOOTINFO_VERSION_MINOR + 1;
     BI->size = 256;
     BI->flags |= 1ull << 40;
+    RG[7].type = 40;
+    EXPECT(NX_BI_OK);
+
+    make_valid(); /* a 1.0 loader: 192-byte struct, no initramfs, no type 11 */
+    BI->version_minor = 0;
+    BI->size = NX_BOOTINFO_V1_SIZE;
+    BI->flags &= ~NX_BI_HAS_INITRD;
+    BI->initrd_phys = 0;
+    BI->initrd_size = 0;
+    BI->mmap_count = FIXTURE_COUNT - 1;
+    EXPECT(NX_BI_OK);
+
+    make_valid(); /* initramfs size exactly one page */
+    BI->initrd_size = 0x1000;
+    EXPECT(NX_BI_OK);
+
+    make_valid(); /* 1.1 without initramfs */
+    BI->flags &= ~NX_BI_HAS_INITRD;
+    BI->initrd_phys = 0;
+    BI->initrd_size = 0;
+    memset(BI->initrd_sha256, 0, sizeof(BI->initrd_sha256));
     EXPECT(NX_BI_OK);
 }
 
@@ -217,12 +243,55 @@ static void test_header(void)
     make_valid();
     BI->reserved0 = 1;
     EXPECT(NX_BI_E_RESERVED);
-    make_valid();
-    BI->initrd_phys = 0x300000;
+    make_valid(); /* 1.0 must have a 192-byte struct */
+    BI->version_minor = 0;
+    EXPECT(NX_BI_E_SIZE);
+    make_valid(); /* 1.0 does not know NX_BI_HAS_INITRD */
+    BI->version_minor = 0;
+    BI->size = NX_BOOTINFO_V1_SIZE;
+    EXPECT(NX_BI_E_FLAGS);
+    make_valid(); /* 1.0: initrd fields are reserved */
+    BI->version_minor = 0;
+    BI->size = NX_BOOTINFO_V1_SIZE;
+    BI->flags &= ~NX_BI_HAS_INITRD;
     EXPECT(NX_BI_E_RESERVED);
+    make_valid(); /* 1.0 does not know region type 11 */
+    BI->version_minor = 0;
+    BI->size = NX_BOOTINFO_V1_SIZE;
+    BI->flags &= ~NX_BI_HAS_INITRD;
+    BI->initrd_phys = 0;
+    BI->initrd_size = 0;
+    EXPECT(NX_BI_E_MMAP_TYPE);
+}
+
+static void test_initrd(void)
+{
+    make_valid(); /* fields without the flag */
+    BI->flags &= ~NX_BI_HAS_INITRD;
+    EXPECT(NX_BI_E_INITRD);
+    make_valid(); /* hash without the flag */
+    BI->flags &= ~NX_BI_HAS_INITRD;
+    BI->initrd_phys = 0;
+    BI->initrd_size = 0;
+    EXPECT(NX_BI_E_INITRD);
     make_valid();
-    BI->initrd_size = 0x1000;
-    EXPECT(NX_BI_E_RESERVED);
+    BI->initrd_phys += 0x10;
+    EXPECT(NX_BI_E_INITRD);
+    make_valid();
+    BI->initrd_phys = 0;
+    EXPECT(NX_BI_E_INITRD);
+    make_valid();
+    BI->initrd_size = 0;
+    EXPECT(NX_BI_E_INITRD);
+    make_valid(); /* larger than its region */
+    BI->initrd_size = 0x1001;
+    EXPECT(NX_BI_E_INITRD);
+    make_valid();
+    BI->initrd_size = UINT64_MAX;
+    EXPECT(NX_BI_E_INITRD);
+    make_valid(); /* not reserved as initramfs */
+    RG[9].type = NX_MEM_RESERVED;
+    EXPECT(NX_BI_E_INITRD);
 }
 
 static void test_mmap_rules(void)
@@ -437,6 +506,7 @@ static void test_loader_conversion_accepted(void)
         {EfiACPIReclaimMemory, 0x103000, 1},       {NX_EFI_TYPE_KERNEL_IMAGE, 0x200000, 4},
         {EfiConventionalMemory, 0x214000, 0x3000}, {EfiConventionalMemory, 0x3214000, 0x4DEC},
         {EfiMemoryMappedIO, 0xFFC00000, 0x400},    {EfiReservedMemoryType, 0xE0000000, 0x10000},
+        {NX_EFI_TYPE_INITRD, 0x100000000ull, 1},
     };
     const int n = sizeof(src) / sizeof(src[0]);
     memset(raw, 0, sizeof(raw));
@@ -494,6 +564,7 @@ void test_bootinfo(void)
 {
     test_valid();
     test_header();
+    test_initrd();
     test_mmap_rules();
     test_ranges();
     test_cmdline();

@@ -17,9 +17,11 @@
 #include <nanox/diag.h>
 #include <nanox/printf.h>
 #include <nanox/serial.h>
+#include <nanox/sha256.h>
 #include <nanox/string.h>
 
 #include "bootinfo_check.h"
+#include "initramfs.h"
 #include "kernel.h"
 
 enum test_mode { MODE_PASS, MODE_FAIL, MODE_PANIC, MODE_HANG, MODE_UNKNOWN };
@@ -120,6 +122,36 @@ static void report(const struct nx_bi_result *r)
         nx_printf("NANOX: bootinfo framebuffer none\n");
 }
 
+/* The loader verified the initramfs against the manifest; the kernel checks
+ * that the bytes it received are the ones the loader hashed and that the
+ * archive is well formed before anything reads from it. */
+static void check_initramfs(const struct nx_boot_info *bi)
+{
+    if (bi->version_minor < 1 || !(bi->flags & NX_BI_HAS_INITRD))
+        nx_panic("initramfs missing from boot info");
+    const uint8_t *base = (const uint8_t *)(uintptr_t)bi->initrd_phys;
+    uint8_t digest[NX_SHA256_DIGEST_SIZE];
+    nx_sha256(base, bi->initrd_size, digest);
+    if (memcmp(digest, bi->initrd_sha256, sizeof(digest)) != 0)
+        nx_panic("initramfs sha256 differs from boot info");
+    uint32_t entries;
+    uint64_t bad;
+    int st = nx_cpio_validate(base, bi->initrd_size, &entries, &bad);
+    if (st != NX_CPIO_OK)
+        nx_panic("initramfs invalid: %s at offset %" NX_PRIu64, nx_cpio_strerror(st), bad);
+    struct nx_cpio_entry rel;
+    st = nx_cpio_find(base, bi->initrd_size, "etc/nanox/release", &rel);
+    if (st != NX_CPIO_OK || (rel.mode & NX_CPIO_MODE_TYPE) != NX_CPIO_MODE_REG)
+        nx_panic("initramfs: etc/nanox/release missing (%s)", nx_cpio_strerror(st));
+    nx_printf("NANOX: initramfs ok entries=%u bytes=%" NX_PRIu64 " sha256=", entries,
+              bi->initrd_size);
+    nx_print_hex_bytes(digest, sizeof(digest));
+    nx_printf("\nNANOX: initramfs release \"");
+    for (uint64_t i = 0; i < rel.size && rel.data[i] != '\n'; i++)
+        nx_serial_putc(rel.data[i] >= 0x20 && rel.data[i] < 0x7F ? (char)rel.data[i] : '?');
+    nx_printf("\"\n");
+}
+
 __attribute__((noreturn)) void kernel_main(const struct nx_boot_info *bi)
 {
     nx_serial_init();
@@ -143,6 +175,7 @@ __attribute__((noreturn)) void kernel_main(const struct nx_boot_info *bi)
         nx_panic("running stack 0x%" NX_PRIx64 " outside boot-info stack region", rsp);
 
     report(&res);
+    check_initramfs(bi);
 
     const char *cl = (const char *)(uintptr_t)bi->cmdline_phys;
     nx_printf("NANOX: cmdline \"%s\"\n", cl);

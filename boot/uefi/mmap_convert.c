@@ -18,6 +18,7 @@ uint32_t nx_mmap_translate_type(uint32_t t)
     case NX_EFI_TYPE_KERNEL_IMAGE: return NX_MEM_KERNEL_IMAGE;
     case NX_EFI_TYPE_KERNEL_STACK: return NX_MEM_KERNEL_STACK;
     case NX_EFI_TYPE_BOOT_INFO: return NX_MEM_BOOT_INFO;
+    case NX_EFI_TYPE_INITRD: return NX_MEM_INITRD;
     default:
         /* Reserved, unusable, PAL code, persistent, unaccepted, unknown. */
         return NX_MEM_RESERVED;
