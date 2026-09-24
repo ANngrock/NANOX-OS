@@ -435,6 +435,8 @@ def run_boot(sc, run_dir, toolchain, echo=False, adapter_override=None, data_dis
         m5.qmp_socket(qmp_dir)
     serial_path = run_dir / "serial.log"
     serial_path.touch()
+    if m5 is not None:
+        carry["serial_path"] = str(serial_path)  # M5 scripts check what the log holds
     vars_path = qemu.prepare_vars(run_dir / "OVMF_VARS.fd")
     bridge = (BridgeRunner(sc["bridge"], run_dir, adapter_override, carry)
               if sc.get("bridge") else None)

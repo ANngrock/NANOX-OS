@@ -280,6 +280,10 @@ class Services:
       tls        test-PKI profiles to serve with TLS echo servers
       anchors    profiles whose root certificates are provisioned as
                  trust anchors (tls/anchor0, ...)
+      provider   start the test provider (tools/bench/provider.py):
+                 {"profile", "timeout_ms", "attempts", "key": false (no key
+                 object), "omit": [cfg keys left out]}; configures
+                 cfg/provider.* and provisions secret/provider
     """
 
     def __init__(self, spec, run_dir):
@@ -292,7 +296,15 @@ class Services:
         self.qmp_dir = None
         self.qmp_path = None
         self.qmp = None
-        self.provider = None  # set up by the provider module (later steps)
+        self.provider = None
+        self.key = None
+        pspec = self.spec.get("provider")
+        if pspec is not None:
+            import provider as providermod  # noqa: E402  (imports this module)
+            # a fresh test key per run; it must never appear in the guest's log
+            self.key = "sk-nanox-test-" + os.urandom(16).hex()
+            self.provider = providermod.ProviderServer(self.key, pspec.get("profile", "ec-leaf"))
+            self.provider_model = providermod.MODEL
 
     def qmp_socket(self, tmpdir):
         self.qmp_path = os.path.join(tmpdir, "qmp.sock")
@@ -303,12 +315,24 @@ class Services:
         cfg = {"net.dns": GUEST_HOST_ALIAS, "net.dns_port": str(self.dns.port)}
         if self.echo:
             cfg["echo.port"] = str(self.echo.port)
+        pspec = self.spec.get("provider")
+        if pspec is not None:
+            cfg.update({"provider.host": "provider.nanox.test",
+                        "provider.port": str(self.provider.port),
+                        "provider.model": self.provider_model,
+                        "provider.timeout_ms": str(pspec.get("timeout_ms", 4000)),
+                        "provider.attempts": str(pspec.get("attempts", 3))})
+            for k in pspec.get("omit", []):
+                cfg.pop(k, None)
         cfg.update(self.spec.get("config", {}))
         return cfg
 
     def objects(self):
         objs = [("cfg/" + k, nxstore.KIND_CONFIG, str(v).encode("ascii"))
                 for k, v in sorted(self.config().items())]
+        pspec = self.spec.get("provider")
+        if pspec is not None and pspec.get("key", True):
+            objs.append(("secret/provider", nxstore.KIND_SECRET, self.key.encode("ascii")))
         for i, prof in enumerate(self.spec.get("anchors", [])):
             objs.append(("tls/anchor%d" % i, nxstore.KIND_ANCHOR,
                          (pki_dir(prof) / "anchor.der").read_bytes()))
@@ -327,7 +351,8 @@ class Services:
                 "config": self.config(),
                 "tls": {p: {"port": t.port, "lines": list(t.lines), "ciphers": list(t.ciphers),
                             "errors": list(t.errors)} for p, t in self.tls.items()},
-                "qmp": self.qmp.log if self.qmp else []}
+                "qmp": self.qmp.log if self.qmp else [],
+                "provider": self.provider.record() if self.provider else None}
 
     def close(self):
         self.dns.close()

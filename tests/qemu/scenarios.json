@@ -1103,6 +1103,257 @@
           "^NANOX: USER core#4: tls anchors=2 "
         ]
       }
+    },
+    {
+      "name": "m5-agent",
+      "description": "M5 criterion 3: the Cognitive Core asks the (test) provider itself over its own virtio-net/TCP/TLS 1.3 stack, without the host bridge in the loop; the model's tool calls run as verified executor actions; telemetry of every attempt and action; the key never appears in the log",
+      "image": {
+        "cmdline": "nanox.test=m5-serve"
+      },
+      "timeout_s": 240,
+      "m5": {
+        "provider": {},
+        "anchors": [
+          "ec-leaf"
+        ]
+      },
+      "bridge": {
+        "script": "m5-agent"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        },
+        "patterns": [
+          "^NANOX: USER core#4: provider config host=provider.nanox.test port=[0-9]+ model=nanox-mock-model key_ref=secret/provider key=present timeout_ms=4000 attempts=3 result=ok$",
+          "^NANOX: USER core#4: tel ask=ask1 phase=ask result=ok class=ok detail=ok steps=6 attempts=6 retries=0 reconnects=0 actions=5 actions_failed=0 bad_tools=0 effects=task.spawn,task.terminate "
+        ]
+      }
+    },
+    {
+      "name": "m5-agent-loss",
+      "description": "M5 criteria 3-4: the agent scenario under deterministic frame loss (every 5th received, every 7th sent frame dropped); TCP retransmission keeps the provider path working",
+      "image": {
+        "cmdline": "nanox.test=m5-serve nanox.m5.loss=rx:5,tx:7"
+      },
+      "timeout_s": 300,
+      "m5": {
+        "provider": {
+          "timeout_ms": 8000
+        },
+        "anchors": [
+          "ec-leaf"
+        ]
+      },
+      "bridge": {
+        "script": "m5-agent-loss"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        },
+        "patterns": [
+          "^NANOX: m5 net=virtio-net link=up loss_rx=5 loss_tx=7 "
+        ]
+      }
+    },
+    {
+      "name": "m5-noretx",
+      "description": "Negative control for m5-agent-loss: the same loss with TCP retransmission disabled in bin/core; the provider path must fail and the scenario must not pass",
+      "image": {
+        "cmdline": "nanox.test=m5-noretx nanox.m5.loss=rx:5,tx:7"
+      },
+      "timeout_s": 400,
+      "m5": {
+        "provider": {
+          "timeout_ms": 8000
+        },
+        "anchors": [
+          "ec-leaf"
+        ]
+      },
+      "bridge": {
+        "script": "m5-agent-loss"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail",
+        "bridge": {
+          "ok": false,
+          "problems": [
+            "^ask_workload: FAILED .*class=net code=NET_ERROR "
+          ]
+        },
+        "patterns": [
+          "tcp_retransmit=off"
+        ]
+      }
+    },
+    {
+      "name": "m5-faults",
+      "description": "M5 criterion 4: provider errors (429 with Retry-After, 529, 500, stream error event), response-stream breaks (FIN without close_notify, early close_notify), timeout, connection reset, idle keep-alive close, exhausted retries, non-retryable errors; each attempt classified in telemetry, retried when useful, and the path recovers",
+      "image": {
+        "cmdline": "nanox.test=m5-serve"
+      },
+      "timeout_s": 400,
+      "m5": {
+        "provider": {
+          "timeout_ms": 3000
+        },
+        "anchors": [
+          "ec-leaf"
+        ]
+      },
+      "bridge": {
+        "script": "m5-faults"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "m5-noretry",
+      "description": "Negative control for m5-faults: the provider client makes one attempt only; the retry checks must fail",
+      "image": {
+        "cmdline": "nanox.test=m5-noretry"
+      },
+      "timeout_s": 400,
+      "m5": {
+        "provider": {
+          "timeout_ms": 3000
+        },
+        "anchors": [
+          "ec-leaf"
+        ]
+      },
+      "bridge": {
+        "script": "m5-faults"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail",
+        "bridge": {
+          "ok": false,
+          "problems": [
+            "^retry_5xx: FAILED .*detail=overloaded "
+          ]
+        },
+        "patterns": [
+          "attempts=1 result=ok$"
+        ]
+      }
+    },
+    {
+      "name": "m5-classes",
+      "description": "M5 done-definition: network failure (refused, link down), provider error (HTTP 400, refused tool call) and action-execution error (the executor fails the model's action) are told apart in the response and the telemetry",
+      "image": {
+        "cmdline": "nanox.test=m5-serve"
+      },
+      "timeout_s": 300,
+      "m5": {
+        "provider": {
+          "timeout_ms": 3000
+        },
+        "anchors": [
+          "ec-leaf"
+        ]
+      },
+      "bridge": {
+        "script": "m5-classes"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "m5-flattel",
+      "description": "Negative control for m5-classes: telemetry does not classify failures; the class checks must fail",
+      "image": {
+        "cmdline": "nanox.test=m5-flattel"
+      },
+      "timeout_s": 300,
+      "m5": {
+        "provider": {
+          "timeout_ms": 3000
+        },
+        "anchors": [
+          "ec-leaf"
+        ]
+      },
+      "bridge": {
+        "script": "m5-classes"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail",
+        "bridge": {
+          "ok": false,
+          "problems": [
+            "^net_refused: FAILED .*class=unclassified code=UNCLASSIFIED_ERROR detail=conn_refused "
+          ]
+        }
+      }
+    },
+    {
+      "name": "m5-console",
+      "description": "M5 criterion 5: with the provider refused and the link down the agent fails cleanly, the operator console keeps observing, acting (spawn/terminate) and diagnosing; when the provider is back the agent works again",
+      "image": {
+        "cmdline": "nanox.test=m5-serve"
+      },
+      "timeout_s": 300,
+      "m5": {
+        "provider": {
+          "timeout_ms": 3000
+        },
+        "anchors": [
+          "ec-leaf"
+        ]
+      },
+      "bridge": {
+        "script": "m5-console"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "m5-nokey",
+      "description": "M5 key configuration: no key object in the store; the agent fails as a local error before any connection and the console keeps working",
+      "image": {
+        "cmdline": "nanox.test=m5-serve"
+      },
+      "timeout_s": 180,
+      "m5": {
+        "provider": {
+          "key": false
+        },
+        "anchors": [
+          "ec-leaf"
+        ]
+      },
+      "bridge": {
+        "script": "m5-nokey"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        },
+        "patterns": [
+          "key=missing timeout_ms=4000 attempts=3 result=no_key$"
+        ]
+      }
     }
   ]
 }
