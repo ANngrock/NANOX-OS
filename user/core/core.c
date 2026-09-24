@@ -12,12 +12,20 @@
  * never makes an action SUCCEEDED.  Every transition is written to the
  * serial log (NX_SYS_DEBUG_WRITE) as the guest-side trace.
  *
- * a0 = Sovereign handle, a1 = channel handle, a2 = NX_M3_CORE_* flags.
- * Exit codes: abi/nanox/m3.h.
+ * a0 = Sovereign handle, a1 = channel handle (0: none), a2 = NX_M3_CORE_*
+ * and NX_M4_CORE_* flags, a3 = block device handle of the data disk (0:
+ * no store, as in M3).  Exit codes: abi/nanox/m3.h, abi/nanox/m4.h.
+ *
+ * M4: with a data disk the executor keeps configuration, blobs, the commit
+ * history and its own task-engine records in the store (persist.c,
+ * docs/m4-store.md); requests of an earlier boot are answered from the
+ * stored records, interrupted ones as OUTCOME_UNKNOWN.
  */
 #include <nanox/m3.h>
+#include <nanox/m4.h>
 #include <nanox/string.h>
 
+#include "core.h"
 #include "engine.h"
 #include "nanox_user.h"
 #include "nci.h"
@@ -31,11 +39,12 @@
 #define SUBS_MAX 4u
 #define LIST_MAX 32u
 
-static uint64_t sov, chan, boot_id, hz;
+static uint64_t sov, chan, hz;
+uint64_t boot_id;
 static uint32_t self_id;
 static int nodedup;
-static struct engine eng;
-static uint64_t verify_failures;
+struct engine eng;
+uint64_t verify_failures;
 static char self_ref[NCI_REF_MAX];
 
 /* Tasks this executor started: kernel handle per task id. */
@@ -55,8 +64,27 @@ static char rx[1024];
 static uint32_t rx_len;
 static int discarding; /* inside an overlong line */
 
+/* Without a bridge (M4 workload and check modes) the response lines go to
+ * the serial log instead ("out <line>", RES lines only). */
 static void write_all(const char *p, uint32_t len)
 {
+    if (!chan) {
+        while (len) {
+            uint32_t n = 0;
+            while (n < len && p[n] != '\n')
+                n++;
+            if (n >= 3 && p[0] == 'R' && p[1] == 'E' && p[2] == 'S') {
+                char line[208];
+                uint32_t k = n < 200 ? n : 200;
+                memcpy(line, p, k);
+                line[k] = 0;
+                u_printf("out %s\n", line);
+            }
+            p += n < len ? n + 1 : n;
+            len -= n < len ? n + 1 : n;
+        }
+        return;
+    }
     while (len) {
         uint32_t n = len > NX_CHAN_IO_MAX ? NX_CHAN_IO_MAX : len;
         if (nx_chan_write(chan, p, n) < 0)
@@ -104,7 +132,12 @@ static int read_line(char *line, uint32_t cap, uint32_t *len)
 
 static char outmem[ENG_RESULT_MAX];
 
-static void res_begin(struct nci_buf *b, const char *id, const char *state)
+void res_reset(struct nci_buf *b)
+{
+    nb_init(b, outmem, sizeof(outmem));
+}
+
+void res_begin(struct nci_buf *b, const char *id, const char *state)
 {
     nb_init(b, outmem, sizeof(outmem));
     nb_str(b, "RES ");
@@ -113,13 +146,13 @@ static void res_begin(struct nci_buf *b, const char *id, const char *state)
     nb_str(b, state);
 }
 
-static void item_begin(struct nci_buf *b, const char *id)
+void item_begin(struct nci_buf *b, const char *id)
 {
     nb_str(b, "\nITEM ");
     nb_str(b, id);
 }
 
-static void res_end(struct nci_buf *b, const char *id)
+void res_end(struct nci_buf *b, const char *id)
 {
     nb_str(b, "\nEND ");
     nb_str(b, id);
@@ -128,7 +161,7 @@ static void res_end(struct nci_buf *b, const char *id)
 
 /* ---- trace ------------------------------------------------------------------ */
 
-static void step(struct eng_action *a, int to, const char *detail)
+void step(struct eng_action *a, int to, const char *detail)
 {
     int from = a->state;
     if (eng_advance(a, to) != 0) {
@@ -142,8 +175,8 @@ static void step(struct eng_action *a, int to, const char *detail)
 }
 
 /* Ends the action FAILED with `code` (and an optional detail value). */
-static void fail_action(struct eng_action *a, struct nci_buf *b, const char *code,
-                        const char *detail, const char *effects)
+void fail_action(struct eng_action *a, struct nci_buf *b, const char *code,
+                 const char *detail, const char *effects)
 {
     char t[160];
     struct nci_buf tb;
@@ -287,7 +320,7 @@ static void describe_ref(struct nci_buf *b, const char *key, uint32_t id)
 
 static const char OPS[] = "system.describe,task.list,task.inspect,task.spawn,task.measure,"
                           "task.terminate,memory.stats,event.subscribe,event.poll,"
-                          "action.status,session.close";
+                          "action.status,session.close,";
 
 static void op_describe(struct eng_action *a, const struct nci_req *r, struct nci_buf *b)
 {
@@ -315,7 +348,13 @@ static void op_describe(struct eng_action *a, const struct nci_req *r, struct nc
     nb_kv_u64(b, "events_next", si.events_next);
     nb_kv(b, "dedup", nodedup ? "off" : "on");
     nb_kv_u64(b, "actions", eng.started);
-    nb_kv(b, "ops", OPS);
+    nb_str(b, " ops=");
+    nb_str(b, OPS);
+    nb_str(b, PS_OPS);
+    if (ps_state != PS_ABSENT) {
+        nb_kv(b, "store", ps_state_name());
+        nb_kv_u64(b, "store_gen", ps_gen());
+    }
     nb_kv(b, "verify", "n/a");
     res_end(b, a->id);
 }
@@ -412,6 +451,10 @@ static void op_spawn(struct eng_action *a, const struct nci_req *r, struct nci_b
     nb_str(&db, "call=SOV_TASK_SPAWN path=");
     nb_str(&db, path);
     step(a, ACT_PLANNED, detail);
+    if (ps_intent(a) != 0) {
+        fail_action(a, b, "STORE_ERROR", "intent_not_saved", "none");
+        return;
+    }
     step(a, ACT_RUNNING, "");
     int64_t h = nx_sov_task_spawn(sov, path, plen + 4, 0);
     if (h < 0) {
@@ -581,6 +624,12 @@ static void op_terminate(struct eng_action *a, const struct nci_req *r, struct n
     nb_str(&db, " rev=");
     nb_u64(&db, t.rev);
     step(a, ACT_PLANNED, detail);
+    if (ps_intent(a) != 0) {
+        if (k < 0)
+            nx_handle_close((uint64_t)h);
+        fail_action(a, b, "STORE_ERROR", "intent_not_saved", "none");
+        return;
+    }
     step(a, ACT_RUNNING, "");
     int64_t kr = nx_task_kill((uint64_t)h);
     if (kr < 0) {
@@ -735,8 +784,6 @@ static void op_poll(struct eng_action *a, const struct nci_req *r, struct nci_bu
     res_end(b, a->id);
 }
 
-typedef void (*op_fn)(struct eng_action *, const struct nci_req *, struct nci_buf *);
-
 static const struct {
     const char *name;
     op_fn fn;
@@ -791,6 +838,7 @@ static void action_status(const struct nci_req *r)
     if (a) {
         nb_kv(&b, "state", eng_state_name(a->state));
         nb_kv(&b, "op", a->op);
+        ps_status_fields(&b, a);
     }
     res_end(&b, r->id);
     write_all(b.p, b.len);
@@ -799,7 +847,7 @@ static void action_status(const struct nci_req *r)
 }
 
 /* Returns the exit code when the session is closed, else -1. */
-static int64_t handle(const char *line, uint32_t len)
+int64_t core_handle(const char *line, uint32_t len)
 {
     static struct nci_req req;
     int ps = nci_parse(line, len, &req);
@@ -833,7 +881,7 @@ static int64_t handle(const char *line, uint32_t len)
                  verify_failures, code);
         return code;
     }
-    op_fn fn = 0;
+    op_fn fn = ps_op(req.op);
     for (uint32_t i = 0; i < sizeof(OPTAB) / sizeof(OPTAB[0]); i++)
         if (nci_streq(req.op, OPTAB[i].name))
             fn = OPTAB[i].fn;
@@ -861,13 +909,15 @@ static int64_t handle(const char *line, uint32_t len)
         a->state = ACT_VERIFYING; /* result is known, only the text did not fit */
         fail_action(a, &b, "RESPONSE_TOO_LARGE", 0, "unknown");
     }
+    if (a->persist == PS_INTENT)
+        ps_final(a, &b); /* write-ahead record of task.spawn / task.terminate */
     if (eng_store(a, b.p, b.len) != 0)
         u_printf("act %s: response not stored (%u bytes)\n", a->id, b.len);
     write_all(b.p, b.len);
     return -1;
 }
 
-int64_t umain(uint64_t a0, uint64_t a1, uint64_t flags, uint64_t a3)
+int64_t umain(uint64_t a0, uint64_t a1, uint64_t flags, uint64_t blk)
 {
     sov = a0;
     chan = a1;
@@ -881,8 +931,17 @@ int64_t umain(uint64_t a0, uint64_t a1, uint64_t flags, uint64_t a3)
     self_id = (uint32_t)nx_task_self();
     nci_ref_format(self_ref, boot_id, self_id);
     /* The handles must be what the kernel promised. */
-    if (nx_sov_task_list(sov, list, LIST_MAX) < 0 || nx_chan_write(chan, "", 0) < 0) {
+    if (nx_sov_task_list(sov, list, LIST_MAX) < 0 || (chan && nx_chan_write(chan, "", 0) < 0)) {
         u_printf("bad handles: sovereign=0x%lx channel=0x%lx\n", sov, chan);
+        return NX_M3_CORE_BAD_ARGS;
+    }
+    ps_init(blk);
+    if (flags & NX_M4_CORE_WORKLOAD)
+        return ps_run_workload();
+    if (flags & NX_M4_CORE_CHECK)
+        return ps_run_check();
+    if (!chan) {
+        u_printf("no bridge channel and no M4 mode flag\n");
         return NX_M3_CORE_BAD_ARGS;
     }
     char hello[128];
@@ -922,7 +981,7 @@ int64_t umain(uint64_t a0, uint64_t a1, uint64_t flags, uint64_t a3)
             continue;
         }
         line[len] = 0;
-        int64_t code = handle(line, len);
+        int64_t code = core_handle(line, len);
         if (code >= 0)
             return code;
     }

@@ -687,6 +687,350 @@
           "^NANOX: TEST FAIL m3-kill-noop: core#4 exited with code 3: the executor's end-state verification failed$"
         ]
       }
+    },
+    {
+      "name": "m4-blk",
+      "description": "M4 virtio-blk driver: boot disk (read-only, GPT) and data disk (serial nanox-data) found over PCI; the read-only disk refuses a write; 8 blocks written, flushed, read back and restored; the emulated volatile cache of the crash-test layer holds a write until the flush.",
+      "image": {
+        "cmdline": "nanox.test=m4-blk"
+      },
+      "data_disk": true,
+      "expect": {
+        "verdict": "PASS",
+        "patterns": [
+          "^NANOX: blk 00:[0-9a-f]{{2}}\\.0 virtio-blk id=0x10(01|42) serial=\"\" sectors=131072 features=0x[0-9a-f]+ ro=yes flush=yes queue=16$",
+          "^NANOX: blk 00:[0-9a-f]{{2}}\\.0 virtio-blk id=0x10(01|42) serial=\"nanox-data\" sectors=2048 features=0x[0-9a-f]+ ro=no flush=yes queue=16$",
+          "^NANOX: m4-blk boot disk sectors=131072 mbr=55aa gpt=\"EFI PART\" write=(ioerr|unsupp)$",
+          "^NANOX: m4-blk data disk serial=\"nanox-data\" blocks=256 write\\+flush\\+readback=ok blocks=248-255 range_check=ok$",
+          "^NANOX: m4-blk test cache pending=1 device_before_flush=old device_after_flush=new ops=2$",
+          "^NANOX: m4-blk restored requests=[0-9]+ errors=0$"
+        ],
+        "store": {
+          "mounted": true,
+          "gen": 1,
+          "label": "format",
+          "check_ok": true
+        }
+      }
+    },
+    {
+      "name": "m4-crash",
+      "kind": "crash-sweep",
+      "description": "M4 crash consistency: the built-in workload of bin/core (configuration, blobs, pins, task.spawn/terminate with write-ahead records, reuse of released blocks) is stopped before every one of its write/flush operations, with every persistence policy of the unflushed writes that changes the outcome there (all lost, all kept, newest torn, only newest kept); after each stop a check boot must recover a generation between the last one reported saved and the last one begun, with exactly the content of the model of that generation, confirmed by the host-side reader and both consistency checks.",
+      "work_cmdline": "nanox.test=m4-work nanox.m4.cache=volatile",
+      "check_cmdline": "nanox.test=m4-check",
+      "policies": "auto",
+      "expect": {
+        "violations": 0,
+        "points_min": 60
+      }
+    },
+    {
+      "name": "m4-persist",
+      "description": "M4 criterion 2: boot 1 sets configuration, runs task.spawn/terminate (write-ahead and final records), stores a blob and pins a generation; boot 2 on the same data disk finds the configuration, the history of boot 1 (commit log with its boot id, pinned generation readable), the task records (action.status known, persisted, restored), answers a repeated boot-1 request from its record without running it again, rejects a boot-1 id with another request, and commits the next generation.",
+      "timeout_s": 180,
+      "boots": [
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "persist-1"
+          },
+          "expect": {
+            "verdict": "PASS",
+            "bridge": {
+              "ok": true
+            },
+            "store": {
+              "mounted": true,
+              "check_ok": true,
+              "config": {
+                "owner": "nanox",
+                "mode": "beta"
+              },
+              "blobs": {
+                "data": 20000
+              },
+              "pins": {
+                "before": 3
+              },
+              "tasks": {
+                "p1-cfg-owner": "SUCCEEDED",
+                "p1-spawn": "SUCCEEDED",
+                "p1-kill": "SUCCEEDED",
+                "p1-pin": "SUCCEEDED"
+              }
+            }
+          }
+        },
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "persist-2"
+          },
+          "expect": {
+            "verdict": "PASS",
+            "bridge": {
+              "ok": true
+            },
+            "store": {
+              "mounted": true,
+              "check_ok": true,
+              "config": {
+                "owner": "nanox",
+                "mode": "gamma"
+              },
+              "tasks": {
+                "p1-spawn": "SUCCEEDED",
+                "p2-cfg-mode": "SUCCEEDED"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "m4-persist-amnesia",
+      "description": "Negative control of criterion 2: boot 2 gets a freshly formatted data disk instead of the one boot 1 wrote; the host checks of persistence (configuration, task records, replay of the boot-1 request) must fail.",
+      "timeout_s": 180,
+      "boots": [
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "persist-1"
+          },
+          "expect": {
+            "verdict": "PASS",
+            "bridge": {
+              "ok": true
+            }
+          }
+        },
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "persist-2"
+          },
+          "expect": {
+            "verdict": "FAIL",
+            "failure_class": "test_fail",
+            "patterns": [
+              "^NANOX: TEST FAIL m4-serve: core#4 exited with code 4: "
+            ],
+            "bridge": {
+              "ok": false,
+              "problems": [
+                "^persist_status:",
+                "^persist_config:",
+                "^persist_task:",
+                "^persist_replay:"
+              ]
+            }
+          },
+          "data_disk": "fresh"
+        }
+      ]
+    },
+    {
+      "name": "m4-corrupt-root",
+      "description": "M4 criterion 3 (damaged root): after boot 1 committed generations 2 and 3, the harness flips a byte of the root block of generation 3; boot 2 must reject it (bad_root), fall back to generation 2 in the other slot, report the fallback, and commit generation 4 into the damaged slot.",
+      "timeout_s": 180,
+      "boots": [
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "corrupt-1"
+          },
+          "expect": {
+            "verdict": "PASS",
+            "bridge": {
+              "ok": true
+            },
+            "store": {
+              "gen": 3,
+              "config": {
+                "x": "two"
+              }
+            }
+          },
+          "after": {
+            "corrupt": "current-root"
+          }
+        },
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "corrupt-2"
+          },
+          "expect": {
+            "verdict": "PASS",
+            "bridge": {
+              "ok": true
+            },
+            "store": {
+              "mounted": true,
+              "check_ok": true,
+              "gen": 4,
+              "config": {
+                "x": "three"
+              },
+              "tasks": {
+                "c1-x1": "SUCCEEDED",
+                "c2-x3": "SUCCEEDED"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "m4-unmountable",
+      "description": "M4 criterion 3 (no valid root): both superblocks damaged after boot 1; boot 2 must refuse the store (no_valid_root, both slots bad_crc), fail store operations with NO_STORE and no effects, keep serving the other operations, and leave the disk untouched.",
+      "timeout_s": 180,
+      "boots": [
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "unmountable-1"
+          },
+          "expect": {
+            "verdict": "PASS",
+            "bridge": {
+              "ok": true
+            }
+          },
+          "after": {
+            "corrupt": "both-supers"
+          }
+        },
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "unmountable-2"
+          },
+          "expect": {
+            "verdict": "PASS",
+            "bridge": {
+              "ok": true
+            },
+            "data_disk_unchanged": true,
+            "store": {
+              "mounted": false,
+              "slot_states": [
+                "bad_crc",
+                "bad_crc"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "m4-full",
+      "description": "M4 criterion 3 (full store): 32 KiB blobs until NO_SPACE; the failed put has no effect and no record, the last blob and the consistency check are intact; deletes and prunes (allowed to use the reserve) release space, a new put succeeds; boot 2 finds the same generation and valid blobs.",
+      "timeout_s": 240,
+      "boots": [
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "full-1"
+          },
+          "expect": {
+            "verdict": "PASS",
+            "bridge": {
+              "ok": true
+            },
+            "store": {
+              "mounted": true,
+              "check_ok": true,
+              "blobs": {
+                "again": 32768,
+                "f0": null
+              }
+            }
+          }
+        },
+        {
+          "image": {
+            "cmdline": "nanox.test=m4-serve"
+          },
+          "bridge": {
+            "script": "full-2"
+          },
+          "expect": {
+            "verdict": "PASS",
+            "bridge": {
+              "ok": true
+            },
+            "store": {
+              "mounted": true,
+              "check_ok": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "m4-retention",
+      "description": "M4 criterion 4: the retention window (4 generations) and pins: a pinned generation outside the window stays readable, an unpinned one is PRUNED, unpin and store.prune release blocks, the commit log keeps the entries of released generations marked pruned.",
+      "timeout_s": 180,
+      "data_disk": true,
+      "image": {
+        "cmdline": "nanox.test=m4-serve"
+      },
+      "bridge": {
+        "script": "retention"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        },
+        "store": {
+          "mounted": true,
+          "check_ok": true,
+          "config": {
+            "v": "6"
+          },
+          "pins": {
+            "first": null
+          }
+        }
+      }
+    },
+    {
+      "name": "m4-crash-noflush",
+      "kind": "crash-sweep",
+      "description": "Negative control of the crash sweep: the block layer reports every flush as done without writing the emulated volatile cache out; a stop right after each generation reported saved, losing the unflushed writes, must lose saved generations.",
+      "work_cmdline": "nanox.test=m4-work nanox.m4.cache=volatile nanox.m4.flush=noop",
+      "check_cmdline": "nanox.test=m4-check",
+      "points": "after-ack",
+      "policies": [
+        "all"
+      ],
+      "expect": {
+        "violations_min": 1,
+        "violation_patterns": [
+          "^saved_lost:"
+        ]
+      }
     }
   ]
 }

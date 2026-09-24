@@ -3,8 +3,8 @@
 
 Copies the current source tree (tracked + untracked, not ignored files) into
 two fresh directories with different absolute paths, runs `make all` in each
-and in the working tree, and requires BOOTX64.EFI, kernel.elf, initrd.img and nanox.img to
-be byte-identical across all three builds (plus initrd.img).  Writes out/repro-check.json.
+and in the working tree, and requires BOOTX64.EFI, kernel.elf, initrd.img, nanox.img and
+(M4) data.img to be byte-identical across all three builds.  Writes out/repro-check.json.
 Temporary trees are removed on success and kept for inspection on failure.
 """
 
@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-ARTIFACTS = ("BOOTX64.EFI", "kernel.elf", "initrd.img", "nanox.img")
+ARTIFACTS = ("BOOTX64.EFI", "kernel.elf", "initrd.img", "nanox.img", "data.img")
 
 
 def source_files():

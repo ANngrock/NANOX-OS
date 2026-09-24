@@ -137,6 +137,28 @@ static inline int64_t nx_chan_write(uint64_t ch, const void *buf, uint64_t len)
     return nx_sys(NX_SYS_CHAN_WRITE, ch, (uint64_t)(uintptr_t)buf, len, 0, 0);
 }
 
+/* ---- M4 ---- */
+
+static inline int64_t nx_blk_info(uint64_t h, struct nx_blk_info *info)
+{
+    return nx_sys(NX_SYS_BLK_INFO, h, (uint64_t)(uintptr_t)info, 0, 0, 0);
+}
+
+static inline int64_t nx_blk_read(uint64_t h, uint64_t blk, uint64_t count, void *buf)
+{
+    return nx_sys(NX_SYS_BLK_READ, h, blk, count, (uint64_t)(uintptr_t)buf, 0);
+}
+
+static inline int64_t nx_blk_write(uint64_t h, uint64_t blk, uint64_t count, const void *buf)
+{
+    return nx_sys(NX_SYS_BLK_WRITE, h, blk, count, (uint64_t)(uintptr_t)buf, 0);
+}
+
+static inline int64_t nx_blk_flush(uint64_t h)
+{
+    return nx_sys(NX_SYS_BLK_FLUSH, h, 0, 0, 0, 0);
+}
+
 /* Current privilege level (low bits of CS). */
 static inline uint64_t u_cpl(void)
 {

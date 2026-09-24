@@ -27,8 +27,9 @@ def reason_code(problem):
 
 
 def run_session(sock, script, adapter=None, request=None, trace_path=None, wire_path=None,
-                hello_timeout_s=120.0):
-    """Returns a dict: ok, problems, hello, close, agent, trace_path."""
+                hello_timeout_s=120.0, carry=None):
+    """Returns a dict: ok, problems, hello, close, agent, trace_path.
+    carry: dict shared by the sessions of the boots of one scenario (M4)."""
     wire = open(wire_path, "w") if wire_path else None
     t0 = time.monotonic()
 
@@ -44,7 +45,8 @@ def run_session(sock, script, adapter=None, request=None, trace_path=None, wire_
            "close": None, "agent": None, "trace": trace_path}
     try:
         out["hello"] = client.wait_hello(hello_timeout_s)
-        ctx = {"client": client, "trace": trace, "hello": out["hello"], "request": request}
+        ctx = {"client": client, "trace": trace, "hello": out["hello"], "request": request,
+               "carry": carry if carry is not None else {}}
         if adapter:
             ctx["adapter"] = adapter
         problems = scripts.SCRIPTS[script](ctx)

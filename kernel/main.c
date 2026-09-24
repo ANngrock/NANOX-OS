@@ -1,5 +1,5 @@
 /*
- * NANOX kernel (M1, M2).
+ * NANOX kernel (M1-M4).
  *
  * Boot sequence: own GDT/TSS/IDT, boot info validation, physical allocator,
  * own page tables (CR3 switch), reclaim of boot memory, initramfs check,
@@ -19,6 +19,9 @@
  *   m3-serve, m3-kill-noop, m3-events-off, m3-nodedup
  *                   Cognitive Core executor serving the host bridge
  *                   (kernel/m3test.c)
+ *   m4-blk, m4-serve, m4-work, m4-check
+ *                   virtio-blk driver, persistent store, crash points
+ *                   (kernel/m4test.c)
  */
 #include <stdint.h>
 
@@ -38,6 +41,7 @@
 #include "kernel.h"
 #include "m2test.h"
 #include "m3test.h"
+#include "m4test.h"
 #include "mm/mm.h"
 
 /* M0/M1 early boot runs on the UEFI identity mapping: physical == virtual. */
@@ -100,7 +104,34 @@ static const struct test_mode MODES[] = {
     {"m3-kill-noop", K_M2, nx_m3_kill_noop},
     {"m3-events-off", K_M2, nx_m3_events_off},
     {"m3-nodedup", K_M2, nx_m3_nodedup},
+    {"m4-blk", K_M2, nx_m4_blk},
+    {"m4-serve", K_M2, nx_m4_serve},
+    {"m4-work", K_M2, nx_m4_work},
+    {"m4-check", K_M2, nx_m4_check},
 };
+
+const char *nx_cmdline;
+uint32_t nx_cmdline_len;
+
+int nx_cmdline_value(const char *key, const char **val, uint32_t *vlen)
+{
+    uint32_t klen = (uint32_t)nx_strlen(key), i = 0;
+    int found = 0;
+    while (nx_cmdline && i < nx_cmdline_len) {
+        while (i < nx_cmdline_len && nx_cmdline[i] == ' ')
+            i++;
+        uint32_t start = i;
+        while (i < nx_cmdline_len && nx_cmdline[i] != ' ')
+            i++;
+        if (i - start > klen && memcmp(nx_cmdline + start, key, klen) == 0 &&
+            nx_cmdline[start + klen] == '=') {
+            *val = nx_cmdline + start + klen + 1;
+            *vlen = i - start - klen - 1;
+            found = 1;
+        }
+    }
+    return found;
+}
 
 static int token_eq(const char *tok, uint32_t len, const char *lit)
 {
@@ -425,6 +456,8 @@ __attribute__((noreturn)) void kernel_main(const struct nx_boot_info *boot_bi)
 
     const char *cl = nx_phys_to_virt(bi->cmdline_phys);
     nx_printf("NANOX: cmdline \"%s\"\n", cl);
+    nx_cmdline = cl;
+    nx_cmdline_len = bi->cmdline_len;
     uint32_t vlen;
     const struct test_mode *mode = parse_mode(cl, bi->cmdline_len, &vlen);
     selftest_timer(mode && mode->kind == K_TIMER_MASKED);

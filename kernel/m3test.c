@@ -17,12 +17,14 @@
 
 #include <nanox/diag.h>
 #include <nanox/m3.h>
+#include <nanox/m4.h>
 #include <nanox/printf.h>
 #include <nanox/syscall.h>
 
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/timer.h"
 #include "chan.h"
+#include "dev/blk.h"
 #include "kernel.h"
 #include "m2test.h"
 #include "m3test.h"
@@ -71,6 +73,7 @@ static const char *core_verdict(int64_t code)
     case NX_M3_CORE_VERIFY_FAILED: return "the executor's end-state verification failed";
     case NX_M3_CORE_HOST_FAILED: return "the host bridge reported failed host-side checks";
     case NX_M3_CORE_BRIDGE_LOST: return "the host bridge went silent";
+    case NX_M4_CORE_STORE_FAILED: return "the store could not be mounted or checked";
     default: return "bin/core failed";
     }
 }
@@ -104,35 +107,57 @@ static uint32_t cleanup_leftovers(const char *mode)
     return left;
 }
 
-__attribute__((noreturn)) static void m3_run(const char *mode, uint64_t core_flags)
+__attribute__((noreturn)) void nx_core_session(const struct nx_core_opts *o)
 {
+    const char *mode = o->mode;
+    uint64_t core_flags = o->flags;
     nx_sched_init(1);
     nx_boot_id = make_boot_id();
     nx_reaper_start();
-    struct nx_chan *chan = nx_chan_init();
-    if (!chan)
-        fail("%s: no UART at COM2: the host bridge channel is missing", mode);
-    nx_printf("NANOX: m3 boot_id=%016" NX_PRIx64 " bridge=com2 port=0x2f8 events=%s"
-              " kill=%s dedup=%s\n",
-              nx_boot_id, nx_events.disabled ? "off" : "on", nx_inject_kill_noop ? "noop" : "on",
-              core_flags & NX_M3_CORE_NODEDUP ? "off" : "on");
+    struct nx_chan *chan = 0;
+    if (o->bridge) {
+        chan = nx_chan_init();
+        if (!chan)
+            fail("%s: no UART at COM2: the host bridge channel is missing", mode);
+    }
+    if (!o->blk)
+        nx_printf("NANOX: m3 boot_id=%016" NX_PRIx64 " bridge=com2 port=0x2f8 events=%s"
+                  " kill=%s dedup=%s\n",
+                  nx_boot_id, nx_events.disabled ? "off" : "on",
+                  nx_inject_kill_noop ? "noop" : "on",
+                  core_flags & NX_M3_CORE_NODEDUP ? "off" : "on");
+    else
+        nx_printf("NANOX: m4 boot_id=%016" NX_PRIx64 " bridge=%s store=virtio-blk serial=%s"
+                  " blocks=%" NX_PRIu64 " cache=%s flush=%s crash=%u lose=%s\n",
+                  nx_boot_id, chan ? "com2" : "none", o->blk->dev->serial, o->blk->blocks,
+                  nx_blk_test.volatile_cache ? "volatile-test" : "device",
+                  nx_blk_test.flush_noop ? "noop" : "device", nx_blk_test.crash_at,
+                  nx_blk_lose_name(nx_blk_test.lose));
     struct nx_test_snapshot before, after;
     nx_test_snapshot(&before);
     print_snap(mode, "before", &before);
 
     const uint64_t none[4] = {0, 0, 0, 0};
     struct nx_task *core = nx_test_spawn(mode, "core", "bin/core", none);
-    uint32_t sh, ch;
+    uint32_t sh, ch = 0, bh = 0;
     if (nx_ht_install(&core->handles, nx_sovereign(), NX_RIGHT_SOVEREIGN, &sh) != NX_OK ||
-        nx_ht_install(&core->handles, &chan->base, NX_RIGHT_READ | NX_RIGHT_WRITE, &ch) != NX_OK)
+        (chan && nx_ht_install(&core->handles, &chan->base, NX_RIGHT_READ | NX_RIGHT_WRITE,
+                               &ch) != NX_OK) ||
+        (o->blk && nx_ht_install(&core->handles, &o->blk->base, NX_RIGHT_READ | NX_RIGHT_WRITE,
+                                 &bh) != NX_OK))
         fail("%s: cannot install the core's handles", mode);
     nx_task_set_arg(core, 0, sh);
     nx_task_set_arg(core, 1, ch);
     nx_task_set_arg(core, 2, core_flags);
+    nx_task_set_arg(core, 3, bh);
     nx_printf("NANOX: %s core %s#%u sovereign=0x%x rights=0x%x channel=0x%x rights=0x%x"
-              " flags=0x%" NX_PRIx64 "\n",
+              " flags=0x%" NX_PRIx64 "%s\n",
               mode, core->name, core->id, sh, NX_RIGHT_SOVEREIGN, ch,
-              NX_RIGHT_READ | NX_RIGHT_WRITE, core_flags);
+              chan ? NX_RIGHT_READ | NX_RIGHT_WRITE : 0, core_flags,
+              o->blk ? " blk=present" : "");
+    if (o->blk)
+        nx_printf("NANOX: %s core blk=0x%x rights=0x%x\n", mode, bh,
+                  NX_RIGHT_READ | NX_RIGHT_WRITE);
 
     nx_sched_watchdog(WATCHDOG_M3, mode);
     nx_task_start(core);
@@ -142,9 +167,15 @@ __attribute__((noreturn)) static void m3_run(const char *mode, uint64_t core_fla
     nx_obj_unref(&core->base);
     uint32_t leftovers = cleanup_leftovers(mode);
     nx_sched_watchdog(0, 0);
-    nx_printf("NANOX: %s bridge rx_bytes=%" NX_PRIu64 " tx_bytes=%" NX_PRIu64
-              " events=%" NX_PRIu64 "\n",
-              mode, chan->rx_bytes, chan->tx_bytes, nx_events.next - 1);
+    if (chan)
+        nx_printf("NANOX: %s bridge rx_bytes=%" NX_PRIu64 " tx_bytes=%" NX_PRIu64
+                  " events=%" NX_PRIu64 "\n",
+                  mode, chan->rx_bytes, chan->tx_bytes, nx_events.next - 1);
+    if (o->blk)
+        nx_printf("NANOX: %s blk reads=%" NX_PRIu64 " writes=%" NX_PRIu64 " flushes=%" NX_PRIu64
+                  " ops=%u pending=%u\n",
+                  mode, o->blk->reads, o->blk->writes, o->blk->flushes, nx_blk_test.ops,
+                  nx_blk_pending());
 
     nx_test_snapshot(&after);
     print_snap(mode, "after", &after);
@@ -163,6 +194,12 @@ __attribute__((noreturn)) static void m3_run(const char *mode, uint64_t core_fla
         fail("%s: resources not returned", mode);
     nx_printf("NANOX: %s ok core#%u exit=0 resources_restored=yes\n", mode, core_id);
     nx_test_pass();
+}
+
+__attribute__((noreturn)) static void m3_run(const char *mode, uint64_t core_flags)
+{
+    struct nx_core_opts o = {mode, core_flags, 1, 0};
+    nx_core_session(&o);
 }
 
 void nx_m3_serve(void)

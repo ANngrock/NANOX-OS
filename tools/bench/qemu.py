@@ -61,7 +61,12 @@ def prepare_vars(dest):
     return dest
 
 
-def base_argv(image, vars_path, serial, extra=(), bridge_socket=None):
+# M4: the persistent data disk, a second virtio-blk device found by the
+# kernel through its serial number (docs/m4-store.md).
+DATA_DISK_SERIAL = "nanox-data"
+
+
+def base_argv(image, vars_path, serial, extra=(), bridge_socket=None, data_disk=None):
     """Returns the canonical argv.
 
     image     raw disk image (opened read-only)
@@ -72,6 +77,8 @@ def base_argv(image, vars_path, serial, extra=(), bridge_socket=None):
               M3 host bridge: the second serial port (COM2) is connected, as a
               client, to this unix socket, on which the host bridge listens
               (docs/m3-core.md)
+    data_disk M4: raw image of the persistent data disk, attached writable as
+              a second virtio-blk device with serial DATA_DISK_SERIAL
     """
     argv = [
         QEMU_BINARY,
@@ -93,6 +100,9 @@ def base_argv(image, vars_path, serial, extra=(), bridge_socket=None):
         "-device", "isa-debug-exit,iobase=0x%x,iosize=0x01" % DEBUG_EXIT_IOBASE,
         "-serial", serial,
     ]
+    if data_disk:
+        argv += ["-drive", "if=none,id=nxdata,format=raw,file=%s" % data_disk,
+                 "-device", "virtio-blk-pci,drive=nxdata,serial=%s" % DATA_DISK_SERIAL]
     if bridge_socket:
         argv += ["-chardev", "socket,id=nxbridge,path=%s,server=off" % bridge_socket,
                  "-serial", "chardev:nxbridge"]

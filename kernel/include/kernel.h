@@ -32,6 +32,13 @@ __attribute__((noreturn, format(printf, 1, 2))) void nx_panic(const char *fmt, .
  * exits QEMU with NX_EXIT_EXCEPTION. */
 __attribute__((noreturn)) void nx_fatal_trap(struct nx_trap_frame *f);
 
+/* Kernel command line (set by kernel_main before the test mode runs). */
+extern const char *nx_cmdline;
+extern uint32_t nx_cmdline_len;
+/* Value of the last "<key>=<value>" token of the command line: 1 found
+ * (val and len set, not NUL-terminated), 0 absent. */
+int nx_cmdline_value(const char *key, const char **val, uint32_t *len);
+
 /* Writes `code` to isa-debug-exit; halts if the device is absent. */
 __attribute__((noreturn)) void nx_debug_exit(uint8_t code);
 

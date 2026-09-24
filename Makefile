@@ -50,7 +50,8 @@ KERNEL_CSRCS := kernel/main.c kernel/panic.c kernel/bootinfo_check.c \
     kernel/arch/x86_64/idt.c kernel/arch/x86_64/timer.c kernel/mm/pmm.c kernel/mm/pt.c \
     kernel/mm/vmm.c kernel/mm/uaccess.c kernel/obj/handle.c kernel/obj/ipc.c \
     kernel/obj/objects.c kernel/obj/event.c kernel/task.c kernel/syscall.c kernel/m2test.c \
-    kernel/chan.c kernel/m3test.c lib/elf_plan.c lib/serial.c lib/printf.c lib/string.c lib/sha256.c
+    kernel/chan.c kernel/m3test.c kernel/dev/pci.c kernel/dev/virtio_blk.c kernel/dev/blk.c \
+    kernel/m4test.c lib/elf_plan.c lib/serial.c lib/printf.c lib/string.c lib/sha256.c
 KERNEL_ASRCS := kernel/arch/x86_64/entry.S kernel/arch/x86_64/isr.S
 KERNEL_OBJS := $(patsubst %.c,$(BUILD)/kernel/%.o,$(KERNEL_CSRCS)) \
     $(patsubst %.S,$(BUILD)/kernel/%.o,$(KERNEL_ASRCS))
@@ -71,18 +72,20 @@ USER_PROGS := hello spin ipc-send ipc-recv load core
 USER_ELFS := $(patsubst %,$(BUILD)/user/bin/%,$(USER_PROGS))
 # bin/core (M3): the Cognitive Core executor, several sources.
 CORE_OBJS := $(BUILD)/user/user/core/core.o $(BUILD)/user/user/core/nci.o \
-    $(BUILD)/user/user/core/engine.o
+    $(BUILD)/user/user/core/engine.o $(BUILD)/user/user/core/persist.o \
+    $(BUILD)/user/lib/store.o $(BUILD)/user/lib/crc32.o
 
 LOADER_EFI := $(OUT)/BOOTX64.EFI
 KERNEL_ELF := $(OUT)/kernel.elf
 INITRD     := $(OUT)/initrd.img
 IMAGE      := $(OUT)/nanox.img
+DATA_IMG   := $(OUT)/data.img
 INITRD_FILES := $(shell find initrd -type f 2>/dev/null | LC_ALL=C sort)
 
 .PHONY: all doctor test host-test py-test qemu-test run debug debug-check \
     repro-check clean distclean
 
-all: $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) $(IMAGE) $(OUT)/SHA256SUMS
+all: $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) $(IMAGE) $(DATA_IMG) $(OUT)/SHA256SUMS
 
 $(BUILD)/loader/%.obj: %.c
 	@mkdir -p $(@D)
@@ -130,8 +133,15 @@ $(IMAGE): $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) tools/image/mkimage.py
 	$(PYTHON) tools/image/mkimage.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) \
 	    --initrd $(INITRD) --out $@
 
-$(OUT)/SHA256SUMS: $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) $(IMAGE)
-	cd $(OUT) && sha256sum BOOTX64.EFI kernel.elf initrd.img nanox.img > SHA256SUMS
+# M4: the persistent data disk of the bench, an empty store (1 MiB, 256
+# blocks, 4 generations retained), written by the host-side implementation
+# of the format; every scenario that uses it works on a copy.
+$(DATA_IMG): tools/store/nxstore.py
+	@mkdir -p $(@D)
+	$(PYTHON) tools/store/nxstore.py format --out $@ --blocks 256 --retain 4
+
+$(OUT)/SHA256SUMS: $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) $(IMAGE) $(DATA_IMG)
+	cd $(OUT) && sha256sum BOOTX64.EFI kernel.elf initrd.img nanox.img data.img > SHA256SUMS
 	@cat $@
 
 -include $(LOADER_OBJS:.obj=.d) $(KERNEL_OBJS:.o=.d) $(USER_RT_OBJS:.o=.d) \
@@ -150,10 +160,10 @@ HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_sha256.c tests/host/test_elf.c tests/host/test_mmap.c \
     tests/host/test_initramfs.c tests/host/test_pt.c tests/host/test_pmm.c \
     tests/host/test_handle.c tests/host/test_ipc.c tests/host/test_event.c \
-    tests/host/test_nci.c tests/host/test_engine.c \
+    tests/host/test_nci.c tests/host/test_engine.c tests/host/test_store.c \
     kernel/bootinfo_check.c kernel/initramfs.c kernel/mm/pt.c kernel/mm/pmm.c \
     kernel/obj/handle.c kernel/obj/ipc.c kernel/obj/event.c user/core/nci.c user/core/engine.c \
-    lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c
+    lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c lib/store.c lib/crc32.c
 
 $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
     $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h kernel/mm/*.h kernel/obj/*.h \
@@ -161,10 +171,16 @@ $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_TEST_SRCS)
 
-host-test: $(OUT)/host/test_host $(KERNEL_ELF) $(INITRD)
-	$(OUT)/host/test_host $(KERNEL_ELF) $(INITRD)
+host-test: $(OUT)/host/test_host $(KERNEL_ELF) $(INITRD) $(DATA_IMG)
+	$(OUT)/host/test_host $(KERNEL_ELF) $(INITRD) $(DATA_IMG)
 
-py-test: all
+# M4: lib/store.c as a host tool, for cross-checks with tools/store/nxstore.py.
+$(OUT)/host/storetool: tests/host/storetool.c lib/store.c lib/crc32.c lib/include/nanox/store.h \
+    lib/include/nanox/crc32.h
+	@mkdir -p $(@D)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tests/host/storetool.c lib/store.c lib/crc32.c
+
+py-test: all $(OUT)/host/storetool
 	$(PYTHON) -m unittest discover -s tests/host -p 'test_*.py' -v
 
 # All scenarios, then repeatability: the normal boot and the page-fault crash
@@ -192,7 +208,7 @@ repro-check:
 
 clean:
 	rm -rf $(BUILD) $(OUT)/host $(OUT)/images $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) \
-	    $(IMAGE) $(OUT)/SHA256SUMS
+	    $(IMAGE) $(DATA_IMG) $(OUT)/SHA256SUMS
 
 # Also removes run records (out/runs).
 distclean:

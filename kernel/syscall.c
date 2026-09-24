@@ -19,6 +19,7 @@
 #include "arch/x86_64/timer.h"
 #include "arch/x86_64/trap.h"
 #include "chan.h"
+#include "dev/blk.h"
 #include "initramfs.h"
 #include "kernel.h"
 #include "m2test.h"
@@ -522,6 +523,84 @@ static int64_t sys_chan_write(struct nx_task *t, uint64_t ch, uint64_t va, uint6
     return (int64_t)len;
 }
 
+/* ---- M4: block device ------------------------------------------------------ */
+
+static struct nx_blkdev *blk_lookup(struct nx_task *t, uint64_t h, uint32_t need, int *st)
+{
+    struct nx_object *o = 0;
+    *st = h > UINT32_MAX ? NX_EBADHANDLE
+                         : nx_ht_lookup(&t->handles, (uint32_t)h, NX_OBJ_BLOCKDEV, need, &o, 0);
+    return (struct nx_blkdev *)o;
+}
+
+/* Data of one block request (not on the 16 KiB kernel stack). */
+static uint8_t blkbuf[NX_BLK_IO_MAX * NX_BLK_SIZE];
+
+static int64_t sys_blk_info(struct nx_task *t, uint64_t h, uint64_t va)
+{
+    int st;
+    struct nx_blkdev *b = blk_lookup(t, h, NX_RIGHT_READ, &st);
+    if (!b)
+        return -st;
+    struct nx_blk_info info;
+    memset(&info, 0, sizeof(info));
+    info.blocks = b->blocks;
+    info.block_size = NX_BLK_SIZE;
+    info.flags = (b->dev->read_only ? NX_BLK_INFO_READ_ONLY : 0) |
+                 (b->dev->has_flush ? NX_BLK_INFO_FLUSH : 0) |
+                 (nx_blk_test.enabled && nx_blk_test.volatile_cache ? NX_BLK_INFO_TEST_CACHE : 0);
+    info.reads = b->reads;
+    info.writes = b->writes;
+    info.flushes = b->flushes;
+    for (uint32_t i = 0; i < NX_VBLK_SERIAL_MAX && b->dev->serial[i]; i++)
+        info.serial[i] = b->dev->serial[i];
+    st = copy_out(t, va, &info, sizeof(info));
+    return st == NX_OK ? 0 : -st;
+}
+
+static int64_t sys_blk_read(struct nx_task *t, uint64_t h, uint64_t blk, uint64_t count,
+                            uint64_t va)
+{
+    int st;
+    struct nx_blkdev *b = blk_lookup(t, h, NX_RIGHT_READ, &st);
+    if (!b)
+        return -st;
+    if (count == 0 || count > NX_BLK_IO_MAX || blk >= b->blocks || count > b->blocks - blk)
+        return -NX_EINVAL;
+    st = check_out(t, va, count * NX_BLK_SIZE);
+    if (st == NX_OK)
+        st = nx_blk_read(b, blk, (uint32_t)count, blkbuf);
+    if (st != NX_OK)
+        return -st;
+    copy_out(t, va, blkbuf, count * NX_BLK_SIZE);
+    return (int64_t)count;
+}
+
+static int64_t sys_blk_write(struct nx_task *t, uint64_t h, uint64_t blk, uint64_t count,
+                             uint64_t va)
+{
+    int st;
+    struct nx_blkdev *b = blk_lookup(t, h, NX_RIGHT_WRITE, &st);
+    if (!b)
+        return -st;
+    if (count == 0 || count > NX_BLK_IO_MAX || blk >= b->blocks || count > b->blocks - blk)
+        return -NX_EINVAL;
+    st = copy_in(t, blkbuf, va, count * NX_BLK_SIZE);
+    if (st == NX_OK)
+        st = nx_blk_write(b, blk, (uint32_t)count, blkbuf);
+    return st == NX_OK ? (int64_t)count : -st;
+}
+
+static int64_t sys_blk_flush(struct nx_task *t, uint64_t h)
+{
+    int st;
+    struct nx_blkdev *b = blk_lookup(t, h, NX_RIGHT_WRITE, &st);
+    if (!b)
+        return -st;
+    st = nx_blk_flush(b);
+    return st == NX_OK ? 0 : -st;
+}
+
 void nx_syscall(struct nx_trap_frame *f)
 {
     struct nx_task *t = nx_current;
@@ -563,6 +642,10 @@ void nx_syscall(struct nx_trap_frame *f)
     case NX_SYS_SOV_EVENT_READ: r = sys_sov_event_read(t, a, b, c, d); break;
     case NX_SYS_CHAN_READ: r = sys_chan_read(t, a, b, c, d); break;
     case NX_SYS_CHAN_WRITE: r = sys_chan_write(t, a, b, c); break;
+    case NX_SYS_BLK_INFO: r = sys_blk_info(t, a, b); break;
+    case NX_SYS_BLK_READ: r = sys_blk_read(t, a, b, c, d); break;
+    case NX_SYS_BLK_WRITE: r = sys_blk_write(t, a, b, c, d); break;
+    case NX_SYS_BLK_FLUSH: r = sys_blk_flush(t, a); break;
     default: r = -NX_ENOSYS; break;
     }
     f->rax = (uint64_t)r;

@@ -118,10 +118,52 @@ static void test_nodedup(void)
     CHECK_EQ_INT(eng.started, 2);
 }
 
+/* M4: records read back from the store. */
+static void test_restore(void)
+{
+    struct eng_action *a, *b;
+    eng_init(&eng, 0);
+    a = eng_restore(&eng, "old1", "task.spawn", 7, ACT_SUCCEEDED, "RES old1 SUCCEEDED\nEND old1\n",
+                    30, 0xB00Du);
+    CHECK(a != NULL && a->persist && a->restored && a->boot_id == 0xB00Du);
+    CHECK_EQ_INT(a->result_len, 30);
+    /* Non-final states are refused (the caller converts them first). */
+    CHECK(eng_restore(&eng, "old2", "task.spawn", 8, ACT_RUNNING, "", 0, 1) == NULL);
+    CHECK(eng_restore(&eng, "old3", "task.spawn", 8, ACT_OUTCOME_UNKNOWN, "x", 1, 1) != NULL);
+    /* The id is known: a second restore is refused. */
+    CHECK(eng_restore(&eng, "old1", "task.spawn", 7, ACT_SUCCEEDED, "", 0, 1) == NULL);
+    /* A repeated request of an earlier boot is answered from the record. */
+    CHECK_EQ_INT(eng_begin(&eng, "old1", "task.spawn", 7, &b), ENG_REPLAY);
+    CHECK(b == a);
+    CHECK_EQ_INT(eng_begin(&eng, "old1", "task.spawn", 9, &b), ENG_ID_REUSED);
+    CHECK_EQ_INT(eng.started, 0); /* restoring is not starting */
+    /* A new record is not persisted until the persistence layer says so. */
+    CHECK_EQ_INT(eng_begin(&eng, "new1", "config.set", 3, &b), ENG_NEW);
+    CHECK(!b->persist && !b->restored && b->boot_id == 0);
+    /* Records kept in the store are evicted only when no other finished
+     * record is left: the read-only n* records go first. */
+    char id[8];
+    for (uint32_t i = 0; i < ENG_SLOTS; i++) {
+        snprintf(id, sizeof(id), "n%u", i);
+        if (eng_begin(&eng, id, "task.list", i, &b) == ENG_NEW)
+            run_to(b, ACT_SUCCEEDED);
+    }
+    CHECK(eng_find(&eng, "old1") != NULL && eng_find(&eng, "old3") != NULL);
+    CHECK(eng_find(&eng, "n0") == NULL && eng_find(&eng, "n31") != NULL);
+    run_to(eng_find(&eng, "new1"), ACT_SUCCEEDED);
+    /* With only persisted records finished, the oldest of them goes. */
+    for (uint32_t i = 0; i < ENG_SLOTS; i++)
+        if (eng.a[i].state != ACT_NONE)
+            eng.a[i].persist = 1;
+    CHECK_EQ_INT(eng_begin(&eng, "last", "task.list", 1, &b), ENG_NEW);
+    CHECK(eng_find(&eng, "old1") == NULL && eng_find(&eng, "old3") != NULL);
+}
+
 void test_engine(void)
 {
     test_lifecycle();
     test_dedup();
     test_eviction();
     test_nodedup();
+    test_restore();
 }

@@ -39,5 +39,6 @@ void test_ipc(void);
 void test_event(void);
 void test_nci(void);
 void test_engine(void);
+void test_store(const char *data_image);
 
 #endif

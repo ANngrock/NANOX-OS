@@ -1,7 +1,8 @@
 /*
- * NANOX system call ABI, version 1 (M2, extended in M3 by calls 14-21).
- * Shared by the kernel and user programs; normative description in
- * docs/m2-kernel.md (calls 1-13) and docs/m3-core.md (calls 14-21).
+ * NANOX system call ABI, version 1 (M2, extended in M3 by calls 14-21 and
+ * in M4 by calls 22-25).  Shared by the kernel and user programs; normative
+ * description in docs/m2-kernel.md (calls 1-13), docs/m3-core.md (calls
+ * 14-21) and docs/m4-store.md (calls 22-25).
  *
  * Entry: `int $0x80`.  RAX = call number, arguments in RDI, RSI, RDX, R10,
  * R8; result in RAX (>= 0 success, < 0 one of NX_E*).  All other registers
@@ -46,6 +47,11 @@ enum nx_syscall {
     NX_SYS_SOV_EVENT_READ = 19, /* (sovereign h, since, ev*, cap) -> events copied */
     NX_SYS_CHAN_READ = 20,   /* (channel h, buf, cap, timeout ticks) -> bytes (0: timeout) */
     NX_SYS_CHAN_WRITE = 21,  /* (channel h, buf, len) -> len */
+    /* M4: block device (4096-byte blocks). */
+    NX_SYS_BLK_INFO = 22,    /* (blk h, info*) -> 0; struct nx_blk_info, needs READ */
+    NX_SYS_BLK_READ = 23,    /* (blk h, block, count <= NX_BLK_IO_MAX, buf) -> count; READ */
+    NX_SYS_BLK_WRITE = 24,   /* (blk h, block, count <= NX_BLK_IO_MAX, buf) -> count; WRITE */
+    NX_SYS_BLK_FLUSH = 25,   /* (blk h) -> 0 once every completed write is durable; WRITE */
     NX_SYS__COUNT
 };
 
@@ -64,6 +70,7 @@ enum nx_error {
     NX_ERANGE = 10,    /* address outside the user half */
     NX_EDEAD = 11,     /* target task has exited */
     NX_ENOENT = 12,    /* M3: no such program in the initramfs */
+    NX_EIO = 13,       /* M4: the device reported an error or did not complete */
     NX_E__COUNT
 };
 
@@ -156,6 +163,23 @@ struct nx_event {
     uint32_t type; /* NX_EV_* */
     uint32_t task;
     int64_t arg;
+};
+
+/* ---- M4 (docs/m4-store.md) ------------------------------------------------ */
+
+#define NX_BLK_SIZE 4096u
+#define NX_BLK_IO_MAX 8u
+
+#define NX_BLK_INFO_READ_ONLY 1u
+#define NX_BLK_INFO_FLUSH 2u     /* the device has a volatile cache and a flush command */
+#define NX_BLK_INFO_TEST_CACHE 4u /* test layer: emulated volatile cache (M4 crash tests) */
+
+struct nx_blk_info {
+    uint64_t blocks;     /* capacity in NX_BLK_SIZE blocks */
+    uint32_t block_size; /* NX_BLK_SIZE */
+    uint32_t flags;      /* NX_BLK_INFO_* */
+    uint64_t reads, writes, flushes;
+    char serial[24];     /* virtio-blk GET_ID, NUL-terminated */
 };
 
 /* Filled by NX_SYS_IPC_RECV.  sender_task is set by the kernel. */

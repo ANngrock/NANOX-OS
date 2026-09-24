@@ -49,19 +49,21 @@ int eng_begin(struct engine *e, const char *id, const char *op, uint64_t fp,
             return ENG_REPLAY;
         }
     }
-    /* A free record, else the oldest finished one. */
+    /* A free record, else the oldest finished one; records kept in the
+     * store (M4) only when no other finished record is left. */
     struct eng_action *slot = 0;
     for (uint32_t i = 0; i < ENG_SLOTS && !slot; i++)
         if (e->a[i].state == ACT_NONE)
             slot = &e->a[i];
-    if (!slot) {
+    for (int pass = 0; pass < 2 && !slot; pass++)
         for (uint32_t i = 0; i < ENG_SLOTS; i++)
-            if (eng_is_final(e->a[i].state) && (!slot || e->a[i].seq < slot->seq))
+            if (eng_is_final(e->a[i].state) && (pass || !e->a[i].persist) &&
+                (!slot || e->a[i].seq < slot->seq))
                 slot = &e->a[i];
-        if (!slot)
-            return ENG_FULL;
+    if (!slot)
+        return ENG_FULL;
+    if (slot->state != ACT_NONE)
         e->evicted++;
-    }
     copy_str(slot->id, id, sizeof(slot->id));
     copy_str(slot->op, op, sizeof(slot->op));
     slot->fp = fp;
@@ -69,9 +71,43 @@ int eng_begin(struct engine *e, const char *id, const char *op, uint64_t fp,
     slot->state = ACT_CREATED;
     slot->result_len = 0;
     slot->result[0] = 0;
+    slot->boot_id = 0;
+    slot->persist = 0;
+    slot->restored = 0;
     e->started++;
     *out = slot;
     return ENG_NEW;
+}
+
+struct eng_action *eng_restore(struct engine *e, const char *id, const char *op, uint64_t fp,
+                               int state, const char *text, uint32_t len, uint64_t boot_id)
+{
+    if (!eng_is_final(state) || eng_find(e, id))
+        return 0;
+    struct eng_action *slot = 0;
+    for (uint32_t i = 0; i < ENG_SLOTS && !slot; i++)
+        if (e->a[i].state == ACT_NONE)
+            slot = &e->a[i];
+    for (int pass = 0; pass < 2 && !slot; pass++)
+        for (uint32_t i = 0; i < ENG_SLOTS; i++)
+            if (eng_is_final(e->a[i].state) && (pass || !e->a[i].persist) &&
+                (!slot || e->a[i].seq < slot->seq))
+                slot = &e->a[i];
+    if (!slot)
+        return 0;
+    if (slot->state != ACT_NONE)
+        e->evicted++;
+    copy_str(slot->id, id, sizeof(slot->id));
+    copy_str(slot->op, op, sizeof(slot->op));
+    slot->fp = fp;
+    slot->seq = e->next_seq++;
+    slot->state = state;
+    slot->boot_id = boot_id;
+    slot->persist = 1;
+    slot->restored = 1;
+    if (eng_store(slot, text, len) != 0)
+        eng_store(slot, "", 0);
+    return slot;
 }
 
 int eng_advance(struct eng_action *a, int to)

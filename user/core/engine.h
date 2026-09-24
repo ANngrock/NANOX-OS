@@ -42,6 +42,10 @@ struct eng_action {
     int state;
     uint32_t result_len; /* stored response (complete lines), valid when final */
     char result[ENG_RESULT_MAX];
+    /* M4 (user/core/persist.c): the record is kept in the store. */
+    uint64_t boot_id; /* boot in which the request was executed */
+    int persist;      /* included in the persisted task table */
+    int restored;     /* loaded from the store at start */
 };
 
 struct engine {
@@ -70,5 +74,10 @@ int eng_is_final(int state);
 /* Stores the response text; 0 ok, -1 too long (nothing stored). */
 int eng_store(struct eng_action *a, const char *text, uint32_t len);
 const char *eng_state_name(int state);
+/* M4: re-creates a finished record read from the store (state must be
+ * final).  Takes a free slot, else evicts the oldest finished record.
+ * NULL: the id is already known or every record is in progress. */
+struct eng_action *eng_restore(struct engine *e, const char *id, const char *op, uint64_t fp,
+                               int state, const char *text, uint32_t len, uint64_t boot_id);
 
 #endif
