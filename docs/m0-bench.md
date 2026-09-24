@@ -8,7 +8,9 @@ QEMU/UEFI, версии toolchain, сборку образа, headless harness, 
 
 Конвенции ниже (маркеры, коды выхода, формат записи, побайтовая
 воспроизводимость) в ARCHITECTURE.md не заданы буквально; это решения M0,
-принятые для выполнения его критериев.
+принятые для выполнения его критериев. Стенд расширен на этапе M1 (код
+выхода 41, класс `exception`, символизация отчётов, проверка повторяемости);
+решения M1 — в [m1-kernel.md](m1-kernel.md).
 
 ## 1. Одна последовательность от чистого checkout
 
@@ -20,7 +22,7 @@ make doctor && make && make test
 | --- | --- | --- |
 | `make doctor` | сверяет инструменты с `toolchain.lock`, пишет `out/doctor.json` | да (проверяются версии и хеши) |
 | `make` | собирает `out/BOOTX64.EFI`, `out/kernel.elf`, `out/initrd.img` (с M1), `out/nanox.img`, `out/SHA256SUMS` | нет |
-| `make test` | `host-test` + `py-test` + `qemu-test` (все сценарии) | да |
+| `make test` | `host-test` + `py-test` + `qemu-test` (все сценарии, затем повторяемость `normal` и `pagefault`) | да |
 | `make run` | сценарий `normal` с выводом serial в терминал и записью запуска | да |
 | `make debug` | QEMU с `-s -S`, serial в терминал; см. раздел 8 | да |
 | `make debug-check` | автоматическая проверка GDB-процедуры | да, плюс gdb |
@@ -181,9 +183,10 @@ M0: сборка с пустым `REPRO_FLAGS` в двух путях дала �
 - **PASS**: статус 33, ровно одна строка `NANOX: TEST PASS`, ей предшествуют
   по порядку `NANOX: loader start`, `NANOX: loader exit_boot_services ok`,
   `NANOX: kernel_main`, `NANOX: bootinfo ok`, и нет строк `TEST FAIL`,
-  `PANIC`, `LOADER ERROR`.
+  `PANIC`, `LOADER ERROR`, `EXCEPTION`.
 - Иначе **FAIL** с классом: `test_fail` (35 + `TEST FAIL`), `panic`
-  (37 + `PANIC`), `loader_error` (39 + `LOADER ERROR`), `timeout` (процесс
+  (37 + `PANIC`), `loader_error` (39 + `LOADER ERROR`), `exception`
+  (41 + `EXCEPTION`, с M1), `timeout` (процесс
   завершён harness; маркер PASS в логе не спасает), `inconsistent` (статус и
   маркеры не согласованы, например 33 без `TEST PASS`), `unexpected_exit`
   (любой другой статус, например 0 после тройной ошибки).
@@ -207,6 +210,8 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `NANOX: kernel sha256 <hex>` | ядро, хеш из boot info |
 | `NANOX: TEST PASS` / `NANOX: TEST FAIL <причина>` | ядро, вердикт |
 | `NANOX: PANIC <сообщение>` | ядро, panic |
+| `NANOX: EXCEPTION ...`, `NANOX: REGS ...`, `NANOX: BACKTRACE <n> <адрес>` | ядро, отчёт об исключении и backtrace (с M1, [m1-kernel.md §4](m1-kernel.md#4-отчёт-о-panic-и-исключениях)) |
+| `NANOX: cpu ...`, `NANOX: pmm ...`, `NANOX: vmm ...`, `NANOX: initramfs ...`, `NANOX: selftest ...`, `NANOX: timer ...` | ядро, шаги загрузки M1 ([m1-kernel.md §2](m1-kernel.md#2-последовательность-загрузки-ядра)) |
 
 ### Коды выхода
 
@@ -216,6 +221,7 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `0x11` | 35 | TEST FAIL |
 | `0x12` | 37 | PANIC |
 | `0x13` | 39 | LOADER ERROR |
+| `0x14` | 41 | необработанное исключение CPU (с M1) |
 | — | 0 | сброс/выключение без isa-debug-exit |
 | — | нет | таймаут, процесс остановлен harness |
 
@@ -238,23 +244,26 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `source.git_rev`, `source.git_dirty`, `source.git_dirty_paths` | исходная ревизия и незакоммиченные изменения |
 | `qemu.argv`, `qemu.command_line`, `qemu.timeout_s` | полная командная строка |
 | `image_spec` | параметры сценарного образа (cmdline, fault injection) |
-| `artifacts.{image,loader_efi,kernel_elf,ovmf_code,ovmf_vars_template}` | путь, SHA-256, размер |
+| `artifacts.{image,loader_efi,kernel_elf,initrd,ovmf_code,ovmf_vars_template}` | путь, SHA-256, размер |
 | `toolchain.profile`, `toolchain.lock_ok`, `toolchain.versions` | фактические версии инструментов и результат сверки с lock |
 | `host` | ОС и версия Python хоста |
 | `result.exit_status`, `result.timed_out`, `result.killed_returncode` | статус выхода (`null` при таймауте) |
 | `serial.sha256`, `serial.markers`, `serial.raw` | хеш, маркеры и полный текст serial-лога |
 | `verdict`, `failure_class`, `loader_error`, `reason` | вердикт harness |
+| `exception`, `backtrace` | разобранный отчёт об исключении и backtrace с символами из `kernel.elf` (с M1) |
 | `expected`, `expectation_met`, `expectation_problems` | ожидание сценария и расхождения |
 
 `make test` дополнительно пишет `out/runs/<время>-suite/summary.json` со
-списком запусков. Копия `OVMF_VARS.fd` удаляется после запуска; в записи
+списком запусков и `out/runs/<время>-repeat-<сценарий>/repeat.json` для
+проверки повторяемости (`harness.py repeat`). Копия `OVMF_VARS.fd` удаляется после запуска; в записи
 остаётся хеш шаблона.
 
 ## 8. Отладка через GDB
 
-Ядро собрано с `-g`, слинковано и загружено по адресу `0x200000`, виртуальный
-адрес равен физическому (identity mapping UEFI), поэтому символы ELF годятся
-без смещения.
+Ядро собрано с `-g`, слинковано и загружено по адресу `0x200000`; и на
+таблицах страниц UEFI, и на собственных таблицах ядра (M1) образ ядра
+отображён по тому же виртуальному адресу, поэтому символы ELF годятся без
+смещения.
 
 ```sh
 make debug                      # терминал 1: QEMU остановлен до прошивки, GDB stub на :1234

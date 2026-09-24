@@ -148,7 +148,7 @@ static void report(const struct nx_bi_result *r)
     nx_printf("NANOX: bootinfo ok version=%u.%u size=%u regions=%u usable_bytes=%" NX_PRIu64 "\n",
               bi->version_major, bi->version_minor, bi->size, bi->mmap_count, r->usable_bytes);
     nx_printf("NANOX: kernel image=0x%" NX_PRIx64 "-0x%" NX_PRIx64 " entry=0x%" NX_PRIx64
-              " stack=0x%" NX_PRIx64 "-0x%" NX_PRIx64 "\n",
+              " loader_stack=0x%" NX_PRIx64 "-0x%" NX_PRIx64 "\n",
               bi->kernel_phys_base, bi->kernel_phys_base + bi->kernel_phys_size, bi->kernel_entry,
               bi->stack_phys_base, bi->stack_phys_base + bi->stack_size);
     nx_printf("NANOX: kernel sha256 ");
