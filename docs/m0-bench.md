@@ -10,7 +10,10 @@ QEMU/UEFI, версии toolchain, сборку образа, headless harness, 
 воспроизводимость) в ARCHITECTURE.md не заданы буквально; это решения M0,
 принятые для выполнения его критериев. Стенд расширен на этапе M1 (код
 выхода 41, класс `exception`, символизация отчётов, проверка повторяемости);
-решения M1 — в [m1-kernel.md](m1-kernel.md).
+решения M1 — в [m1-kernel.md](m1-kernel.md). На этапе M2 добавлены
+пользовательские программы в initramfs, проверка чередования вывода задач
+(`interleave`) и неупорядоченное сравнение строк при проверке повторяемости;
+решения M2 — в [m2-kernel.md](m2-kernel.md).
 
 ## 1. Одна последовательность от чистого checkout
 
@@ -21,8 +24,8 @@ make doctor && make && make test
 | Цель | Что делает | Нужны QEMU/OVMF |
 | --- | --- | --- |
 | `make doctor` | сверяет инструменты с `toolchain.lock`, пишет `out/doctor.json` | да (проверяются версии и хеши) |
-| `make` | собирает `out/BOOTX64.EFI`, `out/kernel.elf`, `out/initrd.img` (с M1), `out/nanox.img`, `out/SHA256SUMS` | нет |
-| `make test` | `host-test` + `py-test` + `qemu-test` (все сценарии, затем повторяемость `normal` и `pagefault`) | да |
+| `make` | собирает `out/BOOTX64.EFI`, `out/kernel.elf`, программы `user/` (с M2, в `out/build/user/bin/`), `out/initrd.img` (с M1), `out/nanox.img`, `out/SHA256SUMS` | нет |
+| `make test` | `host-test` + `py-test` + `qemu-test` (все сценарии, затем повторяемость `normal`, `pagefault` и `m2-sched`) | да |
 | `make run` | сценарий `normal` с выводом serial в терминал и записью запуска | да |
 | `make debug` | QEMU с `-s -S`, serial в терминал; см. раздел 8 | да |
 | `make debug-check` | автоматическая проверка GDB-процедуры | да, плюс gdb |
@@ -132,7 +135,7 @@ LBA 2048, FAT32 с кластерами 512 байт, только имена 8.
 ```text
 \EFI\BOOT\BOOTX64.EFI     загрузчик (путь съёмного носителя по умолчанию)
 \NANOX\KERNEL.ELF         ядро
-\NANOX\INITRD.IMG         initramfs, cpio newc (с M1, см. m1-kernel.md)
+\NANOX\INITRD.IMG         initramfs, cpio newc (с M1, см. m1-kernel.md; с M2 — и программы bin/*)
 \NANOX\MANIFEST.BIN       размеры и SHA-256 ядра и initramfs (boot-info.md §7)
 \NANOX\CMDLINE.TXT        командная строка ядра (в образе make — пустая)
 ```
@@ -160,7 +163,8 @@ M0: сборка с пустым `REPRO_FLAGS` в двух путях дала �
 
 `tools/bench/harness.py` (только стандартная библиотека Python). Сценарии —
 `tests/qemu/scenarios.json`. Ниже — сценарии M0; сценарии M1 перечислены в
-[m1-kernel.md](m1-kernel.md#сценарии-стенда).
+[m1-kernel.md](m1-kernel.md#сценарии-стенда), сценарии M2 — в
+[m2-kernel.md §10](m2-kernel.md#10-сценарии-стенда).
 
 | Сценарий | Образ | Ожидание |
 | --- | --- | --- |
@@ -175,6 +179,22 @@ M0: сборка с пустым `REPRO_FLAGS` в двух путях дала �
 
 Таймаут по умолчанию 60 с. `make test` успешен, только если каждый сценарий дал
 ожидаемый вердикт, класс отказа, код ошибки загрузчика и строки лога.
+
+Ожидания сценария (`expect`): `verdict`, `failure_class`, `loader_error`,
+`patterns` (регулярные выражения по serial-логу; `{kernel_sha256}` и
+`{initrd_sha256}` подставляются, поэтому литеральные фигурные скобки
+удваиваются), `exception` и `backtrace_functions` (M1), `interleave` (M2):
+`{"pattern": ..., "groups": N}` — строки, совпавшие с выражением, должны
+прийти ровно от N источников (группа 1 выражения), и первая строка каждого
+источника должна стоять раньше последней строки любого источника.
+
+`harness.py repeat` сравнивает маркеры запусков по порядку, маскируя
+значения, которые законно меняются: измерения времени (`ticks=`,
+`tsc_delta=`, `lapic_per_10ms=`) и статистики планирования (`preempted=`,
+`preemptions=`, `switches=`, `latest_first=`, `earliest_last=`). Сценарий
+может объявить строки с непостоянным порядком (`"repeat": {"unordered":
+<выражение>}`, так делает `m2-sched` для вывода задач): они сравниваются как
+мультимножество.
 
 ### Правила вердикта
 
@@ -212,6 +232,8 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `NANOX: PANIC <сообщение>` | ядро, panic |
 | `NANOX: EXCEPTION ...`, `NANOX: REGS ...`, `NANOX: BACKTRACE <n> <адрес>` | ядро, отчёт об исключении и backtrace (с M1, [m1-kernel.md §4](m1-kernel.md#4-отчёт-о-panic-и-исключениях)) |
 | `NANOX: cpu ...`, `NANOX: pmm ...`, `NANOX: vmm ...`, `NANOX: initramfs ...`, `NANOX: selftest ...`, `NANOX: timer ...` | ядро, шаги загрузки M1 ([m1-kernel.md §2](m1-kernel.md#2-последовательность-загрузки-ядра)) |
+| `NANOX: sched ...`, `NANOX: task ...`, `NANOX: ipc ...`, `NANOX: m2-<режим> ...` | ядро, режимы M2 ([m2-kernel.md §2](m2-kernel.md#2-где-начинается-m2-в-загрузке)) |
+| `NANOX: USER <имя>#<id>: <текст>` | ядро от имени пользовательской задачи (`NX_SYS_DEBUG_WRITE`, M2); задача не может напечатать строку, начинающуюся с другого маркера |
 
 ### Коды выхода
 
@@ -255,7 +277,8 @@ ANSI-последовательности вывода OVMF). Эти прави�
 
 `make test` дополнительно пишет `out/runs/<время>-suite/summary.json` со
 списком запусков и `out/runs/<время>-repeat-<сценарий>/repeat.json` для
-проверки повторяемости (`harness.py repeat`). Копия `OVMF_VARS.fd` удаляется после запуска; в записи
+проверки повторяемости (`harness.py repeat`; поле `unordered` — выражение
+для строк, сравниваемых как мультимножество, если сценарий его задал). Копия `OVMF_VARS.fd` удаляется после запуска; в записи
 остаётся хеш шаблона.
 
 ## 8. Отладка через GDB
