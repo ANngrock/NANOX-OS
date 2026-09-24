@@ -13,7 +13,9 @@ QEMU/UEFI, версии toolchain, сборку образа, headless harness, 
 решения M1 — в [m1-kernel.md](m1-kernel.md). На этапе M2 добавлены
 пользовательские программы в initramfs, проверка чередования вывода задач
 (`interleave`) и неупорядоченное сравнение строк при проверке повторяемости;
-решения M2 — в [m2-kernel.md](m2-kernel.md).
+решения M2 — в [m2-kernel.md](m2-kernel.md). На этапе M3 добавлены второй
+последовательный порт как канал host bridge, сеанс bridge внутри запуска
+сценария и ожидание `bridge`; решения M3 — в [m3-core.md](m3-core.md).
 
 ## 1. Одна последовательность от чистого checkout
 
@@ -77,9 +79,13 @@ qemu-system-x86_64 -no-user-config -nodefaults -machine pc-q35-8.2 -accel tcg
 Пути переопределяются переменными `NANOX_OVMF_CODE` / `NANOX_OVMF_VARS`,
 бинарник QEMU — `NANOX_QEMU`; `make doctor` проверит хеши выбранных файлов.
 
-Единственное отклонение от канонической конфигурации — сценарий
-`framebuffer`, который добавляет ровно одно устройство `-device VGA`, чтобы
-проверить необязательные поля framebuffer в boot info.
+Отклонения от канонической конфигурации: сценарий `framebuffer` добавляет
+ровно одно устройство `-device VGA`, чтобы проверить необязательные поля
+framebuffer в boot info; сценарии M3 (`m3-*`) добавляют второй
+последовательный порт — канал host bridge:
+`-chardev socket,id=nxbridge,path=<сокет>,server=off -serial chardev:nxbridge`
+(COM2, I/O `0x2F8`; unix-сокет слушает harness во временном каталоге,
+[m3-core.md §2](m3-core.md#2-граница-guesthost)).
 
 ## 3. Toolchain
 
@@ -164,7 +170,8 @@ M0: сборка с пустым `REPRO_FLAGS` в двух путях дала �
 `tools/bench/harness.py` (только стандартная библиотека Python). Сценарии —
 `tests/qemu/scenarios.json`. Ниже — сценарии M0; сценарии M1 перечислены в
 [m1-kernel.md](m1-kernel.md#сценарии-стенда), сценарии M2 — в
-[m2-kernel.md §10](m2-kernel.md#10-сценарии-стенда).
+[m2-kernel.md §10](m2-kernel.md#10-сценарии-стенда), сценарии M3 — в
+[m3-core.md §8](m3-core.md#8-сценарии-стенда).
 
 | Сценарий | Образ | Ожидание |
 | --- | --- | --- |
@@ -187,6 +194,13 @@ M0: сборка с пустым `REPRO_FLAGS` в двух путях дала �
 `{"pattern": ..., "groups": N}` — строки, совпавшие с выражением, должны
 прийти ровно от N источников (группа 1 выражения), и первая строка каждого
 источника должна стоять раньше последней строки любого источника.
+`bridge` (M3): `{"ok": true|false, "problems": [выражение, ...]}` —
+результат host-проверок сеанса bridge и выражения, каждому из которых должна
+соответствовать одна из найденных host-проблем (для отрицательных
+контролей). Сценарий с полем `"bridge": {"script": ..., "adapter": ...}`
+запускается вместе с сеансом host bridge: harness слушает unix-сокет, QEMU
+подключает к нему COM2, отдельный поток ведёт сеанс
+(`tools/bridge/session.py`).
 
 `harness.py repeat` сравнивает маркеры запусков по порядку, маскируя
 значения, которые законно меняются: измерения времени (`ticks=`,
@@ -234,6 +248,7 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `NANOX: cpu ...`, `NANOX: pmm ...`, `NANOX: vmm ...`, `NANOX: initramfs ...`, `NANOX: selftest ...`, `NANOX: timer ...` | ядро, шаги загрузки M1 ([m1-kernel.md §2](m1-kernel.md#2-последовательность-загрузки-ядра)) |
 | `NANOX: sched ...`, `NANOX: task ...`, `NANOX: ipc ...`, `NANOX: m2-<режим> ...` | ядро, режимы M2 ([m2-kernel.md §2](m2-kernel.md#2-где-начинается-m2-в-загрузке)) |
 | `NANOX: USER <имя>#<id>: <текст>` | ядро от имени пользовательской задачи (`NX_SYS_DEBUG_WRITE`, M2); задача не может напечатать строку, начинающуюся с другого маркера |
+| `NANOX: m3 ...`, `NANOX: m3-<режим> ...`, `NANOX: USER core#4: act ...` | контроллер режимов M3 и трасса исполнителя ([m3-core.md §9](m3-core.md#9-serial-маркеры-m3)) |
 
 ### Коды выхода
 
@@ -257,6 +272,7 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `record.json` | запись `nanox.run-record.v1` |
 | `serial.log` | сырой вывод COM1 |
 | `qemu-output.log` | stdout/stderr QEMU |
+| `bridge-trace.jsonl`, `bridge-wire.log` | только сценарии M3: трасса host bridge и все строки канала ([m3-core.md §7](m3-core.md#7-host-bridge)) |
 
 Поля `record.json`:
 
@@ -273,6 +289,7 @@ ANSI-последовательности вывода OVMF). Эти прави�
 | `serial.sha256`, `serial.markers`, `serial.raw` | хеш, маркеры и полный текст serial-лога |
 | `verdict`, `failure_class`, `loader_error`, `reason` | вердикт harness |
 | `exception`, `backtrace` | разобранный отчёт об исключении и backtrace с символами из `kernel.elf` (с M1) |
+| `bridge` | сеанс host bridge (M3): `ok`, `problems`, `hello`, `close`, итог задачи агента, число действий, путь к трассе |
 | `expected`, `expectation_met`, `expectation_problems` | ожидание сценария и расхождения |
 
 `make test` дополнительно пишет `out/runs/<время>-suite/summary.json` со

@@ -180,7 +180,10 @@ ring 3 завершает задачу (запись `killed: user fault ...`), 
 | 10 | `IPC_RECV` | `(ep, buf, cap, info*)` → длина; блокирует, пока очередь пуста | да, с блокировкой |
 | 11 | `SOV_TASK_OPEN` | `(h Sovereign, id)` → handle задачи | нет (критерий 6) |
 | 12 | `TASK_READ` | `(h задачи, va, buf, len)` → `len` | нет (критерий 6) |
-| 13 | `TASK_KILL` | `(h задачи)` → 0 | нет (критерий 6) |
+| 13 | `TASK_KILL` | `(h задачи)` → 0 | в M3: `bin/core` завершает нагрузку через handle от `SOV_TASK_SPAWN` ([m3-core.md](m3-core.md)) |
+
+Вызовы 14–21 и ошибка `ENOENT` (12) добавлены в M3 —
+[m3-core.md §6](m3-core.md#6-ядро-вызовы-1421-события-reaper).
 
 Ошибки: `ENOSYS` (1) неизвестный номер, `EINVAL` (2) размер/флаги,
 `EFAULT` (3) буфер не отображён или недоступен, `EBADHANDLE` (4) handle не
@@ -324,8 +327,11 @@ QEMU 8.2.2, TCG, без KVM). Выполнено в рабочем дереве 
   память, нет; путь «исключение в ring 3 → задача завершена»
   (`nx_user_trap`) не выполнялся.
 - Критерий 6 (Sovereign). В коде: объект `nx_sovereign()` и вызовы
-  `SOV_TASK_OPEN`, `TASK_READ`, `TASK_KILL`. Ни один режим не выдаёт задаче
-  handle Sovereign; вызовы не выполнялись ни разу.
+  `SOV_TASK_OPEN`, `TASK_READ`, `TASK_KILL`. В M2 ни один режим не выдаёт
+  задаче handle Sovereign. С M3 handle Sovereign получает `bin/core`, и
+  сценарии M3 выполняют `TASK_KILL` над запущенной им нагрузкой
+  ([m3-core.md](m3-core.md)); `SOV_TASK_OPEN` и `TASK_READ` по-прежнему не
+  выполнялись, и критерий 6 как проверка M2 не оформлен.
 
 Прочее:
 
