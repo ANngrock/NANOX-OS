@@ -7,7 +7,9 @@
   harness.py repeat NAME... [--count N]
                                 run each scenario N times (default 3) and require the
                                 expected verdict every time and identical serial
-                                markers (after masking timing values)
+                                markers (after masking timing values); a scenario may
+                                name marker lines whose order legitimately varies
+                                (repeat.unordered): those are compared as a multiset
   harness.py list               list scenarios
 
 Every run writes out/runs/<UTC time>-<scenario>/ with record.json (schema
@@ -187,7 +189,37 @@ def check_expectation(outcome, expect, serial_text, substitutions, report=None):
         pattern = pattern.format(**substitutions)
         if not re.search(pattern, text, re.MULTILINE):
             problems.append("serial pattern not found: %s" % pattern)
+    if "interleave" in expect:
+        problems += check_interleave(serial_text, expect["interleave"])
     return problems
+
+
+def check_interleave(serial_text, spec):
+    """Checks that several producers made progress interleaved (M2 scheduler).
+
+    spec = {"pattern": regex with one group naming the producer, "groups": N}.
+    The marker lines matching the pattern must come from exactly N producers,
+    and every producer's first line must precede every producer's last line
+    (no producer finished before all others had started reporting)."""
+    rx = re.compile(spec["pattern"])
+    first, last = {}, {}
+    markers = [l for l in serial_lines(serial_text) if l.startswith("NANOX: ")]
+    for i, line in enumerate(markers):
+        m = rx.match(line)
+        if m:
+            first.setdefault(m.group(1), i)
+            last[m.group(1)] = i
+    if len(first) != spec["groups"]:
+        return ["interleave: expected %d producers matching %s, found %d (%s)" % (
+            spec["groups"], spec["pattern"], len(first), sorted(first))]
+    latest_first = max(first.values())
+    earliest_last = min(last.values())
+    if latest_first >= earliest_last:
+        who_first = [k for k, v in first.items() if v == latest_first][0]
+        who_last = [k for k, v in last.items() if v == earliest_last][0]
+        return ["interleave: %s reported its last line (marker %d) before %s reported its "
+                "first (marker %d)" % (who_last, earliest_last, who_first, latest_first)]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +429,7 @@ def cmd_test(args):
                      "exit_status": status, "timed_out": record["result"]["timed_out"],
                      "duration_s": record["duration_s"],
                      "record": str(run_dir / "record.json")})
-        print("%-4s %-15s verdict=%-4s class=%-12s exit=%-4s %6.1fs  %s" % (
+        print("%-4s %-18s verdict=%-4s class=%-12s exit=%-4s %6.1fs  %s" % (
             "ok" if ok else "FAIL", sc["name"], record["verdict"],
             record["failure_class"] or "-", "T/O" if status is None else status,
             record["duration_s"], display_path(run_dir)))
@@ -427,12 +459,28 @@ def cmd_run(args):
     return 0 if record["verdict"] == "PASS" else 1
 
 
-# Serial values that legitimately differ between runs (timing measurements).
-VOLATILE_RE = re.compile(r"\b(tsc_delta|ticks|lapic_per_10ms)=[0-9]+")
+# Serial values that legitimately differ between runs: timing measurements
+# (M1) and scheduling statistics (M2: where the timer happened to preempt).
+VOLATILE_RE = re.compile(r"\b(tsc_delta|ticks|lapic_per_10ms|preempted|preemptions|switches|"
+                         r"latest_first|earliest_last)=[0-9]+(,[0-9]+)*")
 
 
 def normalized_markers(markers):
     return [VOLATILE_RE.sub(lambda m: m.group(1) + "=*", l) for l in markers]
+
+
+def repeat_view(markers, unordered=None):
+    """Normalised markers split for comparison between runs.
+
+    Returns (ordered, unordered): lines matching the `unordered` regex (whose
+    relative order may vary, e.g. output of preempted tasks) are taken out of
+    the sequence and returned sorted, i.e. compared as a multiset; all other
+    lines keep their order."""
+    lines = normalized_markers(markers)
+    if not unordered:
+        return lines, []
+    rx = re.compile(unordered)
+    return ([l for l in lines if not rx.search(l)], sorted(l for l in lines if rx.search(l)))
 
 
 def cmd_repeat(args):
@@ -445,33 +493,44 @@ def cmd_repeat(args):
     toolchain = toolchain_snapshot()
     all_ok = True
     for name in args.names:
+        unordered = scenarios[name].get("repeat", {}).get("unordered")
         runs, reference, problems = [], None, []
         for i in range(args.count):
             record, run_dir = run_scenario(scenarios[name], args.runs_dir, toolchain)
-            markers = normalized_markers(record["serial"]["markers"])
+            ordered, unordered_lines = repeat_view(record["serial"]["markers"], unordered)
             runs.append({"record": str(run_dir / "record.json"),
                          "expectation_met": record["expectation_met"],
                          "markers_sha256": hashlib.sha256(
-                             "\n".join(markers).encode()).hexdigest()})
+                             "\n".join(ordered + ["--"] + unordered_lines).encode()).hexdigest(),
+                         "unordered_lines": len(unordered_lines)})
             if not record["expectation_met"]:
                 problems.append("run %d: %s" % (i + 1, "; ".join(record["expectation_problems"])))
             if reference is None:
-                reference = markers
-            elif markers != reference:
-                diff = [(a, b) for a, b in zip(reference, markers) if a != b][:3]
+                reference = (ordered, unordered_lines)
+                continue
+            if ordered != reference[0]:
+                diff = [(a, b) for a, b in zip(reference[0], ordered) if a != b][:3]
                 problems.append("run %d: markers differ from run 1 (%d vs %d lines), first: %s"
-                                % (i + 1, len(reference), len(markers), diff))
+                                % (i + 1, len(reference[0]), len(ordered), diff))
+            if unordered_lines != reference[1]:
+                gone = sorted(set(reference[1]) - set(unordered_lines))[:3]
+                new = sorted(set(unordered_lines) - set(reference[1]))[:3]
+                problems.append("run %d: unordered lines differ from run 1 as a multiset "
+                                "(%d vs %d lines), only in run 1: %s, only here: %s"
+                                % (i + 1, len(reference[1]), len(unordered_lines), gone, new))
         ok = not problems
         all_ok &= ok
+        identical = len({r["markers_sha256"] for r in runs}) == 1
         out_dir = new_run_dir(args.runs_dir, "repeat-" + name)
         (out_dir / "repeat.json").write_text(json.dumps({
             "schema": "nanox.repeat.v1", "scenario": name, "count": args.count,
-            "volatile_fields": VOLATILE_RE.pattern, "source": git_source(), "runs": runs,
-            "identical_markers": len({r["markers_sha256"] for r in runs}) == 1,
+            "volatile_fields": VOLATILE_RE.pattern, "unordered": unordered,
+            "source": git_source(), "runs": runs, "identical_markers": identical,
             "problems": problems, "ok": ok}, indent=2) + "\n")
-        print("%-4s repeat %-13s %d runs, %d marker lines each, identical=%s  %s" % (
-            "ok" if ok else "FAIL", name, args.count, len(reference or []),
-            len({r["markers_sha256"] for r in runs}) == 1, display_path(out_dir)))
+        print("%-4s repeat %-18s %d runs, %d marker lines each%s, identical=%s  %s" % (
+            "ok" if ok else "FAIL", name, args.count, len(reference[0]) if reference else 0,
+            " + %d unordered" % len(reference[1]) if reference and unordered else "",
+            identical, display_path(out_dir)))
         for p in problems:
             print("       " + p)
     return 0 if all_ok else 1
@@ -479,7 +538,7 @@ def cmd_repeat(args):
 
 def cmd_list(args):
     for sc in load_scenarios():
-        print("%-15s %s" % (sc["name"], sc.get("description", "")))
+        print("%-18s %s" % (sc["name"], sc.get("description", "")))
     return 0
 
 

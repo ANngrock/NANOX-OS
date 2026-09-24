@@ -152,6 +152,72 @@ class RepeatTest(unittest.TestCase):
                             harness.normalized_markers(["NANOX: rip=0x2"]))
 
 
+class M2RepeatTest(unittest.TestCase):
+    def test_scheduling_statistics_are_masked(self):
+        a = ["NANOX: task spin-a#3 exited code=0 ticks=57 preempted=28 syscalls=6",
+             "NANOX: m2-sched progress order latest_first=3 earliest_last=11 preempted=28,27,27",
+             "NANOX: m2-sched ok tasks=3 switches=86 preemptions=82"]
+        b = ["NANOX: task spin-a#3 exited code=0 ticks=55 preempted=26 syscalls=6",
+             "NANOX: m2-sched progress order latest_first=2 earliest_last=12 preempted=1,2,30",
+             "NANOX: m2-sched ok tasks=3 switches=90 preemptions=80"]
+        self.assertEqual(harness.normalized_markers(a), harness.normalized_markers(b))
+        c = [a[0].replace("syscalls=6", "syscalls=7")] + a[1:]
+        self.assertNotEqual(harness.normalized_markers(a), harness.normalized_markers(c))
+
+    def test_unordered_lines_compared_as_multiset(self):
+        run1 = ["NANOX: sched ok", "NANOX: USER a#3: progress 1/2", "NANOX: USER b#4: progress 1/2",
+                "NANOX: USER a#3: done", "NANOX: USER b#4: done", "NANOX: TEST PASS"]
+        run2 = ["NANOX: sched ok", "NANOX: USER b#4: progress 1/2", "NANOX: USER a#3: progress 1/2",
+                "NANOX: USER b#4: done", "NANOX: USER a#3: done", "NANOX: TEST PASS"]
+        self.assertNotEqual(harness.repeat_view(run1), harness.repeat_view(run2))
+        v1 = harness.repeat_view(run1, "^NANOX: USER ")
+        self.assertEqual(v1, harness.repeat_view(run2, "^NANOX: USER "))
+        self.assertEqual(v1[0], ["NANOX: sched ok", "NANOX: TEST PASS"])
+        self.assertEqual(len(v1[1]), 4)
+        # A missing, extra or changed line is still a difference.
+        self.assertNotEqual(v1, harness.repeat_view(run2[:-2] + run2[-1:], "^NANOX: USER "))
+        self.assertNotEqual(v1, harness.repeat_view(run2 + ["NANOX: USER a#3: done"],
+                                                    "^NANOX: USER "))
+        changed = [l.replace("b#4: done", "b#4: FAILED") for l in run2]
+        self.assertNotEqual(v1, harness.repeat_view(changed, "^NANOX: USER "))
+        # Ordered lines keep their order.
+        swapped = [run1[-1]] + run1[1:-1] + [run1[0]]
+        self.assertNotEqual(v1, harness.repeat_view(swapped, "^NANOX: USER "))
+
+
+class InterleaveTest(unittest.TestCase):
+    SPEC = {"pattern": "^NANOX: USER (t[0-9]): progress", "groups": 2}
+
+    def serial(self, order):
+        return BOOT + "".join("NANOX: USER %s: progress\n" % t for t in order)
+
+    def test_interleaved(self):
+        self.assertEqual(harness.check_interleave(self.serial(["t1", "t2", "t1", "t2"]),
+                                                  self.SPEC), [])
+        self.assertEqual(harness.check_interleave(self.serial(["t1", "t2", "t2", "t1"]),
+                                                  self.SPEC), [])
+
+    def test_sequential_is_rejected(self):
+        problems = harness.check_interleave(self.serial(["t1", "t1", "t2", "t2"]), self.SPEC)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("t1 reported its last line", problems[0])
+        # One line each is not interleaving either.
+        self.assertEqual(len(harness.check_interleave(self.serial(["t1", "t2"]), self.SPEC)), 1)
+
+    def test_producer_count(self):
+        self.assertEqual(len(harness.check_interleave(self.serial(["t1", "t1"]), self.SPEC)), 1)
+        three = self.serial(["t1", "t2", "t3", "t1", "t2", "t3"])
+        self.assertEqual(len(harness.check_interleave(three, self.SPEC)), 1)
+        self.assertEqual(harness.check_interleave(three, dict(self.SPEC, groups=3)), [])
+
+    def test_expectation_hook(self):
+        outcome = {"verdict": "PASS"}
+        exp = {"verdict": "PASS", "interleave": self.SPEC}
+        good, bad = self.serial(["t1", "t2", "t1", "t2"]), self.serial(["t1", "t1", "t2", "t2"])
+        self.assertEqual(harness.check_expectation(outcome, exp, good, {}), [])
+        self.assertEqual(len(harness.check_expectation(outcome, exp, bad, {})), 1)
+
+
 class ExpectationTest(unittest.TestCase):
     def test_expectation_mismatch_reported(self):
         outcome = harness.classify(BOOT + "NANOX: TEST PASS\n", 33, False)
@@ -177,6 +243,18 @@ class ScenarioFileTest(unittest.TestCase):
                          "nullderef", "wprotect", "nxexec", "stackoverflow", "ud", "gp",
                          "divzero", "doublefree", "timer-masked"):
             self.assertIn(required, names)
+
+    def test_scenario_patterns_are_valid(self):
+        """Every pattern survives str.format substitution and compiles."""
+        import re
+        subs = {"kernel_sha256": "0" * 64, "initrd_sha256": "0" * 64}
+        for sc in harness.load_scenarios():
+            for pattern in sc["expect"].get("patterns", []):
+                re.compile(pattern.format(**subs))
+            if "interleave" in sc["expect"]:
+                self.assertEqual(re.compile(sc["expect"]["interleave"]["pattern"]).groups, 1)
+            if "repeat" in sc:
+                re.compile(sc["repeat"]["unordered"])
 
 
 if __name__ == "__main__":
