@@ -1,4 +1,5 @@
-# NANOX-OS build, M0 bench.  One documented sequence from a fresh checkout:
+# NANOX-OS build (M0 bench, M1/M2 kernel).  One documented sequence from a
+# fresh checkout:
 #
 #     make doctor && make && make test
 #
@@ -48,11 +49,26 @@ KERNEL_CSRCS := kernel/main.c kernel/panic.c kernel/bootinfo_check.c \
     kernel/initramfs.c kernel/faults.c kernel/arch/x86_64/gdt.c \
     kernel/arch/x86_64/idt.c kernel/arch/x86_64/timer.c kernel/mm/pmm.c kernel/mm/pt.c \
     kernel/mm/vmm.c kernel/mm/uaccess.c kernel/obj/handle.c kernel/obj/ipc.c \
-    kernel/obj/objects.c kernel/task.c kernel/syscall.c \
+    kernel/obj/objects.c kernel/task.c kernel/syscall.c kernel/m2test.c \
     lib/elf_plan.c lib/serial.c lib/printf.c lib/string.c lib/sha256.c
 KERNEL_ASRCS := kernel/arch/x86_64/entry.S kernel/arch/x86_64/isr.S
 KERNEL_OBJS := $(patsubst %.c,$(BUILD)/kernel/%.o,$(KERNEL_CSRCS)) \
     $(patsubst %.S,$(BUILD)/kernel/%.o,$(KERNEL_ASRCS))
+
+# ---- User programs (M2): static ELF64 for ring 3, packed into the initramfs --
+# -fpie gives RIP-relative code and data references, so the programs can be
+# linked at NX_USER_BASE (0x8000000000, abi/nanox/syscall.h), beyond the
+# reach of the 32-bit absolute addresses of -mcmodel=small.  The link is
+# static and not PIE: the result has no dynamic relocations.
+USER_CFLAGS := --target=x86_64-unknown-none-elf $(FREESTANDING_FLAGS) -O2 -fpie \
+    -fno-asynchronous-unwind-tables -fno-unwind-tables -Iuser/rt
+USER_ASFLAGS := --target=x86_64-unknown-none-elf $(REPRO_FLAGS)
+USER_LDFLAGS := -nostdlib -static --build-id=none -z max-page-size=4096 \
+    -z noexecstack -T user/user.ld
+USER_RT_OBJS := $(BUILD)/user/user/rt/start.o $(BUILD)/user/user/rt/rt.o \
+    $(BUILD)/user/lib/string.o
+USER_PROGS := hello spin ipc-send ipc-recv
+USER_ELFS := $(patsubst %,$(BUILD)/user/bin/%,$(USER_PROGS))
 
 LOADER_EFI := $(OUT)/BOOTX64.EFI
 KERNEL_ELF := $(OUT)/kernel.elf
@@ -85,9 +101,23 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/arch/x86_64/kernel.ld
 	@mkdir -p $(@D)
 	$(LD_LLD) $(KERNEL_LDFLAGS) -o $@ $(KERNEL_OBJS)
 
-$(INITRD): $(INITRD_FILES) tools/image/mkinitrd.py
+$(BUILD)/user/%.o: %.c
 	@mkdir -p $(@D)
-	$(PYTHON) tools/image/mkinitrd.py --root initrd --out $@
+	$(CLANG) $(USER_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/%.o: %.S
+	@mkdir -p $(@D)
+	$(CLANG) $(USER_ASFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/bin/%: $(BUILD)/user/user/test/%.o $(USER_RT_OBJS) user/user.ld
+	@mkdir -p $(@D)
+	$(LD_LLD) $(USER_LDFLAGS) -o $@ $(USER_RT_OBJS) $<
+
+# The user programs go to bin/<name> in the initramfs.
+$(INITRD): $(INITRD_FILES) $(USER_ELFS) tools/image/mkinitrd.py
+	@mkdir -p $(@D)
+	$(PYTHON) tools/image/mkinitrd.py --root initrd --out $@ \
+	    $(foreach p,$(USER_PROGS),--file bin/$(p)=$(BUILD)/user/bin/$(p))
 
 $(IMAGE): $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) tools/image/mkimage.py
 	$(PYTHON) tools/image/mkimage.py --loader $(LOADER_EFI) --kernel $(KERNEL_ELF) \
@@ -97,7 +127,8 @@ $(OUT)/SHA256SUMS: $(LOADER_EFI) $(KERNEL_ELF) $(INITRD) $(IMAGE)
 	cd $(OUT) && sha256sum BOOTX64.EFI kernel.elf initrd.img nanox.img > SHA256SUMS
 	@cat $@
 
--include $(LOADER_OBJS:.obj=.d) $(KERNEL_OBJS:.o=.d)
+-include $(LOADER_OBJS:.obj=.d) $(KERNEL_OBJS:.o=.d) $(USER_RT_OBJS:.o=.d) \
+    $(patsubst %,$(BUILD)/user/user/test/%.d,$(USER_PROGS))
 
 # ---- Environment check ------------------------------------------------------
 doctor:
@@ -127,10 +158,12 @@ py-test: all
 	$(PYTHON) -m unittest discover -s tests/host -p 'test_*.py' -v
 
 # All scenarios, then repeatability: the normal boot and the page-fault crash
-# must produce identical serial markers in three runs.
+# must produce identical serial markers in three runs; the preemptive
+# scheduler scenario (M2) likewise, except that the output lines of its tasks
+# are compared as a multiset (their interleaving differs from run to run).
 qemu-test: all
 	$(PYTHON) tools/bench/harness.py test
-	$(PYTHON) tools/bench/harness.py repeat normal pagefault --count 3
+	$(PYTHON) tools/bench/harness.py repeat normal pagefault m2-sched --count 3
 
 test: host-test py-test qemu-test
 

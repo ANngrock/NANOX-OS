@@ -57,6 +57,23 @@ class MkinitrdTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 mkinitrd.collect(d)
 
+    def test_extra_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.make_tree(d)
+            prog = Path(d) / "prog.elf"
+            prog.write_bytes(b"\x7fELF..")
+            items = mkinitrd.add_files(mkinitrd.collect(os.path.join(d, "etc")),
+                                       [("bin/sub/prog", str(prog)), ("bin/other", str(prog))])
+            entries, _ = parse_newc(mkinitrd.build_cpio(items))
+            self.assertEqual([(n, m) for n, m, _ in entries],
+                             [("bin", 0o040755), ("bin/other", 0o100644), ("bin/sub", 0o040755),
+                              ("bin/sub/prog", 0o100644), ("nanox", 0o040755),
+                              ("nanox/release", 0o100644)])
+            self.assertEqual(entries[3][2], b"\x7fELF..")
+            for bad in ("/abs", "a//b", "a/../b", "./a", "nanox/release", ""):
+                with self.assertRaises(ValueError, msg=bad):
+                    mkinitrd.add_files(mkinitrd.collect(os.path.join(d, "etc")), [(bad, str(prog))])
+
     def test_repository_initrd(self):
         entries, _ = parse_newc(mkinitrd.build_cpio(mkinitrd.collect(REPO / "initrd")))
         names = [n for n, _, _ in entries]

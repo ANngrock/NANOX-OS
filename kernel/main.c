@@ -1,10 +1,10 @@
 /*
- * NANOX kernel (M1).
+ * NANOX kernel (M1, M2).
  *
  * Boot sequence: own GDT/TSS/IDT, boot info validation, physical allocator,
  * own page tables (CR3 switch), reclaim of boot memory, initramfs check,
  * self-tests, then the scenario selected with nanox.test= on the command
- * line (docs/m0-bench.md, docs/m1-kernel.md):
+ * line (docs/m0-bench.md, docs/m1-kernel.md, docs/m2-kernel.md):
  *
  *   (none) / pass   self-tests, then TEST PASS
  *   fail            deliberate TEST FAIL
@@ -14,6 +14,8 @@
  *                   deliberate CPU exceptions (kernel/faults.c)
  *   doublefree      the page allocator must reject a double free (panic)
  *   timer-masked    timer left masked: the timer check must report TEST FAIL
+ *   m2-user, m2-sched, m2-sched-nopreempt, m2-ipc, m2-ipc-overgrant
+ *                   scheduler, user tasks and IPC (kernel/m2test.c)
  */
 #include <stdint.h>
 
@@ -31,6 +33,7 @@
 #include "faults.h"
 #include "initramfs.h"
 #include "kernel.h"
+#include "m2test.h"
 #include "mm/mm.h"
 
 /* M0/M1 early boot runs on the UEFI identity mapping: physical == virtual. */
@@ -42,12 +45,12 @@ static const void *identity_map(void *opaque, uint64_t phys, uint64_t len)
     return (const void *)(uintptr_t)phys;
 }
 
-enum mode_kind { K_PASS, K_FAIL, K_PANIC, K_HANG, K_FAULT, K_TIMER_MASKED };
+enum mode_kind { K_PASS, K_FAIL, K_PANIC, K_HANG, K_FAULT, K_TIMER_MASKED, K_M2 };
 
 struct test_mode {
     const char *name;
     enum mode_kind kind;
-    void (*fault)(void);
+    void (*fn)(void); /* K_FAULT: the deliberate fault; K_M2: the test (does not return) */
 };
 
 static void fault_nullderef(void)
@@ -84,6 +87,11 @@ static const struct test_mode MODES[] = {
     {"stackoverflow", K_FAULT, fault_stack_overflow},
     {"doublefree", K_FAULT, fault_double_free},
     {"timer-masked", K_TIMER_MASKED, 0},
+    {"m2-user", K_M2, nx_m2_user},
+    {"m2-sched", K_M2, nx_m2_sched},
+    {"m2-sched-nopreempt", K_M2, nx_m2_sched_nopreempt},
+    {"m2-ipc", K_M2, nx_m2_ipc},
+    {"m2-ipc-overgrant", K_M2, nx_m2_ipc_overgrant},
 };
 
 static int token_eq(const char *tok, uint32_t len, const char *lit)
@@ -186,6 +194,7 @@ static void check_initramfs(const struct nx_boot_info *bi)
     st = nx_cpio_find(base, bi->initrd_size, "etc/nanox/release", &rel);
     if (st != NX_CPIO_OK || (rel.mode & NX_CPIO_MODE_TYPE) != NX_CPIO_MODE_REG)
         nx_panic("initramfs: etc/nanox/release missing (%s)", nx_cpio_strerror(st));
+    nx_m2_set_initramfs(base, bi->initrd_size);
     nx_printf("NANOX: initramfs ok entries=%u bytes=%" NX_PRIu64 " sha256=", entries,
               bi->initrd_size);
     nx_print_hex_bytes(digest, sizeof(digest));
@@ -347,9 +356,12 @@ __attribute__((noreturn)) static void run_mode(const struct test_mode *mode, uin
             __asm__ volatile("cli; hlt");
     case K_FAULT:
         nx_printf("NANOX: test fault %s: expecting a failure report\n", mode->name);
-        mode->fault();
+        mode->fn();
         test_fail("deliberate fault did not trap");
     case K_TIMER_MASKED: test_fail("timer-masked: the timer check did not detect the masked timer");
+    case K_M2:
+        mode->fn();
+        test_fail("M2 test returned without a verdict");
     }
     test_fail("bad test mode");
 }

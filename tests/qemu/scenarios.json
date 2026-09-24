@@ -13,8 +13,8 @@
         "patterns": [
           "^NANOX: kernel sha256 {kernel_sha256}$",
           "^NANOX: bootinfo acpi_rsdp=0x[0-9a-f]+$",
-          "^NANOX: initramfs ok entries=3 bytes=[0-9]+ sha256={initrd_sha256}$",
-          "^NANOX: initramfs release \"NANOX-OS initramfs M1\"$",
+          "^NANOX: initramfs ok entries=8 bytes=[0-9]+ sha256={initrd_sha256}$",
+          "^NANOX: initramfs release \"NANOX-OS initramfs M2\"$",
           "^NANOX: cpu gdt\\+tss\\+idt loaded ",
           "^NANOX: selftest breakpoint ok resumed=2$",
           "^NANOX: pmm ok span_pages=[0-9]+ managed=[1-9][0-9]* ",
@@ -370,6 +370,121 @@
         "failure_class": "test_fail",
         "patterns": [
           "^NANOX: TEST FAIL timer: no timer interrupts in the window \\(ticks=0 expected=30\\)$"
+        ]
+      }
+    },
+    {
+      "name": "m2-user",
+      "description": "M2 criterion 1: bin/hello from the initramfs runs in ring 3 in its own address space, prints through debug_write and exits 0; the kernel reaps it and the allocator and page-table counters return to their values before the task.",
+      "image": {
+        "cmdline": "nanox.test=m2-user"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "patterns": [
+          "^NANOX: sched ok tasks=kmain#1,idle#2 preempt=on slice_ticks=2 hz=100 user_fpu=off gdt_user=0x1b/0x23 syscall_vector=0x80$",
+          "^NANOX: m2-user spawn hello#3 path=bin/hello size=[0-9]+ entry=0x0000008000000000$",
+          "^NANOX: m2-user address space hello#3 root=0x[0-9a-f]+ kernel_root=0x[0-9a-f]+ code=user,r-x stack=user,rw- kernel_root_maps_them=no pages_in_use=[1-9][0-9]*$",
+          "^NANOX: USER hello#3: hello from ring 3: cpl=3 task=3$",
+          "^NANOX: USER hello#3: args ok: 0x48454c4c4f000000 0x48454c4c4f000001 0x48454c4c4f000002 0x48454c4c4f000003$",
+          "^NANOX: USER hello#3: code=0x8000000[0-9a-f]{{3}} data=0x8000002000 stack=0x7ffffffe[0-9a-f]{{4}} data_ok=yes bss_ok=yes$",
+          "^NANOX: USER hello#3: exiting with code 0$",
+          "^NANOX: task hello#3 exited code=0 ticks=[0-9]+ preempted=0 syscalls=6$",
+          "^NANOX: m2-user resources before free_pages=([0-9]+) tables=([0-9]+) tasks=2 vmos=0 endpoints=0$[\\s\\S]*^NANOX: m2-user resources after free_pages=\\1 tables=\\2 tasks=2 vmos=0 endpoints=0$",
+          "^NANOX: m2-user ok task=hello#3 exit=0 syscalls=6 pages_in_use=[1-9][0-9]* free_pages_restored=[0-9]+$"
+        ]
+      }
+    },
+    {
+      "name": "m2-sched",
+      "description": "M2 criterion 2: three bin/spin tasks that never yield or block are interleaved by the timer (preemptive round robin), each finishes with the result the kernel computed independently.",
+      "image": {
+        "cmdline": "nanox.test=m2-sched"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "patterns": [
+          "^NANOX: sched ok tasks=kmain#1,idle#2 preempt=on slice_ticks=2 hz=100 user_fpu=off gdt_user=0x1b/0x23 syscall_vector=0x80$",
+          "^NANOX: m2-sched expect spin-a#3 iterations=200000000 result=(0x[0-9a-f]{{16}})$[\\s\\S]*^NANOX: USER spin-a#3: done index=0 iterations=200000000 result=\\1 ok$",
+          "^NANOX: m2-sched expect spin-b#4 iterations=200000000 result=(0x[0-9a-f]{{16}})$[\\s\\S]*^NANOX: USER spin-b#4: done index=1 iterations=200000000 result=\\1 ok$",
+          "^NANOX: m2-sched expect spin-c#5 iterations=200000000 result=(0x[0-9a-f]{{16}})$[\\s\\S]*^NANOX: USER spin-c#5: done index=2 iterations=200000000 result=\\1 ok$",
+          "^NANOX: task spin-a#3 exited code=0 ticks=[0-9]+ preempted=[1-9][0-9]* syscalls=6$",
+          "^NANOX: task spin-b#4 exited code=0 ticks=[0-9]+ preempted=[1-9][0-9]* syscalls=6$",
+          "^NANOX: task spin-c#5 exited code=0 ticks=[0-9]+ preempted=[1-9][0-9]* syscalls=6$",
+          "^NANOX: m2-sched progress order latest_first=[0-9]+ earliest_last=[0-9]+ preempted=[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*$",
+          "^NANOX: m2-sched resources before free_pages=([0-9]+) tables=([0-9]+) tasks=2 vmos=0 endpoints=0$[\\s\\S]*^NANOX: m2-sched resources after free_pages=\\1 tables=\\2 tasks=2 vmos=0 endpoints=0$",
+          "^NANOX: m2-sched ok tasks=3 exited=3 yields=0 interleaved=yes switches=[0-9]+ preemptions=[1-9][0-9]*$"
+        ],
+        "interleave": {
+          "pattern": "^NANOX: USER (spin-[a-c]#[0-9]+): progress [1-4]/4$",
+          "groups": 3
+        }
+      },
+      "repeat": {
+        "unordered": "^NANOX: USER "
+      }
+    },
+    {
+      "name": "m2-sched-nopreempt",
+      "description": "Negative control for m2-sched: the same tasks with preemption disabled run one after another, and the interleaving check must fail.",
+      "image": {
+        "cmdline": "nanox.test=m2-sched-nopreempt"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail",
+        "patterns": [
+          "^NANOX: sched ok tasks=kmain#1,idle#2 preempt=off slice_ticks=2 hz=100 user_fpu=off gdt_user=0x1b/0x23 syscall_vector=0x80$",
+          "^NANOX: USER spin-c#5: done index=2 iterations=200000000 result=0x[0-9a-f]{{16}} ok$",
+          "^NANOX: m2-sched-nopreempt progress order latest_first=[0-9]+ earliest_last=[0-9]+ preempted=0,0,0$",
+          "^NANOX: TEST FAIL m2-sched-nopreempt: tasks did not interleave: a task finished before another reported progress "
+        ]
+      }
+    },
+    {
+      "name": "m2-ipc",
+      "description": "M2 criterion 3: bin/ipc-send sends a message and a memory-object handle reduced to READ|MAP to bin/ipc-recv, which receives both intact with exactly those rights, maps the page read-only and is refused write mapping and duplication.",
+      "image": {
+        "cmdline": "nanox.test=m2-ipc"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "patterns": [
+          "^NANOX: sched ok tasks=kmain#1,idle#2 preempt=on slice_ticks=2 hz=100 user_fpu=off gdt_user=0x1b/0x23 syscall_vector=0x80$",
+          "^NANOX: m2-ipc endpoint ipc-send#4 handle=0x[0-9a-f]+ rights=0x20, ipc-recv#3 handle=0x[0-9a-f]+ rights=0x40$",
+          "^NANOX: m2-ipc ipc-recv#3 blocked in receive on the endpoint, starting ipc-send#4$",
+          "^NANOX: USER ipc-send#4: send granting an extra right \\(0x25\\): EACCESS \\(expected EACCESS\\)$",
+          "^NANOX: ipc send by ipc-send#4 len=48 handle=vmo sender_rights=0x1f requested=0x5 queued=0x5$",
+          "^NANOX: USER ipc-send#4: send len=48 granting 0x5: ok$",
+          "^NANOX: USER ipc-send#4: close of the sent handle: EBADHANDLE \\(expected EBADHANDLE\\)$",
+          "^NANOX: ipc recv by ipc-recv#3 len=48 from=#4 handle=0x[0-9a-f]+ rights=0x5$",
+          "^NANOX: USER ipc-recv#3: received len=48 from=#4 \\(expected #4\\) message intact: \"NANOX M2: one page of memory for you \\(read-only\\)\"$",
+          "^NANOX: USER ipc-recv#3: handle=0x[0-9a-f]+ rights=0x5 expected=0x5$",
+          "^NANOX: USER ipc-recv#3: map read-only at 0x20000000000: ok, page contents match the sender's$",
+          "^NANOX: USER ipc-recv#3: map read-write: EACCESS \\(expected EACCESS\\), duplicate: EACCESS \\(expected EACCESS\\)$",
+          "^NANOX: USER ipc-recv#3: verdict ok$",
+          "^NANOX: task ipc-send#4 exited code=0 ",
+          "^NANOX: task ipc-recv#3 exited code=0 ",
+          "^NANOX: m2-ipc resources before free_pages=([0-9]+) tables=([0-9]+) tasks=2 vmos=0 endpoints=0$[\\s\\S]*^NANOX: m2-ipc resources after free_pages=\\1 tables=\\2 tasks=2 vmos=0 endpoints=0$",
+          "^NANOX: m2-ipc ok message and handle delivered, rights reduced to 0x5$"
+        ]
+      }
+    },
+    {
+      "name": "m2-ipc-overgrant",
+      "description": "Negative control for m2-ipc: the kernel deliberately delivers the handle with all of the sender's rights; the receiver must detect it and the run must fail.",
+      "image": {
+        "cmdline": "nanox.test=m2-ipc-overgrant"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail",
+        "patterns": [
+          "^NANOX: m2-ipc-overgrant fault injection: transferred handles keep all sender rights$",
+          "^NANOX: ipc send by ipc-send#4 len=48 handle=vmo sender_rights=0x1f requested=0x5 queued=0x1f$",
+          "^NANOX: USER ipc-recv#3: handle=0x[0-9a-f]+ rights=0x1f expected=0x5$",
+          "^NANOX: USER ipc-recv#3: verdict FAILED$",
+          "^NANOX: TEST FAIL m2-ipc-overgrant: task ipc-recv#3 did not exit normally with code 0 \\(end=1 code=2\\)$"
         ]
       }
     }

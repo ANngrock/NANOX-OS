@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <nanox/elf_plan.h>
+#include <nanox/syscall.h>
+
 #include "initramfs.h"
 #include "test.h"
 
@@ -182,9 +185,20 @@ void test_initramfs(const char *initrd_path)
             size_t len = fread(img, 1, sizeof(img), f);
             fclose(f);
             CHECK_EQ_INT(nx_cpio_validate(img, len, &n, &bad), NX_CPIO_OK);
-            CHECK_EQ_INT(n, 3);
+            CHECK_EQ_INT(n, 8); /* etc, etc/nanox, release, bin and 4 programs */
             CHECK_EQ_INT(nx_cpio_find(img, len, "etc/nanox/release", &e), NX_CPIO_OK);
-            CHECK(e.size == 22 && memcmp(e.data, "NANOX-OS initramfs M1\n", 22) == 0);
+            CHECK(e.size == 22 && memcmp(e.data, "NANOX-OS initramfs M2\n", 22) == 0);
+            /* The M2 user programs pass the kernel's loader rules. */
+            static const char *const progs[] = {"bin/hello", "bin/spin", "bin/ipc-send",
+                                                "bin/ipc-recv"};
+            for (unsigned i = 0; i < sizeof(progs) / sizeof(progs[0]); i++) {
+                struct nx_elf_plan plan;
+                CHECK_EQ_INT(nx_cpio_find(img, len, progs[i], &e), NX_CPIO_OK);
+                CHECK_EQ_INT(e.mode & NX_CPIO_MODE_TYPE, NX_CPIO_MODE_REG);
+                CHECK_EQ_INT(nx_elf_plan_user(e.data, e.size, &plan), NX_ELF_OK);
+                CHECK_EQ_INT(plan.entry, NX_USER_BASE);
+                CHECK(plan.segment_count >= 2);
+            }
         }
     } else {
         fprintf(stderr, "test_initramfs: no initrd path given, real-archive check skipped\n");

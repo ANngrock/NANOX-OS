@@ -241,7 +241,8 @@ class ScenarioFileTest(unittest.TestCase):
         for required in ("normal", "fail", "panic", "hang", "missing-kernel", "corrupt-kernel",
                          "missing-initrd", "corrupt-initrd", "bad-initrd", "pagefault",
                          "nullderef", "wprotect", "nxexec", "stackoverflow", "ud", "gp",
-                         "divzero", "doublefree", "timer-masked"):
+                         "divzero", "doublefree", "timer-masked", "m2-user", "m2-sched",
+                         "m2-sched-nopreempt", "m2-ipc", "m2-ipc-overgrant"):
             self.assertIn(required, names)
 
     def test_scenario_patterns_are_valid(self):
