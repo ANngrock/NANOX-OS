@@ -19,7 +19,10 @@ QEMU/UEFI, версии toolchain, сборку образа, headless harness, 
 этапе M4 добавлены диск данных (второй virtio-blk), код выхода 43 и класс
 `crash_point`, сценарии из нескольких загрузок на одном диске, ожидание
 `store` и серия сбоев (`"kind": "crash-sweep"`); решения M4 — в
-[m4-store.md](m4-store.md).
+[m4-store.md](m4-store.md). На этапе M5 добавлены сетевая карта, источник
+энтропии, QMP-сокет, RTC с фиксированной датой, сервисы стенда (DNS, echo,
+TLS, тестовый provider) и ключ сценария `"m5"`; решения M5 — в
+[m5-net.md](m5-net.md).
 
 ## 1. Одна последовательность от чистого checkout
 
@@ -94,7 +97,12 @@ framebuffer в boot info; сценарии M3 (`m3-*`) добавляют вто
 `out/data.img` из каталога запуска:
 `-drive if=none,id=nxdata,format=raw,file=<run>/data.img -device
 virtio-blk-pci,drive=nxdata,serial=nanox-data`
-([m4-store.md §11](m4-store.md#11-сценарии-стенда)).
+([m4-store.md §11](m4-store.md#11-сценарии-стенда)); сценарии M5 (`m5-*`)
+добавляют к этому сетевую карту и источник энтропии:
+`-netdev user,id=nxnet,ipv6=off -device
+virtio-net-pci,netdev=nxnet,mac=52:54:00:4e:58:05,romfile= -object
+rng-builtin,id=nxrng -device virtio-rng-pci,rng=nxrng -qmp
+unix:<сокет>,server=on,wait=off` ([m5-net.md §3](m5-net.md#3-устройства-virtio-net-virtio-rng-часы)).
 
 ## 3. Toolchain
 
@@ -185,7 +193,8 @@ M0: сборка с пустым `REPRO_FLAGS` в двух путях дала �
 [m1-kernel.md](m1-kernel.md#сценарии-стенда), сценарии M2 — в
 [m2-kernel.md §10](m2-kernel.md#10-сценарии-стенда), сценарии M3 — в
 [m3-core.md §8](m3-core.md#8-сценарии-стенда), сценарии M4 — в
-[m4-store.md §11](m4-store.md#11-сценарии-стенда).
+[m4-store.md §11](m4-store.md#11-сценарии-стенда), сценарии M5 — в
+[m5-net.md §10](m5-net.md#10-стенд).
 
 | Сценарий | Образ | Ожидание |
 | --- | --- | --- |
