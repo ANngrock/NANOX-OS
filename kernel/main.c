@@ -42,6 +42,7 @@
 #include "m2test.h"
 #include "m3test.h"
 #include "m4test.h"
+#include "m5test.h"
 #include "mm/mm.h"
 
 /* M0/M1 early boot runs on the UEFI identity mapping: physical == virtual. */
@@ -108,6 +109,10 @@ static const struct test_mode MODES[] = {
     {"m4-serve", K_M2, nx_m4_serve},
     {"m4-work", K_M2, nx_m4_work},
     {"m4-check", K_M2, nx_m4_check},
+    {"m5-serve", K_M2, nx_m5_serve},
+    {"m5-noretx", K_M2, nx_m5_noretx},
+    {"m5-noretry", K_M2, nx_m5_noretry},
+    {"m5-flattel", K_M2, nx_m5_flattel},
 };
 
 const char *nx_cmdline;

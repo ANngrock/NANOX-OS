@@ -1,8 +1,9 @@
 /*
- * NANOX system call ABI, version 1 (M2, extended in M3 by calls 14-21 and
- * in M4 by calls 22-25).  Shared by the kernel and user programs; normative
- * description in docs/m2-kernel.md (calls 1-13), docs/m3-core.md (calls
- * 14-21) and docs/m4-store.md (calls 22-25).
+ * NANOX system call ABI, version 1 (M2, extended in M3 by calls 14-21, in
+ * M4 by calls 22-25 and in M5 by calls 26-30).  Shared by the kernel and
+ * user programs; normative description in docs/m2-kernel.md (calls 1-13),
+ * docs/m3-core.md (calls 14-21), docs/m4-store.md (calls 22-25) and
+ * docs/m5-net.md (calls 26-30).
  *
  * Entry: `int $0x80`.  RAX = call number, arguments in RDI, RSI, RDX, R10,
  * R8; result in RAX (>= 0 success, < 0 one of NX_E*).  All other registers
@@ -52,6 +53,13 @@ enum nx_syscall {
     NX_SYS_BLK_READ = 23,    /* (blk h, block, count <= NX_BLK_IO_MAX, buf) -> count; READ */
     NX_SYS_BLK_WRITE = 24,   /* (blk h, block, count <= NX_BLK_IO_MAX, buf) -> count; WRITE */
     NX_SYS_BLK_FLUSH = 25,   /* (blk h) -> 0 once every completed write is durable; WRITE */
+    /* M5: network device, entropy, wall clock. */
+    NX_SYS_NET_INFO = 26,    /* (net h, info*) -> 0; struct nx_net_info, needs READ */
+    NX_SYS_NET_SEND = 27,    /* (net h, frame, len) -> len; WRITE */
+    NX_SYS_NET_RECV = 28,    /* (net h, buf, cap >= NX_NET_FRAME_MAX, timeout ticks) -> len
+                                (0: timeout); READ */
+    NX_SYS_ENTROPY = 29,     /* (buf, len <= NX_ENTROPY_MAX) -> len: raw device entropy */
+    NX_SYS_CLOCK = 30,       /* (clock*) -> 0; struct nx_clock */
     NX_SYS__COUNT
 };
 
@@ -71,6 +79,8 @@ enum nx_error {
     NX_EDEAD = 11,     /* target task has exited */
     NX_ENOENT = 12,    /* M3: no such program in the initramfs */
     NX_EIO = 13,       /* M4: the device reported an error or did not complete */
+    NX_ENOLINK = 14,   /* M5: the network link is down, nothing was sent */
+    NX_ENODEV = 15,    /* M5: no such device (e.g. no entropy source) */
     NX_E__COUNT
 };
 
@@ -180,6 +190,37 @@ struct nx_blk_info {
     uint32_t flags;      /* NX_BLK_INFO_* */
     uint64_t reads, writes, flushes;
     char serial[24];     /* virtio-blk GET_ID, NUL-terminated */
+};
+
+/* ---- M5 (docs/m5-net.md) ------------------------------------------------ */
+
+#define NX_NET_FRAME_MAX 1514u    /* Ethernet frame without FCS */
+#define NX_NET_FRAME_MIN 14u
+#define NX_NET_TIMEOUT_MAX 6000u  /* ticks */
+#define NX_ENTROPY_MAX 256u
+
+#define NX_NET_INFO_LINK_UP 1u
+#define NX_NET_INFO_STATUS 2u     /* the device reports the link state */
+#define NX_NET_INFO_TEST_LOSS 4u  /* test layer: frames are dropped deliberately */
+
+struct nx_net_info {
+    uint8_t mac[6];
+    uint16_t mtu;             /* 1500 */
+    uint32_t flags;           /* NX_NET_INFO_* */
+    uint32_t loss_rx, loss_tx; /* test layer: every N-th frame dropped (0: off) */
+    uint64_t rx_frames, tx_frames, rx_bytes, tx_bytes;
+    uint64_t rx_test_drops, tx_test_drops; /* dropped by the test layer */
+    uint64_t tx_link_down;    /* sends refused with NX_ENOLINK */
+    uint64_t rx_oversize, tx_errors;
+};
+
+#define NX_CLOCK_SRC_RTC 1u /* CMOS RTC read at start + timer ticks since */
+
+struct nx_clock {
+    uint64_t unix_s;   /* seconds since 1970-01-01T00:00:00Z */
+    uint64_t ticks;    /* timer ticks (as nx_sys_info.ticks) */
+    uint32_t hz;
+    uint32_t source;   /* NX_CLOCK_SRC_* */
 };
 
 /* Filled by NX_SYS_IPC_RECV.  sender_task is set by the kernel. */

@@ -1031,6 +1031,45 @@
           "^saved_lost:"
         ]
       }
+    },
+    {
+      "name": "m5-net",
+      "description": "M5 criterion 1: virtio-net, ARP, ICMP, DNS, TCP and diagnostics through the guest's own stack; link down and up through QMP",
+      "image": {
+        "cmdline": "nanox.test=m5-serve"
+      },
+      "timeout_s": 180,
+      "m5": {},
+      "bridge": {
+        "script": "m5-net"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "m5-net-loss",
+      "description": "M5 criterion 1 under deterministic frame loss (every 5th received, every 7th sent frame dropped by the kernel's test layer): ARP, DNS and TCP recover by retrying",
+      "image": {
+        "cmdline": "nanox.test=m5-serve nanox.m5.loss=rx:5,tx:7"
+      },
+      "timeout_s": 180,
+      "m5": {},
+      "bridge": {
+        "script": "m5-net-loss"
+      },
+      "expect": {
+        "verdict": "PASS",
+        "bridge": {
+          "ok": true
+        },
+        "patterns": [
+          "^NANOX: m5 net=virtio-net link=up loss_rx=5 loss_tx=7 "
+        ]
+      }
     }
   ]
 }

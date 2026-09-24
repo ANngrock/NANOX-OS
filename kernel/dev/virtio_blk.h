@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 
-#include "pci.h"
+#include "virtio.h"
 
 #define NX_VBLK_MAX 2u          /* devices the driver manages */
 #define NX_VBLK_SECTOR 512u
@@ -31,18 +31,13 @@ enum nx_vblk_status {
 
 struct nx_vblk {
     int present;
-    struct nx_pci_addr pci;
-    uint16_t device_id;
-    volatile uint8_t *common, *notify_base, *devcfg;
-    uint32_t notify_mult;
-    uint16_t qsize, notify_off;
-    uint64_t features;
+    struct nx_virtio v;
+    struct nx_virtq q;
     uint64_t sectors;
     int read_only, has_flush;
     char serial[NX_VBLK_SERIAL_MAX + 1];
-    uint64_t ring_pa, req_pa;
+    uint64_t req_pa;
     uint64_t data_pa[NX_VBLK_MAX_PAGES];
-    uint16_t avail_idx, used_seen;
     uint64_t requests, errors;
 };
 

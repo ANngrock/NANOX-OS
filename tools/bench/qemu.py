@@ -66,7 +66,22 @@ def prepare_vars(dest):
 DATA_DISK_SERIAL = "nanox-data"
 
 
-def base_argv(image, vars_path, serial, extra=(), bridge_socket=None, data_disk=None):
+# M5: the network card (user-mode networking, no host privileges needed),
+# the entropy device and the QMP socket through which a scenario can take
+# the link down (docs/m5-net.md §3).
+NET_MAC = "52:54:00:4e:58:05"
+
+
+def net_argv(qmp_socket):
+    return ["-netdev", "user,id=nxnet,ipv6=off",
+            "-device", "virtio-net-pci,netdev=nxnet,mac=%s,romfile=" % NET_MAC,
+            "-object", "rng-builtin,id=nxrng",
+            "-device", "virtio-rng-pci,rng=nxrng",
+            "-qmp", "unix:%s,server=on,wait=off" % qmp_socket]
+
+
+def base_argv(image, vars_path, serial, extra=(), bridge_socket=None, data_disk=None,
+              net_qmp=None):
     """Returns the canonical argv.
 
     image     raw disk image (opened read-only)
@@ -79,6 +94,8 @@ def base_argv(image, vars_path, serial, extra=(), bridge_socket=None, data_disk=
               (docs/m3-core.md)
     data_disk M4: raw image of the persistent data disk, attached writable as
               a second virtio-blk device with serial DATA_DISK_SERIAL
+    net_qmp   M5: attach virtio-net (user networking) and virtio-rng, and a
+              QMP monitor on this unix socket (net_argv)
     """
     argv = [
         QEMU_BINARY,
@@ -106,6 +123,8 @@ def base_argv(image, vars_path, serial, extra=(), bridge_socket=None, data_disk=
     if bridge_socket:
         argv += ["-chardev", "socket,id=nxbridge,path=%s,server=off" % bridge_socket,
                  "-serial", "chardev:nxbridge"]
+    if net_qmp:
+        argv += net_argv(net_qmp)
     argv.extend(extra)
     return argv
 

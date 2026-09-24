@@ -159,6 +159,33 @@ static inline int64_t nx_blk_flush(uint64_t h)
     return nx_sys(NX_SYS_BLK_FLUSH, h, 0, 0, 0, 0);
 }
 
+/* ---- M5 ---- */
+
+static inline int64_t nx_net_info(uint64_t h, struct nx_net_info *info)
+{
+    return nx_sys(NX_SYS_NET_INFO, h, (uint64_t)(uintptr_t)info, 0, 0, 0);
+}
+
+static inline int64_t nx_net_send(uint64_t h, const void *frame, uint64_t len)
+{
+    return nx_sys(NX_SYS_NET_SEND, h, (uint64_t)(uintptr_t)frame, len, 0, 0);
+}
+
+static inline int64_t nx_net_recv(uint64_t h, void *buf, uint64_t cap, uint64_t timeout)
+{
+    return nx_sys(NX_SYS_NET_RECV, h, (uint64_t)(uintptr_t)buf, cap, timeout, 0);
+}
+
+static inline int64_t nx_entropy(void *buf, uint64_t len)
+{
+    return nx_sys(NX_SYS_ENTROPY, (uint64_t)(uintptr_t)buf, len, 0, 0, 0);
+}
+
+static inline int64_t nx_clock(struct nx_clock *c)
+{
+    return nx_sys(NX_SYS_CLOCK, (uint64_t)(uintptr_t)c, 0, 0, 0, 0);
+}
+
 /* Current privilege level (low bits of CS). */
 static inline uint64_t u_cpl(void)
 {

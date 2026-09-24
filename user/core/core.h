@@ -56,6 +56,9 @@ void ps_final(struct eng_action *a, struct nci_buf *b);
 #define PS_INTENT 2 /* write-ahead record committed; the final one is due */
 /* action.status fields of a record: boot and whether it is in the store. */
 void ps_status_fields(struct nci_buf *b, const struct eng_action *a);
+/* M5: reads object `name` of the current generation (configuration,
+ * secrets, trust anchors).  ST_OK or an ST_E_* code. */
+int ps_read_obj(const char *name, void *buf, uint32_t cap, uint32_t *len);
 /* Modes without the bridge (abi/nanox/m4.h). */
 int64_t ps_run_workload(void);
 int64_t ps_run_check(void);

@@ -114,7 +114,8 @@ const char *u_err(int64_t r)
         [NX_EFAULT] = "EFAULT",  [NX_EBADHANDLE] = "EBADHANDLE", [NX_EWRONGTYPE] = "EWRONGTYPE",
         [NX_EACCESS] = "EACCESS", [NX_ENOMEM] = "ENOMEM",        [NX_EFULL] = "EFULL",
         [NX_EEXISTS] = "EEXISTS", [NX_ERANGE] = "ERANGE",        [NX_EDEAD] = "EDEAD",
-        [NX_ENOENT] = "ENOENT",  [NX_EIO] = "EIO",
+        [NX_ENOENT] = "ENOENT",  [NX_EIO] = "EIO",            [NX_ENOLINK] = "ENOLINK",
+        [NX_ENODEV] = "ENODEV",
     };
     if (r > 0)
         return "ok";

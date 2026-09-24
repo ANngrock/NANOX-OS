@@ -23,10 +23,12 @@
  */
 #include <nanox/m3.h>
 #include <nanox/m4.h>
+#include <nanox/m5.h>
 #include <nanox/string.h>
 
 #include "core.h"
 #include "engine.h"
+#include "m5.h"
 #include "nanox_user.h"
 #include "nci.h"
 
@@ -351,6 +353,8 @@ static void op_describe(struct eng_action *a, const struct nci_req *r, struct nc
     nb_str(b, " ops=");
     nb_str(b, OPS);
     nb_str(b, PS_OPS);
+    if (m5_enabled)
+        nb_str(b, M5_OPS);
     if (ps_state != PS_ABSENT) {
         nb_kv(b, "store", ps_state_name());
         nb_kv_u64(b, "store_gen", ps_gen());
@@ -882,6 +886,8 @@ int64_t core_handle(const char *line, uint32_t len)
         return code;
     }
     op_fn fn = ps_op(req.op);
+    if (!fn && m5_enabled)
+        fn = m5_op(req.op);
     for (uint32_t i = 0; i < sizeof(OPTAB) / sizeof(OPTAB[0]); i++)
         if (nci_streq(req.op, OPTAB[i].name))
             fn = OPTAB[i].fn;
@@ -936,6 +942,8 @@ int64_t umain(uint64_t a0, uint64_t a1, uint64_t flags, uint64_t blk)
         return NX_M3_CORE_BAD_ARGS;
     }
     ps_init(blk);
+    if (flags & NX_M5_CORE_NET)
+        m5_init(flags >> NX_M5_CORE_NET_SHIFT, flags & NX_M5_CORE_FLAGS_MASK);
     if (flags & NX_M4_CORE_WORKLOAD)
         return ps_run_workload();
     if (flags & NX_M4_CORE_CHECK)

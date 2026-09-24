@@ -105,7 +105,7 @@ __attribute__((noreturn)) static void run_core(const char *mode, uint64_t flags,
     parse_params(mode);
     struct nx_blkdev *b = open_data(mode);
     nx_blk_test_setup();
-    struct nx_core_opts o = {mode, flags, bridge, b};
+    struct nx_core_opts o = {mode, flags, bridge, b, 0};
     nx_core_session(&o);
 }
 

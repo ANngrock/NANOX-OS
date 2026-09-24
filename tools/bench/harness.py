@@ -66,6 +66,7 @@ import doctor  # noqa: E402
 import elfsym  # noqa: E402
 import mkimage  # noqa: E402
 import qemu  # noqa: E402
+import m5host  # noqa: E402
 import session as bridge_session  # noqa: E402
 import storecheck  # noqa: E402
 
@@ -419,11 +420,19 @@ class BridgeRunner:
 
 
 def run_boot(sc, run_dir, toolchain, echo=False, adapter_override=None, data_disk=None,
-             carry=None, image=None):
+             carry=None, image=None, m5=None):
     """One QEMU boot of the (single-boot) spec `sc` with its records in
     run_dir; returns the run record.  data_disk: M4 data-disk image attached
-    writable; carry: dict shared by the bridge sessions of one scenario."""
+    writable; carry: dict shared by the bridge sessions of one scenario;
+    m5: host services of an M5 run (m5host.Services): the network card and
+    the QMP socket are attached and the scripts can reach the services."""
     image = image or build_scenario_image(sc)
+    qmp_dir = None
+    if m5 is not None:
+        carry = carry if carry is not None else {}
+        carry["m5"] = m5
+        qmp_dir = tempfile.mkdtemp(prefix="nxq-")
+        m5.qmp_socket(qmp_dir)
     serial_path = run_dir / "serial.log"
     serial_path.touch()
     vars_path = qemu.prepare_vars(run_dir / "OVMF_VARS.fd")
@@ -431,7 +440,8 @@ def run_boot(sc, run_dir, toolchain, echo=False, adapter_override=None, data_dis
               if sc.get("bridge") else None)
     disk_before = sha256_file(data_disk) if data_disk else None
     argv = qemu.base_argv(image, vars_path, "file:%s" % serial_path, extra=sc["qemu_extra"],
-                          bridge_socket=bridge.path if bridge else None, data_disk=data_disk)
+                          bridge_socket=bridge.path if bridge else None, data_disk=data_disk,
+                          net_qmp=m5.qmp_path if m5 is not None else None)
 
     started = datetime.datetime.now(datetime.timezone.utc)
     t0 = time.monotonic()
@@ -462,6 +472,9 @@ def run_boot(sc, run_dir, toolchain, echo=False, adapter_override=None, data_dis
     duration = time.monotonic() - t0
     exit_status = proc.returncode
     bridge_result = bridge.finish() if bridge else None
+    if qmp_dir:
+        m5.qmp.close()
+        shutil.rmtree(qmp_dir, ignore_errors=True)
     os.unlink(vars_path)  # 540 KiB per run; the template hash is recorded instead
 
     serial_bytes = serial_path.read_bytes()
@@ -524,6 +537,7 @@ def run_boot(sc, run_dir, toolchain, echo=False, adapter_override=None, data_dis
         "backtrace": report["backtrace"],
         "bridge": bridge_result,
         "data_disk": disk_record,
+        "m5": m5.record() if m5 is not None else None,
         "expected": sc["expect"],
         "expectation_met": not problems,
         "expectation_problems": problems,
@@ -542,6 +556,17 @@ def run_scenario(sc, runs_root, toolchain, echo=False, adapter_override=None):
     if sc.get("data_disk"):
         data_disk = run_dir / "data.img"
         shutil.copyfile(DATA_IMG, data_disk)
+    if "m5" in sc:
+        # M5: host services, and a data disk provisioned with the guest's
+        # network and provider configuration (docs/m5-net.md §10)
+        data_disk = run_dir / "data.img"
+        m5 = m5host.Services(sc["m5"], run_dir)
+        try:
+            m5.provision(data_disk)
+            record = run_boot(sc, run_dir, toolchain, echo, adapter_override, data_disk, m5=m5)
+        finally:
+            m5.close()
+        return record, run_dir
     record = run_boot(sc, run_dir, toolchain, echo, adapter_override, data_disk)
     return record, run_dir
 

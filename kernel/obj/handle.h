@@ -27,6 +27,7 @@ enum nx_obj_type {
     NX_OBJ_SOVEREIGN = 4,
     NX_OBJ_CHANNEL = 5, /* M3: host bridge serial channel */
     NX_OBJ_BLOCKDEV = 6, /* M4: block device (virtio-blk) */
+    NX_OBJ_NETDEV = 7,   /* M5: network device (virtio-net) */
 };
 
 struct nx_object {

@@ -17,6 +17,7 @@ guest in session.close (reason=...).
 import agent as agentmod
 import adapters
 import m4scripts
+import m5scripts
 import nci
 import bridgetrace as tracemod
 
@@ -274,3 +275,4 @@ def run_model_down(ctx):
 SCRIPTS = {"agent": run_agent, "nci": run_nci, "faults": run_faults,
            "model-down": run_model_down}
 SCRIPTS.update(m4scripts.SCRIPTS)  # M4 (docs/m4-store.md §8)
+SCRIPTS.update(m5scripts.SCRIPTS)  # M5 (docs/m5-net.md §10)

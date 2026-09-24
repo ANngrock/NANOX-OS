@@ -118,6 +118,14 @@ static int key_ok(const char *k, uint32_t max)
     return n > 0;
 }
 
+int ps_read_obj(const char *name, void *buf, uint32_t cap, uint32_t *len)
+{
+    if (ps_state != PS_MOUNTED)
+        return ST_E_STATE;
+    struct st_obj meta;
+    return st_read(&store, 0, name, buf, cap, len, &meta);
+}
+
 const char *ps_state_name(void)
 {
     return ps_state == PS_MOUNTED ? "mounted" : ps_state == PS_UNMOUNTABLE ? "unmountable" : "absent";

@@ -40,5 +40,6 @@ void test_event(void);
 void test_nci(void);
 void test_engine(void);
 void test_store(const char *data_image);
+void test_net(void);
 
 #endif

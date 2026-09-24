@@ -50,8 +50,9 @@ KERNEL_CSRCS := kernel/main.c kernel/panic.c kernel/bootinfo_check.c \
     kernel/arch/x86_64/idt.c kernel/arch/x86_64/timer.c kernel/mm/pmm.c kernel/mm/pt.c \
     kernel/mm/vmm.c kernel/mm/uaccess.c kernel/obj/handle.c kernel/obj/ipc.c \
     kernel/obj/objects.c kernel/obj/event.c kernel/task.c kernel/syscall.c kernel/m2test.c \
-    kernel/chan.c kernel/m3test.c kernel/dev/pci.c kernel/dev/virtio_blk.c kernel/dev/blk.c \
-    kernel/m4test.c lib/elf_plan.c lib/serial.c lib/printf.c lib/string.c lib/sha256.c
+    kernel/chan.c kernel/m3test.c kernel/dev/pci.c kernel/dev/virtio.c kernel/dev/virtio_blk.c \
+    kernel/dev/blk.c kernel/m4test.c kernel/dev/virtio_net.c kernel/dev/rtc.c kernel/m5test.c \
+    lib/elf_plan.c lib/serial.c lib/printf.c lib/string.c lib/sha256.c
 KERNEL_ASRCS := kernel/arch/x86_64/entry.S kernel/arch/x86_64/isr.S
 KERNEL_OBJS := $(patsubst %.c,$(BUILD)/kernel/%.o,$(KERNEL_CSRCS)) \
     $(patsubst %.S,$(BUILD)/kernel/%.o,$(KERNEL_ASRCS))
@@ -73,7 +74,11 @@ USER_ELFS := $(patsubst %,$(BUILD)/user/bin/%,$(USER_PROGS))
 # bin/core (M3): the Cognitive Core executor, several sources.
 CORE_OBJS := $(BUILD)/user/user/core/core.o $(BUILD)/user/user/core/nci.o \
     $(BUILD)/user/user/core/engine.o $(BUILD)/user/user/core/persist.o \
-    $(BUILD)/user/lib/store.o $(BUILD)/user/lib/crc32.o
+    $(BUILD)/user/lib/store.o $(BUILD)/user/lib/crc32.o \
+    $(BUILD)/user/user/core/m5net.o \
+    $(BUILD)/user/lib/net/nerr.o $(BUILD)/user/lib/net/net.o $(BUILD)/user/lib/net/tcp.o \
+    $(BUILD)/user/lib/sha256.o $(BUILD)/user/lib/crypto/sha512.o $(BUILD)/user/lib/crypto/hash.o \
+    $(BUILD)/user/lib/crypto/drbg.o
 
 LOADER_EFI := $(OUT)/BOOTX64.EFI
 KERNEL_ELF := $(OUT)/kernel.elf
@@ -161,13 +166,15 @@ HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_initramfs.c tests/host/test_pt.c tests/host/test_pmm.c \
     tests/host/test_handle.c tests/host/test_ipc.c tests/host/test_event.c \
     tests/host/test_nci.c tests/host/test_engine.c tests/host/test_store.c \
+    tests/host/test_net.c \
     kernel/bootinfo_check.c kernel/initramfs.c kernel/mm/pt.c kernel/mm/pmm.c \
     kernel/obj/handle.c kernel/obj/ipc.c kernel/obj/event.c user/core/nci.c user/core/engine.c \
-    lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c lib/store.c lib/crc32.c
+    lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c lib/store.c lib/crc32.c \
+    lib/net/nerr.c lib/net/net.c lib/net/tcp.c
 
 $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
     $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h kernel/mm/*.h kernel/obj/*.h \
-        boot/uefi/*.h user/core/*.h)
+        boot/uefi/*.h user/core/*.h lib/net/*.h)
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_TEST_SRCS)
 

@@ -58,7 +58,7 @@ def run_session(sock, script, adapter=None, request=None, trace_path=None, wire_
         out["close"] = close.fields
         out["problems"] = problems
         out["ok"] = not problems
-    except (nci.BridgeError, KeyError, ValueError) as e:
+    except (nci.BridgeError, KeyError, ValueError, OSError) as e:
         out["problems"].append("bridge_error: %s: %s" % (type(e).__name__, e))
     finally:
         if wire:

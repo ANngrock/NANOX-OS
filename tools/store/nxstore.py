@@ -10,6 +10,10 @@ a consistency check, a JSON dump, decoding of the objects bin/core keeps
 recovery scenarios.  Only the Python standard library.
 
   nxstore.py format --out IMG [--blocks N] [--retain K] [--store-id HEX]
+                    [--object NAME=KIND:VALUE | NAME=KIND:@FILE ...]
+                                    an empty store, or (M5) generation 1 already
+                                    holding objects: provisioning of configuration,
+                                    secrets and trust anchors before the first boot
   nxstore.py dump IMG               JSON: slots, current generation, objects, history
   nxstore.py check IMG              consistency check; exit 1 on problems
   nxstore.py corrupt IMG --what current-root|current-super|both-supers|current-data
@@ -47,6 +51,7 @@ assert struct.calcsize(OBJ_FMT) == 64
 OFF_HIST, OFF_PIN, OFF_LOG, OFF_OBJ = 128, 256, 384, 896
 
 KIND_CONFIG, KIND_BLOB, KIND_TASKS = 1, 2, 3
+KIND_SECRET, KIND_ANCHOR = 4, 5      # M5: provider key, TLS trust anchor (DER)
 TASKS_MAGIC = b"NXTASKS1"
 TASK_REC_FMT = "<33s33sBBIQQ232s"     # struct nx_m4_task_rec, 320 bytes
 assert struct.calcsize(TASK_REC_FMT) == 320
@@ -100,6 +105,42 @@ def format_image(blocks=256, retain=4, store_id=0x4E414E4F58303034, boot_id=0):
     img = bytearray(blocks * BLOCK)
     img[FIRST_DATA * BLOCK:(FIRST_DATA + 1) * BLOCK] = root
     img[0:BLOCK] = pack_super(1, FIRST_DATA, struct.unpack_from("<I", root, BLOCK - 4)[0],
+                              blocks, store_id, retain, boot_id)
+    return bytes(img)
+
+
+def provisioned_image(objects, blocks=256, retain=4, store_id=0x4E414E4F58303034, boot_id=0,
+                      label=b"provision"):
+    """M5: a store whose generation 1 already holds `objects`, a list of
+    (name, kind, bytes): the root in block 2, the extents after it, object
+    ids 1..n, version 1.  The guest's next commit is generation 2."""
+    if not MIN_BLOCKS <= blocks <= MAX_BLOCKS or not RETAIN_MIN <= retain <= RETAIN_MAX:
+        raise ValueError("bad size or retention")
+    if len(objects) > OBJ_MAX:
+        raise ValueError("too many objects")
+    img = bytearray(blocks * BLOCK)
+    body = bytearray(BLOCK)
+    nxt = FIRST_DATA + 1
+    names = set()
+    for i, (name, kind, data) in enumerate(objects):
+        if (not name or len(name) > 27 or set(name) - NAME_CHARS or name in names or
+                len(data) > OBJ_MAX_BYTES):
+            raise ValueError("bad object %r" % name)
+        names.add(name)
+        nblk = (len(data) + BLOCK - 1) // BLOCK
+        if nxt + nblk > blocks:
+            raise ValueError("objects do not fit")
+        img[nxt * BLOCK:nxt * BLOCK + len(data)] = data
+        struct.pack_into(OBJ_FMT, body, OFF_OBJ + 64 * i, i + 1, 1, 1, nxt if nblk else 0,
+                         len(data), crc32(data), kind, nblk, name.encode("ascii"))
+        nxt += nblk
+    hdr = struct.pack(ROOT_HDR_FMT, ROOT_MAGIC, 1, 0, store_id, len(objects) + 1, boot_id,
+                      len(objects), 0, 0, 1, retain, 0, label)
+    body[:128] = hdr
+    body[OFF_LOG:OFF_LOG + 32] = struct.pack(LOG_FMT, 1, boot_id, label)
+    body[BLOCK - 4:] = struct.pack("<I", block_crc(bytes(body)))
+    img[FIRST_DATA * BLOCK:(FIRST_DATA + 1) * BLOCK] = body
+    img[0:BLOCK] = pack_super(1, FIRST_DATA, struct.unpack_from("<I", body, BLOCK - 4)[0],
                               blocks, store_id, retain, boot_id)
     return bytes(img)
 
@@ -432,6 +473,8 @@ def main(argv=None):
     f.add_argument("--blocks", type=int, default=256)
     f.add_argument("--retain", type=int, default=4)
     f.add_argument("--store-id", type=lambda s: int(s, 16), default=0x4E414E4F58303034)
+    f.add_argument("--object", action="append", default=[],
+                   help="NAME=KIND:VALUE or NAME=KIND:@FILE (M5 provisioning)")
     d = sub.add_parser("dump")
     d.add_argument("image")
     c = sub.add_parser("check")
@@ -442,7 +485,18 @@ def main(argv=None):
                    choices=["current-root", "current-super", "both-supers", "current-data"])
     args = ap.parse_args(argv)
     if args.cmd == "format":
-        data = format_image(args.blocks, args.retain, args.store_id)
+        objects = []
+        for spec in args.object:
+            name, rest = spec.split("=", 1)
+            kind, value = rest.split(":", 1)
+            if value.startswith("@"):
+                with open(value[1:], "rb") as fh:
+                    raw = fh.read()
+            else:
+                raw = value.encode("ascii")
+            objects.append((name, int(kind), raw))
+        data = (provisioned_image(objects, args.blocks, args.retain, args.store_id) if objects
+                else format_image(args.blocks, args.retain, args.store_id))
         tmp = args.out + ".tmp"
         with open(tmp, "wb") as fh:
             fh.write(data)

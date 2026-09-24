@@ -25,6 +25,7 @@
 #include "arch/x86_64/timer.h"
 #include "chan.h"
 #include "dev/blk.h"
+#include "dev/virtio_net.h"
 #include "kernel.h"
 #include "m2test.h"
 #include "m3test.h"
@@ -139,8 +140,10 @@ __attribute__((noreturn)) void nx_core_session(const struct nx_core_opts *o)
 
     const uint64_t none[4] = {0, 0, 0, 0};
     struct nx_task *core = nx_test_spawn(mode, "core", "bin/core", none);
-    uint32_t sh, ch = 0, bh = 0;
+    uint32_t sh, ch = 0, bh = 0, nh = 0;
     if (nx_ht_install(&core->handles, nx_sovereign(), NX_RIGHT_SOVEREIGN, &sh) != NX_OK ||
+        (o->net && nx_ht_install(&core->handles, &o->net->base, NX_RIGHT_READ | NX_RIGHT_WRITE,
+                                 &nh) != NX_OK) ||
         (chan && nx_ht_install(&core->handles, &chan->base, NX_RIGHT_READ | NX_RIGHT_WRITE,
                                &ch) != NX_OK) ||
         (o->blk && nx_ht_install(&core->handles, &o->blk->base, NX_RIGHT_READ | NX_RIGHT_WRITE,
@@ -148,7 +151,7 @@ __attribute__((noreturn)) void nx_core_session(const struct nx_core_opts *o)
         fail("%s: cannot install the core's handles", mode);
     nx_task_set_arg(core, 0, sh);
     nx_task_set_arg(core, 1, ch);
-    nx_task_set_arg(core, 2, core_flags);
+    nx_task_set_arg(core, 2, core_flags | (uint64_t)nh << 32);
     nx_task_set_arg(core, 3, bh);
     nx_printf("NANOX: %s core %s#%u sovereign=0x%x rights=0x%x channel=0x%x rights=0x%x"
               " flags=0x%" NX_PRIx64 "%s\n",
@@ -157,6 +160,9 @@ __attribute__((noreturn)) void nx_core_session(const struct nx_core_opts *o)
               o->blk ? " blk=present" : "");
     if (o->blk)
         nx_printf("NANOX: %s core blk=0x%x rights=0x%x\n", mode, bh,
+                  NX_RIGHT_READ | NX_RIGHT_WRITE);
+    if (o->net)
+        nx_printf("NANOX: %s core net=0x%x rights=0x%x\n", mode, nh,
                   NX_RIGHT_READ | NX_RIGHT_WRITE);
 
     nx_sched_watchdog(WATCHDOG_M3, mode);
@@ -171,6 +177,15 @@ __attribute__((noreturn)) void nx_core_session(const struct nx_core_opts *o)
         nx_printf("NANOX: %s bridge rx_bytes=%" NX_PRIu64 " tx_bytes=%" NX_PRIu64
                   " events=%" NX_PRIu64 "\n",
                   mode, chan->rx_bytes, chan->tx_bytes, nx_events.next - 1);
+    if (o->net) {
+        struct nx_net_info ni;
+        nx_net_info(o->net, &ni);
+        nx_printf("NANOX: %s net rx_frames=%" NX_PRIu64 " tx_frames=%" NX_PRIu64
+                  " rx_test_drops=%" NX_PRIu64 " tx_test_drops=%" NX_PRIu64
+                  " tx_link_down=%" NX_PRIu64 " link=%s\n",
+                  mode, ni.rx_frames, ni.tx_frames, ni.rx_test_drops, ni.tx_test_drops,
+                  ni.tx_link_down, ni.flags & NX_NET_INFO_LINK_UP ? "up" : "down");
+    }
     if (o->blk)
         nx_printf("NANOX: %s blk reads=%" NX_PRIu64 " writes=%" NX_PRIu64 " flushes=%" NX_PRIu64
                   " ops=%u pending=%u\n",
@@ -198,7 +213,7 @@ __attribute__((noreturn)) void nx_core_session(const struct nx_core_opts *o)
 
 __attribute__((noreturn)) static void m3_run(const char *mode, uint64_t core_flags)
 {
-    struct nx_core_opts o = {mode, core_flags, 1, 0};
+    struct nx_core_opts o = {mode, core_flags, 1, 0, 0};
     nx_core_session(&o);
 }
 

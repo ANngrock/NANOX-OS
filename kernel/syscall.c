@@ -20,6 +20,8 @@
 #include "arch/x86_64/trap.h"
 #include "chan.h"
 #include "dev/blk.h"
+#include "dev/rtc.h"
+#include "dev/virtio_net.h"
 #include "initramfs.h"
 #include "kernel.h"
 #include "m2test.h"
@@ -601,6 +603,102 @@ static int64_t sys_blk_flush(struct nx_task *t, uint64_t h)
     return st == NX_OK ? 0 : -st;
 }
 
+/* ---- M5: network device, entropy, clock --------------------------------------- */
+
+static struct nx_netdev *net_lookup(struct nx_task *t, uint64_t h, uint32_t need, int *st)
+{
+    struct nx_object *o = 0;
+    *st = h > UINT32_MAX ? NX_EBADHANDLE
+                         : nx_ht_lookup(&t->handles, (uint32_t)h, NX_OBJ_NETDEV, need, &o, 0);
+    return (struct nx_netdev *)o;
+}
+
+static uint8_t netbuf[NX_NET_FRAME_MAX];
+
+static int64_t sys_net_info(struct nx_task *t, uint64_t h, uint64_t va)
+{
+    int st;
+    struct nx_netdev *n = net_lookup(t, h, NX_RIGHT_READ, &st);
+    if (!n)
+        return -st;
+    struct nx_net_info info;
+    nx_net_info(n, &info);
+    st = copy_out(t, va, &info, sizeof(info));
+    return st == NX_OK ? 0 : -st;
+}
+
+static int64_t sys_net_send(struct nx_task *t, uint64_t h, uint64_t va, uint64_t len)
+{
+    int st;
+    struct nx_netdev *n = net_lookup(t, h, NX_RIGHT_WRITE, &st);
+    if (!n)
+        return -st;
+    if (len < NX_NET_FRAME_MIN || len > NX_NET_FRAME_MAX)
+        return -NX_EINVAL;
+    st = copy_in(t, netbuf, va, len);
+    if (st == NX_OK)
+        st = nx_net_send(n, netbuf, (uint32_t)len);
+    return st == NX_OK ? (int64_t)len : -st;
+}
+
+/* Polled receive like CHAN_READ: poll the used ring, then sleep one tick
+ * between polls until `timeout` ticks have passed (0: do not wait). */
+#define NET_SPIN_POLLS 2000u
+
+static int64_t sys_net_recv(struct nx_task *t, uint64_t h, uint64_t va, uint64_t cap,
+                            uint64_t timeout)
+{
+    int st;
+    if (!net_lookup(t, h, NX_RIGHT_READ, &st))
+        return -st;
+    if (cap < NX_NET_FRAME_MAX || cap > 65536 || timeout > NX_NET_TIMEOUT_MAX)
+        return -NX_EINVAL;
+    st = check_out(t, va, NX_NET_FRAME_MAX);
+    if (st != NX_OK)
+        return -st;
+    for (uint64_t waited = 0;; waited++) {
+        struct nx_netdev *n = net_lookup(t, h, NX_RIGHT_READ, &st); /* again after sleeping */
+        if (!n)
+            return -st;
+        uint32_t len = 0;
+        for (uint32_t i = 0; i < NET_SPIN_POLLS && len == 0; i++)
+            len = nx_net_poll(n, netbuf);
+        if (len) {
+            copy_out(t, va, netbuf, len);
+            return len;
+        }
+        if (waited >= timeout)
+            return 0;
+        nx_task_sleep(1);
+    }
+}
+
+static int64_t sys_entropy(struct nx_task *t, uint64_t va, uint64_t len)
+{
+    static uint8_t tmp[NX_ENTROPY_MAX];
+    if (len == 0 || len > NX_ENTROPY_MAX)
+        return -NX_EINVAL;
+    int st = check_out(t, va, len);
+    if (st == NX_OK)
+        st = nx_rng_read(tmp, (uint32_t)len);
+    if (st != NX_OK)
+        return -st;
+    copy_out(t, va, tmp, len);
+    return (int64_t)len;
+}
+
+static int64_t sys_clock(struct nx_task *t, uint64_t va)
+{
+    struct nx_clock c;
+    memset(&c, 0, sizeof(c));
+    c.ticks = nx_timer_ticks;
+    c.hz = NX_TIMER_HZ;
+    c.unix_s = nx_rtc_now(c.ticks, c.hz);
+    c.source = c.unix_s ? NX_CLOCK_SRC_RTC : 0;
+    int st = copy_out(t, va, &c, sizeof(c));
+    return st == NX_OK ? 0 : -st;
+}
+
 void nx_syscall(struct nx_trap_frame *f)
 {
     struct nx_task *t = nx_current;
@@ -646,6 +744,11 @@ void nx_syscall(struct nx_trap_frame *f)
     case NX_SYS_BLK_READ: r = sys_blk_read(t, a, b, c, d); break;
     case NX_SYS_BLK_WRITE: r = sys_blk_write(t, a, b, c, d); break;
     case NX_SYS_BLK_FLUSH: r = sys_blk_flush(t, a); break;
+    case NX_SYS_NET_INFO: r = sys_net_info(t, a, b); break;
+    case NX_SYS_NET_SEND: r = sys_net_send(t, a, b, c); break;
+    case NX_SYS_NET_RECV: r = sys_net_recv(t, a, b, c, d); break;
+    case NX_SYS_ENTROPY: r = sys_entropy(t, a, b); break;
+    case NX_SYS_CLOCK: r = sys_clock(t, a); break;
     default: r = -NX_ENOSYS; break;
     }
     f->rax = (uint64_t)r;
