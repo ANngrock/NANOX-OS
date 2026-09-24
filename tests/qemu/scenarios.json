@@ -1,0 +1,377 @@
+{
+  "schema": "nanox.scenarios.v1",
+  "default_timeout_s": 60,
+  "scenarios": [
+    {
+      "name": "normal",
+      "description": "Normal boot: verified kernel and initramfs, boot info check, own GDT/IDT/stacks, allocator, page tables, reclaim, self-tests, timer, TEST PASS.",
+      "image": {
+        "cmdline": ""
+      },
+      "expect": {
+        "verdict": "PASS",
+        "patterns": [
+          "^NANOX: kernel sha256 {kernel_sha256}$",
+          "^NANOX: bootinfo acpi_rsdp=0x[0-9a-f]+$",
+          "^NANOX: initramfs ok entries=3 bytes=[0-9]+ sha256={initrd_sha256}$",
+          "^NANOX: initramfs release \"NANOX-OS initramfs M1\"$",
+          "^NANOX: cpu gdt\\+tss\\+idt loaded ",
+          "^NANOX: selftest breakpoint ok resumed=2$",
+          "^NANOX: pmm ok span_pages=[0-9]+ managed=[1-9][0-9]* ",
+          "^NANOX: vmm ok root=0x[0-9a-f]+ physmap=0xffff800000000000 .* text=r-x rodata=r-- data=rw- guards=4 null=unmapped$",
+          "^NANOX: pmm reclaimed boot_reclaimable=([1-9][0-9]*) loader_stack=16 pages poisoned=[1-9][0-9]* free=[0-9]+$",
+          "^NANOX: selftest pmm ok pages=256 ",
+          "^NANOX: selftest vmm ok ",
+          "^NANOX: timer ok source=lapic vector=0x40 hz=100 lapic_per_10ms=[0-9]+ window_ms=300 ticks=[0-9]+ expected=30 ",
+          "^NANOX: vmm ok .* ram_mapped=2(5[0-9]|6[0-2])[0-9][0-9][0-9]KiB "
+        ]
+      }
+    },
+    {
+      "name": "fail",
+      "description": "Kernel reports a deliberate test failure (nanox.test=fail).",
+      "image": {
+        "cmdline": "nanox.test=fail"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail"
+      }
+    },
+    {
+      "name": "unknown-test",
+      "description": "Unknown nanox.test value is a test failure, not a silent pass.",
+      "image": {
+        "cmdline": "nanox.test=bogus"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail"
+      }
+    },
+    {
+      "name": "panic",
+      "description": "Kernel panic path (nanox.test=panic).",
+      "image": {
+        "cmdline": "nanox.test=panic"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "panic",
+        "patterns": [
+          "^NANOX: PANIC requested by nanox.test=panic$"
+        ],
+        "backtrace_functions": [
+          "kernel_main"
+        ]
+      }
+    },
+    {
+      "name": "hang",
+      "description": "Kernel halts forever; only the harness timeout ends the run.",
+      "image": {
+        "cmdline": "nanox.test=hang"
+      },
+      "timeout_s": 20,
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "timeout",
+        "patterns": [
+          "^NANOX: kernel_main ",
+          "^NANOX: test hang"
+        ]
+      }
+    },
+    {
+      "name": "missing-kernel",
+      "description": "KERNEL.ELF absent from the ESP.",
+      "image": {
+        "omit_kernel": true
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "loader_error",
+        "loader_error": "E_KERNEL_OPEN"
+      }
+    },
+    {
+      "name": "corrupt-kernel",
+      "description": "One byte of KERNEL.ELF flipped after the manifest was written.",
+      "image": {
+        "corrupt_kernel": true
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "loader_error",
+        "loader_error": "E_KERNEL_HASH"
+      }
+    },
+    {
+      "name": "framebuffer",
+      "description": "Canonical config plus one VGA device: exercises the optional framebuffer fields.",
+      "image": {
+        "cmdline": ""
+      },
+      "qemu_extra": [
+        "-device",
+        "VGA"
+      ],
+      "expect": {
+        "verdict": "PASS",
+        "patterns": [
+          "^NANOX: bootinfo framebuffer [0-9]+x[0-9]+ pitch=[0-9]+ format=[12] base=0x[0-9a-f]+$"
+        ]
+      }
+    },
+    {
+      "name": "missing-initrd",
+      "description": "INITRD.IMG absent from the ESP.",
+      "image": {
+        "omit_initrd": true
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "loader_error",
+        "loader_error": "E_INITRD_OPEN"
+      }
+    },
+    {
+      "name": "corrupt-initrd",
+      "description": "One byte of INITRD.IMG flipped after the manifest was written.",
+      "image": {
+        "corrupt_initrd": true
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "loader_error",
+        "loader_error": "E_INITRD_HASH"
+      }
+    },
+    {
+      "name": "bad-initrd",
+      "description": "Initramfs that matches the manifest but is not a cpio archive (150 bytes of text): rejected by the kernel.",
+      "image": {
+        "initrd_text": "NANOX test: this text is not a cpio newc archive. NANOX test: this text is not a cpio newc archive. NANOX test: this text is not a cpio newc archive. "
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "panic",
+        "patterns": [
+          "^NANOX: PANIC initramfs invalid: E_MAGIC at offset 0$"
+        ]
+      }
+    },
+    {
+      "name": "ud",
+      "description": "Deliberate #UD (ud2) must be caught by the kernel IDT and reported.",
+      "image": {
+        "cmdline": "nanox.test=ud"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "exception",
+        "exception": {
+          "mnemonic": "#UD",
+          "vector": 6,
+          "error": 0,
+          "rip_function": "nx_fault_ud"
+        },
+        "backtrace_functions": [
+          "kernel_main"
+        ]
+      }
+    },
+    {
+      "name": "gp",
+      "description": "Deliberate #GP (load through a non-canonical address).",
+      "image": {
+        "cmdline": "nanox.test=gp"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "exception",
+        "exception": {
+          "mnemonic": "#GP",
+          "vector": 13,
+          "error": 0,
+          "rip_function": "nx_fault_gp"
+        },
+        "backtrace_functions": [
+          "kernel_main"
+        ]
+      }
+    },
+    {
+      "name": "divzero",
+      "description": "Deliberate #DE (division by zero).",
+      "image": {
+        "cmdline": "nanox.test=divzero"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "exception",
+        "exception": {
+          "mnemonic": "#DE",
+          "vector": 0,
+          "error": 0,
+          "rip_function": "nx_fault_divzero"
+        },
+        "backtrace_functions": [
+          "kernel_main"
+        ]
+      }
+    },
+    {
+      "name": "pagefault",
+      "description": "Deliberate write to an address the kernel never maps: #PF with verifiable diagnostics.",
+      "image": {
+        "cmdline": "nanox.test=pagefault"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "exception",
+        "exception": {
+          "mnemonic": "#PF",
+          "vector": 14,
+          "error": 2,
+          "cr2": "0xdead0000",
+          "rip_function": "nx_fault_pagefault"
+        },
+        "backtrace_functions": [
+          "kernel_main"
+        ],
+        "patterns": [
+          "^NANOX: EXCEPTION #PF present=0 write=1 user=0 reserved=0 fetch=0$",
+          "^NANOX: EXCEPTION #PF mapping va=0x00000000dead0000 not-mapped$"
+        ]
+      }
+    },
+    {
+      "name": "nullderef",
+      "description": "Read through a null pointer: the null page is not mapped.",
+      "image": {
+        "cmdline": "nanox.test=nullderef"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "exception",
+        "exception": {
+          "mnemonic": "#PF",
+          "vector": 14,
+          "error": 0,
+          "cr2": "0x0",
+          "rip_function": "nx_fault_nullderef"
+        },
+        "backtrace_functions": [
+          "kernel_main"
+        ],
+        "patterns": [
+          "^NANOX: EXCEPTION #PF mapping va=0x0000000000000000 not-mapped$"
+        ]
+      }
+    },
+    {
+      "name": "wprotect",
+      "description": "Write to .rodata: mapped read-only, CR0.WP set.",
+      "image": {
+        "cmdline": "nanox.test=wprotect"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "exception",
+        "exception": {
+          "mnemonic": "#PF",
+          "vector": 14,
+          "error": 3,
+          "rip_function": "nx_fault_wprotect"
+        },
+        "backtrace_functions": [
+          "kernel_main"
+        ],
+        "patterns": [
+          "^NANOX: EXCEPTION #PF present=1 write=1 user=0 reserved=0 fetch=0$",
+          "^NANOX: EXCEPTION #PF mapping va=0x[0-9a-f]+ pa=0x[0-9a-f]+ size=4K perms=r--$"
+        ]
+      }
+    },
+    {
+      "name": "nxexec",
+      "description": "Jump into writable data: mapped non-executable (EFER.NXE).",
+      "image": {
+        "cmdline": "nanox.test=nxexec"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "exception",
+        "exception": {
+          "mnemonic": "#PF",
+          "vector": 14,
+          "error": 17,
+          "cr2_is_rip": true
+        },
+        "backtrace_functions": [
+          "kernel_main"
+        ],
+        "patterns": [
+          "^NANOX: EXCEPTION #PF present=1 write=0 user=0 reserved=0 fetch=1$",
+          "^NANOX: EXCEPTION #PF mapping va=0x[0-9a-f]+ pa=0x[0-9a-f]+ size=4K perms=rw-$"
+        ]
+      }
+    },
+    {
+      "name": "stackoverflow",
+      "description": "Unbounded recursion hits the unmapped guard page below the boot stack; #DF on its IST stack.",
+      "image": {
+        "cmdline": "nanox.test=stackoverflow"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "exception",
+        "exception": {
+          "mnemonic": "#DF",
+          "vector": 8,
+          "error": 0,
+          "rip_function": "nx_fault_stack_overflow"
+        },
+        "backtrace_functions": [
+          "nx_fault_stack_overflow"
+        ],
+        "patterns": [
+          "^NANOX: EXCEPTION stack overflow: guard page of stack boot hit at 0x[0-9a-f]+$"
+        ]
+      }
+    },
+    {
+      "name": "doublefree",
+      "description": "Freeing a page twice: the physical allocator refuses and the kernel panics.",
+      "image": {
+        "cmdline": "nanox.test=doublefree"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "panic",
+        "patterns": [
+          "^NANOX: PANIC pmm: free of page 0x[0-9a-f]+ rejected: E_DOUBLE_FREE$"
+        ],
+        "backtrace_functions": [
+          "nx_page_free",
+          "kernel_main"
+        ]
+      }
+    },
+    {
+      "name": "timer-masked",
+      "description": "Timer LVT deliberately left masked: the kernel's timer check must detect missing interrupts.",
+      "image": {
+        "cmdline": "nanox.test=timer-masked"
+      },
+      "expect": {
+        "verdict": "FAIL",
+        "failure_class": "test_fail",
+        "patterns": [
+          "^NANOX: TEST FAIL timer: no timer interrupts in the window \\(ticks=0 expected=30\\)$"
+        ]
+      }
+    }
+  ]
+}

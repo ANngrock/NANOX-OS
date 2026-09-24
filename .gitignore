@@ -1,0 +1,8 @@
+# Build outputs, scenario images, run records (make distclean removes all)
+/out/
+# Nix
+/result
+/result-*
+# Python
+__pycache__/
+*.pyc
