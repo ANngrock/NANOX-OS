@@ -29,7 +29,7 @@ static void *fake_virt(void *ctx, uint64_t phys)
     return arena + (phys - ARENA_BASE);
 }
 
-static const struct nx_pt_env ENV = {fake_alloc, fake_virt, 0};
+static const struct nx_pt_env ENV = {fake_alloc, fake_virt, 0, 0};
 
 static uint64_t fresh_root(unsigned limit)
 {
@@ -83,7 +83,13 @@ void test_pt(void)
                  NX_PT_E_NONCANONICAL);
     CHECK_EQ_INT(nx_pt_map(&ENV, root, 0x600000, 1ull << 52, NX_PAGE_4K, 0), NX_PT_E_RANGE);
     CHECK_EQ_INT(nx_pt_map(&ENV, root, 0x600000, 0x1000, NX_PAGE_4K, NX_PTE_PS), NX_PT_E_FLAGS);
-    CHECK_EQ_INT(nx_pt_map(&ENV, root, 0x600000, 0x1000, NX_PAGE_4K, 1ull << 9), NX_PT_E_FLAGS);
+    /* Bit 9 is NX_PTE_OWNED (M2); the other software bits stay reserved. */
+    CHECK_EQ_INT(nx_pt_map(&ENV, root, 0x600000, 0x1000, NX_PAGE_4K, 1ull << 10), NX_PT_E_FLAGS);
+    CHECK_EQ_INT(nx_pt_map(&ENV, root, 0x600000, 0x1000, NX_PAGE_4K, 1ull << 11), NX_PT_E_FLAGS);
+    CHECK_EQ_INT(nx_pt_map(&ENV, root, 0x600000, 0x1000, NX_PAGE_4K, 1ull << 52), NX_PT_E_FLAGS);
+    CHECK_EQ_INT(nx_pt_map(&ENV, root, 0x600000, 0x1000, NX_PAGE_4K, NX_PTE_OWNED | NX_PTE_U),
+                 NX_PT_OK);
+    expect_query(root, 0x600000, 0x1000, NX_PAGE_4K, NX_PTE_OWNED | NX_PTE_U);
 
     /* Top of the canonical higher half. */
     CHECK_EQ_INT(nx_pt_map(&ENV, root, 0xFFFFFFFFFFFFF000ull, 0x9000, NX_PAGE_4K, RWNX), NX_PT_OK);

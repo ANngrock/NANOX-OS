@@ -19,10 +19,14 @@
 #define NX_PTE_D (1ull << 6)
 #define NX_PTE_PS (1ull << 7)
 #define NX_PTE_G (1ull << 8)
+/* Software bit (AVL): the page belongs to the address space and is freed
+ * with it (as opposed to pages of a shared memory object). */
+#define NX_PTE_OWNED (1ull << 9)
 #define NX_PTE_NX (1ull << 63)
 #define NX_PTE_ADDR 0x000FFFFFFFFFF000ull
 /* Flags a caller may request for a leaf (P is implied). */
-#define NX_PT_LEAF_FLAGS (NX_PTE_W | NX_PTE_U | NX_PTE_PWT | NX_PTE_PCD | NX_PTE_G | NX_PTE_NX)
+#define NX_PT_LEAF_FLAGS                                                                           \
+    (NX_PTE_W | NX_PTE_U | NX_PTE_PWT | NX_PTE_PCD | NX_PTE_G | NX_PTE_OWNED | NX_PTE_NX)
 
 #define NX_PAGE_4K 0x1000ull
 #define NX_PAGE_2M 0x200000ull
@@ -34,6 +38,8 @@ struct nx_pt_env {
     uint64_t (*alloc)(void *ctx);
     /* Returns a pointer through which the page at `phys` can be accessed. */
     void *(*virt)(void *ctx, uint64_t phys);
+    /* Returns a page-table page (used by nx_pt_destroy_slots only). */
+    void (*free)(void *ctx, uint64_t phys);
     void *ctx;
 };
 
@@ -65,6 +71,13 @@ int nx_pt_unmap(const struct nx_pt_env *env, uint64_t root, uint64_t va, uint64_
 int nx_pt_query(const struct nx_pt_env *env, uint64_t root, uint64_t va, uint64_t *pa,
                 uint64_t *flags, uint64_t *size);
 int nx_pt_is_canonical(uint64_t va);
+/* Tears down PML4 slots [first, last]: calls `leaf` for every mapped leaf
+ * (physical base, leaf flags, size), frees every table page below those
+ * slots through env->free and clears the PML4 entries. */
+void nx_pt_destroy_slots(const struct nx_pt_env *env, uint64_t root, unsigned first,
+                         unsigned last,
+                         void (*leaf)(void *ctx, uint64_t pa, uint64_t flags, uint64_t size),
+                         void *leaf_ctx);
 const char *nx_pt_strerror(int status);
 
 #endif

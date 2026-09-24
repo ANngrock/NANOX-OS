@@ -1,5 +1,5 @@
 /*
- * Panic report (M1).  Format of the serial lines: docs/m1-kernel.md
+ * Panic report (M1, task stacks since M2).  Format of the serial lines: docs/m1-kernel.md
  * ("Отчёт о panic и исключениях").  The harness symbolises the addresses in
  * the BACKTRACE lines with the symbol table of out/kernel.elf.
  */
@@ -13,6 +13,7 @@
 #include "arch/x86_64/trap.h"
 #include "kernel.h"
 #include "mm/mm.h"
+#include "task.h"
 
 #define BACKTRACE_MAX 32
 
@@ -38,7 +39,8 @@ static const struct stack_range stacks[] = {
     {"ist-mc", __ist_mc_guard, __ist_mc_bottom, __ist_mc_top},
 };
 
-/* A frame record [rbp, rbp + 16) must lie inside one kernel stack. */
+/* A frame record [rbp, rbp + 16) must lie inside one kernel stack (a fixed
+ * stack or a task kernel stack, M2).  User stacks are never followed. */
 static int frame_readable(uint64_t rbp)
 {
     if (rbp & 7)
@@ -49,7 +51,7 @@ static int frame_readable(uint64_t rbp)
         if (rbp >= lo && rbp + 16 <= hi)
             return 1;
     }
-    return 0;
+    return nx_task_stack_readable(rbp);
 }
 
 static void backtrace_from(uint64_t rbp, unsigned index)
@@ -140,11 +142,18 @@ void nx_fatal_trap(struct nx_trap_frame *f)
                   (unsigned)(f->error >> 4 & 1));
     if (f->vector == NX_VEC_PF)
         nx_vmm_describe("NANOX: EXCEPTION #PF mapping", cr2);
-    const char *guard = guard_page_of(cr2);
+    const char *guard = guard_page_of(cr2), *task_guard = nx_task_guard_of(cr2);
     if (guard && (f->vector == NX_VEC_PF || f->vector == NX_VEC_DF))
         nx_printf("NANOX: EXCEPTION stack overflow: guard page of stack %s hit at 0x%016" NX_PRIx64
                   "\n",
                   guard, cr2);
+    if (task_guard && (f->vector == NX_VEC_PF || f->vector == NX_VEC_DF))
+        nx_printf("NANOX: EXCEPTION stack overflow: guard page of the kernel stack of task %s"
+                  " hit at 0x%016" NX_PRIx64 "\n",
+                  task_guard, cr2);
+    if (nx_current)
+        nx_printf("NANOX: EXCEPTION in kernel mode, current task %s#%u\n", nx_current->name,
+                  nx_current->id);
     if (f->vector >= 32)
         nx_printf("NANOX: EXCEPTION unexpected interrupt vector %" NX_PRIu64 "\n", f->vector);
     dump_registers(f, cr2);

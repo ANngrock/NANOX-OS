@@ -31,7 +31,7 @@ LOADER_CFLAGS := --target=x86_64-unknown-windows $(FREESTANDING_FLAGS) -O2 \
 LOADER_LDFLAGS := /subsystem:efi_application /entry:efi_main /nodefaultlib \
     /machine:x64 /Brepro
 
-LOADER_SRCS := boot/uefi/loader.c boot/uefi/elf_plan.c boot/uefi/mmap_convert.c \
+LOADER_SRCS := boot/uefi/loader.c lib/elf_plan.c boot/uefi/mmap_convert.c \
     lib/serial.c lib/printf.c lib/string.c lib/sha256.c
 LOADER_OBJS := $(patsubst %.c,$(BUILD)/loader/%.obj,$(LOADER_SRCS))
 
@@ -46,8 +46,10 @@ KERNEL_LDFLAGS := -nostdlib -static --build-id=none -z max-page-size=4096 \
 
 KERNEL_CSRCS := kernel/main.c kernel/panic.c kernel/bootinfo_check.c \
     kernel/initramfs.c kernel/faults.c kernel/arch/x86_64/gdt.c \
-    kernel/arch/x86_64/idt.c kernel/arch/x86_64/timer.c kernel/mm/pmm.c kernel/mm/pt.c kernel/mm/vmm.c \
-    lib/serial.c lib/printf.c lib/string.c lib/sha256.c
+    kernel/arch/x86_64/idt.c kernel/arch/x86_64/timer.c kernel/mm/pmm.c kernel/mm/pt.c \
+    kernel/mm/vmm.c kernel/mm/uaccess.c kernel/obj/handle.c kernel/obj/ipc.c \
+    kernel/obj/objects.c kernel/task.c kernel/syscall.c \
+    lib/elf_plan.c lib/serial.c lib/printf.c lib/string.c lib/sha256.c
 KERNEL_ASRCS := kernel/arch/x86_64/entry.S kernel/arch/x86_64/isr.S
 KERNEL_OBJS := $(patsubst %.c,$(BUILD)/kernel/%.o,$(KERNEL_CSRCS)) \
     $(patsubst %.S,$(BUILD)/kernel/%.o,$(KERNEL_ASRCS))
@@ -110,10 +112,11 @@ HOST_TEST_SRCS := tests/host/test_main.c tests/host/test_bootinfo.c \
     tests/host/test_sha256.c tests/host/test_elf.c tests/host/test_mmap.c \
     tests/host/test_initramfs.c tests/host/test_pt.c tests/host/test_pmm.c \
     kernel/bootinfo_check.c kernel/initramfs.c kernel/mm/pt.c kernel/mm/pmm.c \
-    boot/uefi/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c
+    lib/elf_plan.c boot/uefi/mmap_convert.c lib/sha256.c
 
 $(OUT)/host/test_host: $(HOST_TEST_SRCS) tests/host/test.h \
-    $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h kernel/mm/*.h boot/uefi/*.h)
+    $(wildcard abi/nanox/*.h lib/include/nanox/*.h kernel/*.h kernel/mm/*.h kernel/obj/*.h \
+        boot/uefi/*.h)
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $(HOST_TEST_SRCS)
 

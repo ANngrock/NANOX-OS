@@ -29,7 +29,7 @@
 #include <nanox/string.h>
 
 #include "efi.h"
-#include "elf_plan.h"
+#include <nanox/elf_plan.h>
 #include "mmap_convert.h"
 
 #define KERNEL_STACK_PAGES 16u /* 64 KiB */
@@ -302,7 +302,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab)
     memset(kmem, 0, plan.span_end - plan.span_base);
     for (uint32_t i = 0; i < plan.segment_count; i++) {
         const struct nx_elf_segment *s = &plan.segments[i];
-        memcpy(kmem + (s->phys_addr - plan.span_base), kfile + s->file_offset, s->file_size);
+        memcpy(kmem + (s->addr - plan.span_base), kfile + s->file_offset, s->file_size);
     }
     BS->FreePool(kfile);
     nx_printf("NANOX: loader kernel loaded span=0x%" NX_PRIx64 "-0x%" NX_PRIx64
