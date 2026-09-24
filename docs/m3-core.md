@@ -337,6 +337,11 @@ KVM). В рабочем дереве выполнено:
 - `make repro-check` — `BOOTX64.EFI`, `kernel.elf`, `initrd.img` (с
   `bin/core` и `bin/load`) и `nanox.img` побайтово совпали в трёх сборках;
 - `make debug-check` — GDB остановился в `kernel_main`.
+- после публикации ветки: `make doctor && make && make test` в свежем
+  `git clone` — код выхода 0, те же 794 проверки, 55 Python-тестов и 33
+  сценария;
+- промежуточный коммит только гостевой части (без host bridge) отдельно
+  проходит `make test` (26 сценариев M0–M2).
 
 Что входит в `make test` для M3:
 
