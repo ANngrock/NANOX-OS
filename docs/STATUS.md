@@ -244,6 +244,91 @@ replay PASS и FAIL совпали
 (`out/runs/1790345120357154504-900379-pass-replay-play/replay-comparison.json`,
 `out/runs/1790345159487682655-900379-kernel-fail-replay-play/replay-comparison.json`).
 
+## Срез M5-3, часть Claude: `crates/net-tcp` (2026-09-25)
+
+Крупный срез M5-3 выполняют оба агента: Claude — TCP, Codex —
+`crates/net-stack` (ARP, DNS-транспорт, IPv4-демультиплексор TCP/UDP,
+детерминированный симулятор). Перекрёстное ревью Codex выполнено, но найдены
+два дефекта; до их исправления срез не принят.
+
+- `crates/net-tcp`: `no_std`, без `alloc`, `#![forbid(unsafe_code)]`,
+  зависимость только `net-wire`. Кодек сегмента и клиентское соединение
+  **ограниченного профиля** [M5-TCP](specs/M5-TCP.md), не полный RFC 9293:
+  активное открытие, состояния до TIME-WAIT, RTO по RFC 6298 с Karn,
+  slow start/congestion avoidance по RFC 5681, persist-пробы нулевого окна,
+  арифметика по модулю 2³², RST/SYN по RFC 5961. Не входят: fast
+  retransmit, SACK, window scaling, timestamps, пассивное открытие, urgent,
+  пересборка вне порядка — полный список в §6 профиля.
+- Тесты: 7 в `crates/net-tcp/tests/segment.rs`, 18 в
+  `crates/net-tcp/tests/connection.rs`; найденный ими дефект (повтор FIN
+  после его подтверждения) исправлен до сдачи.
+- `net-tcp` добавлен в workspace и в host-тесты `cargo xtask test`.
+
+Проверка в основном checkout (`b8913fa` + рабочее дерево, `dirty: true`),
+каждая команда в `nix develop`; логи — `out/net-tcp-checks-20260925T145325Z/`:
+
+- clippy `-D warnings` для `boot-protocol`, `net-wire`, `net-tcp`, `xtask`;
+  сборка `net-wire` и `net-tcp` для `x86_64-unknown-none`; fmt, fixtures,
+  doctor, `git diff --check` — exit 0.
+- `cargo xtask test --replay` — exit 0: 84 host-теста
+  (6 + 16 + 18 + 7 + 14 + 14 + 9), семь QEMU-сценариев
+  (`out/runs/1790348008018025298-943896-suite/suite.json`), replay PASS и
+  FAIL совпали
+  (`out/runs/1790348122850590655-943896-pass-replay-play/replay-comparison.json`,
+  `out/runs/1790348162100999785-943896-kernel-fail-replay-play/replay-comparison.json`).
+- TCP в QEMU не исполняется: драйвера и стека в guest нет.
+
+### Перекрёстное ревью Codex (2026-09-25): нужны исправления
+
+1. `crates/net-tcp/src/conn.rs`, `receive_data`, строки 541–548: полностью
+   повторённый сегмент, заканчивающийся ровно на `RCV.NXT`, имеет
+   `skip == payload.len()`. Ветка проверяет только `skip > len`, затем
+   обнуляет payload и не ставит `ack_pending`; потерянный ACK не будет
+   восстановлен дубликатом до RTO. Добавить ACK и тест точного повтора
+   предыдущего полного сегмента; существующий тест покрывает только случай
+   `skip > len`.
+2. `crates/net-tcp/src/conn.rs`, `rtt_update` и `run_timers`, строки 342–348,
+   601, 605, 611: арифметика времени (`3 * rttvar`, `7 * srtt`, `4 * rttvar`,
+   `rto * 2`, `persist_interval * 2`, `retries += 1`) может переполниться
+   при допустимых публичных значениях `now_ms`/`Config`/`max_retries`; в
+   debug это panic, в release — wrap. Ограничить допустимые пределы конфигурации
+   и/или использовать saturating/widened arithmetic; добавить граничные тесты.
+
+## Срез M5-4, часть Codex: `crates/net-stack` (2026-09-25)
+
+Добавлен host-only crate, зависящий от собственных `net-wire` и `net-tcp`:
+
+- фиксированная ARP neighbor cache с внешними монотонными ticks, лимитом
+  повторов, expiry, конфликтным обучением без молчаливой замены и явным
+  `TableFull`; политика не объявляется защитой от ARP spoofing;
+- однопоточный DNS-over-UDP driver: retries с экспоненциальным backoff,
+  вращение ID, проверка DNS server/портов/current ID, устаревшие и неверные
+  ответы не завершают транзакцию; ID seed детерминированный, не CSPRNG;
+- single-interface IPv4/UDP/TCP/ICMP demux; ARP target/MAC согласуются с
+  локальным интерфейсом, TCP и UDP проходят checksum validation;
+- две end-to-end host-сценария: ARP → TCP handshake → данные в обе стороны →
+  active close; fault-вариант отбрасывает первый SYN, дублирует SYN/data и
+  переупорядочивает data относительно handshake ACK. Оба используют реальный
+  `net_tcp::Connection`; peer TCP в тесте — ограниченная модель, не полный
+  TCP listener.
+
+Тесты `crates/net-stack/tests/{arp,dns_client,demux,simulation}.rs`: 17
+прошли. Общий прогон в основном checkout (`b8913fa` + грязное дерево) выполнен
+в WSL через Nix offline devShell; логи — `out/net-stack-checks-20260925T151900Z/`:
+
+- `cargo clippy --locked -p boot-protocol -p net-wire -p net-tcp -p net-stack -p xtask --all-targets -- -D warnings` — exit 0 (`clippy.log`);
+- `cargo check --locked -p net-wire -p net-tcp -p net-stack --target x86_64-unknown-none` — exit 0 (`target-check.log`);
+- `cargo fmt --all -- --check`, `python3 tests/fixtures/generate.py --check`,
+  `cargo xtask doctor`, `git diff --check` — exit 0 (`fmt.log`,
+  `fixtures.log`, `doctor.log`; diff check также выполнен);
+- `cargo xtask test --replay` — exit 0: 101 host-тест, 7/7 QEMU M0
+  сценариев (`out/runs/1790349569896467371-966873-suite/suite.json`);
+  PASS- и FAIL-replay совпали (`out/runs/1790349685434394096-966873-pass-replay-play/replay-comparison.json`,
+  `out/runs/1790349724811895091-966873-kernel-fail-replay-play/replay-comparison.json`).
+- Сетевой guest path не проверен: QEMU profile остаётся `network=none`.
+
+M5 остаётся незавершённым; criteria ROADMAP не отмечались.
+
 ## Известный долг
 
 - `docs/specs/machine-profile.toml` входит в source fingerprint, но не
@@ -268,10 +353,10 @@ replay PASS и FAIL совпали
 
 Отдельными задачами, по одной:
 
-По указанию пользователя приоритет — M5, затем остальные этапы. Срез M5-1
-принят; M5-2 (DNS) ожидает ревью. Следующий host-проверяемый шаг M5 без
-M1–M4 — ARP neighbor cache фиксированной ёмкости с внешним временем. Затем
-M1–M4, интеграция M5 и M6–M10 по ROADMAP.
+По указанию пользователя приоритет — M5, затем остальные этапы. M5-1 и M5-2
+приняты; host-срез M5-4 реализован и проверен. M5-3 требует двух исправлений
+по перекрёстному ревью выше. После исправления и ревью частей Claude/Codex —
+M1–M4, затем интеграция M5 и M6–M10 по ROADMAP.
 
 1. ~~Clippy-долг~~ — выполнено и принято, см. «Срез 1: Clippy».
 2. Полная сверка runtime-профиля с `docs/specs/machine-profile.toml`: все

@@ -93,6 +93,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-stack"
+version = "0.1.0"
+dependencies = [
+ "net-tcp",
+ "net-wire",
+]
+
+[[package]]
+name = "net-tcp"
+version = "0.1.0"
+dependencies = [
+ "net-wire",
+]
+
+[[package]]
 name = "net-wire"
 version = "0.1.0"
 

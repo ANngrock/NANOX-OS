@@ -1,8 +1,10 @@
 # M5: сеть, ключи и нативный API provider
 
-Статус: контракт этапа. Реализованы срезы M5-1 (кодеки кадров и заголовков)
-и M5-2 (кодек DNS) в `crates/net-wire`; остальное — требования. Ни один критерий M5 в [ROADMAP](../ROADMAP.md) не
-выполнен.
+Статус: контракт этапа. Реализованы host-проверяемые срезы M5-1
+(`crates/net-wire`), M5-2 (DNS codec в `net-wire::dns`), M5-3
+(`crates/net-tcp`, ограниченный TCP-профиль) и M5-4 (`crates/net-stack`,
+ARP/DNS transport/demux). Это не завершает этап: ни один критерий M5 в
+[ROADMAP](../ROADMAP.md) не выполнен.
 
 ## 1. Порядок работ
 
@@ -23,12 +25,15 @@
 ## 2. Слои
 
 1. `crates/net-wire` — чистые кодеки кадров и заголовков (M5-1) и DNS-кодек
-   stub resolver (M5-2).
-2. Драйвер virtio-net в userspace: очереди, DMA, link state.
-3. Сетевой сервис: ARP cache, IPv4 routing для одного интерфейса, ICMP
-   echo, UDP sockets, DNS stub, TCP, таймеры.
-4. Entropy/CSPRNG, криптография и TLS 1.3 с проверкой сертификатов.
-5. Клиент provider с потоковыми ответами и восстановлением соединения.
+   stub resolver (M5-2). `crates/net-tcp` — кодек TCP и клиентское
+   соединение ограниченного профиля (M5-3, [M5-TCP](M5-TCP.md)).
+2. `crates/net-stack` — host-проверяемые bounded структуры и single-interface
+   демультиплексор; это не userspace service и не интеграция с NIC.
+3. Драйвер virtio-net в userspace: очереди, DMA, link state.
+4. Сетевой сервис: драйвер и IPC, ARP cache, IPv4 routing, ICMP echo, UDP
+   sockets, DNS stub, TCP и timers.
+5. Entropy/CSPRNG, криптография и TLS 1.3 с проверкой сертификатов.
+6. Клиент provider с потоковыми ответами и восстановлением соединения.
 
 ## 3. Контракт `crates/net-wire` (M5-1)
 
@@ -147,8 +152,56 @@ RDATA во всех трёх секциях, пропуск OPT; указате�
 собственную серию, зарезервированные типы меток; все усечения; 20 000
 псевдослучайных сообщений без panic.
 
-## 6. Не входит в M5-1 и M5-2
+## 6. Host-профиль сетевого сервиса (`crates/net-stack`, M5-4)
 
-Драйвер, DMA, ARP cache, маршрутизация, TCP, DNS-транспорт (сокет, повторы,
-таймауты, TCP-fallback), AAAA, таймеры, CSPRNG, TLS, ключи и provider. Проверка в QEMU отсутствует: сети в guest нет, профиль M0
-её отключает.
+Этот crate зависит только от собственных `net-wire` и `net-tcp`; он
+`no_std`, без `alloc` и `unsafe`. Ввод-вывод и монотонные ticks остаются за
+вызывающим кодом. Компонент не является NIC-драйвером и пока не запускается
+в kernel/userspace.
+
+**ARP cache.** Фиксированная ёмкость задаётся const-параметром. Lookup
+создаёт pending-запись и запрашивает ARP; число попыток и задержка задаются
+конфигурацией, повтор/timeout выдаются вызывающему по внешним ticks.
+Доступны записи `Reachable` и `Pending`; живые и pending записи не
+вытесняются при заполнении таблицы. Истёкшие Reachable-записи освобождают
+слот. Повторное наблюдение той же пары IP/MAC обновляет срок, конфликтующая
+пара не перезаписывает существующую запись и возвращает `Conflict`; если
+слота нет, возвращается `TableFull`. Явное обучение unsolicited ARP
+разрешено. ARP не аутентифицирует отображение IP–MAC: конфликтное правило
+сохраняет текущую запись, но не является защитой от подмены.
+
+**DNS transport.** `net_stack::dns::DnsClient` ведёт один запрос A/IN поверх
+UDP за раз. Caller задаёт `DnsName`, DNS server, local port, начальный ID seed
+и время. Выходной DNS payload строится в caller buffer для source port,
+server port 53; повторы используют новый детерминированно вращаемый ID и
+экспоненциальный backoff до лимита попыток. Вход принимается только от
+настроенного server:53 на local port и с ID текущей попытки. Некорректные,
+чужие и устаревшие пакеты не завершают запрос; RCODE и TC сообщаются
+отдельно. ID seed не является энтропией, source-port randomization и
+защита от подделки ответов ещё требуют CSPRNG/политики M5. TCP fallback для
+TC, параллельные запросы, выбор нескольких серверов и AAAA не реализованы.
+
+**IPv4 demux.** `demux_frame` обрабатывает один `Interface`: ARP принимается
+только для локального target IP, с MAC sender, совпадающим с Ethernet
+source; IPv4 — только для локального unicast MAC/IP и TTL != 0. IPv4
+фрагменты отклоняются codec-ом. ICMP echo, UDP и TCP разбираются
+соответствующими codecs (в том числе их checksums); неизвестные EtherTypes
+и IP protocols игнорируются. Структурно неверный адресованный пакет
+возвращает ошибку, не panic. Routing, forwarding, сокеты и отправка ответов
+не входят в этот host-срез.
+
+**Детерминированный симулятор.** `crates/net-stack/tests/simulation.rs`
+пропускает ARP request/reply, TCP handshake, двусторонние данные и active
+close через `demux_frame` и реальный `net_tcp::Connection`. Seeded link
+имеет clean и fault-профили; fault-профиль отбрасывает первый SYN,
+дублирует повторный SYN и data, а также переставляет data перед задержанным
+handshake ACK. Это тестовый harness, не production network component; он
+проверяет stack/TCP integration host-only, а не guest/реальное устройство.
+
+## 7. Что по-прежнему не входит в host-срезы
+
+Virtio-net driver и DMA, интеграция с kernel/userspace/IPC и аппаратным
+таймером, маршрутизация и sockets, TCP passive-open и неподдержанный профиль
+из [M5-TCP](M5-TCP.md), CSPRNG, crypto/TLS 1.3, trust store, durable key
+storage и вызов реального provider. Сеть в QEMU отсутствует: M0 profile
+отключает NIC, поэтому QEMU replay проверяет только отсутствие регрессий M0.

@@ -1,6 +1,6 @@
 [workspace]
-members = ["boot/uefi", "kernel", "crates/boot-protocol", "crates/net-wire", "tools/xtask"]
-default-members = ["tools/xtask", "crates/boot-protocol", "crates/net-wire"]
+members = ["boot/uefi", "kernel", "crates/boot-protocol", "crates/net-wire", "crates/net-tcp", "crates/net-stack", "tools/xtask"]
+default-members = ["tools/xtask", "crates/boot-protocol", "crates/net-wire", "crates/net-tcp", "crates/net-stack"]
 resolver = "2"
 
 [workspace.package]
