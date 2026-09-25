@@ -121,7 +121,7 @@
   ELF `496ef48df665ff041324138f8fef156fb1dbf496b9f8aca1eae80c8824477e2a`
   двух сборок равны и совпадают с прежними; `disk_image_equality_tested: false`:
   `out/runs/1790304160434397777-366878-reproduce-build/record.json`.
-- Clippy (диагностически): те же 12 ошибок, см. «Известный долг».
+- Clippy (диагностически): 12 ошибок в boot-protocol; исправлено в «Срез 1: Clippy».
 - Повторно, тем же checkout: `nix develop --command bash -c 'set -e; cargo xtask doctor;
   cargo fmt --all -- --check; python3 tests/fixtures/generate.py --check;
   cargo xtask test --replay'` — exit 0; 31 host-тест
@@ -143,12 +143,44 @@
 Аппаратная `hbreak` в этом профиле не поддерживается. Reverse debugging не
 заявляется. Пункт закрыт и M1 не блокирует.
 
+## Срез 1: Clippy (2026-09-25)
+
+На `b8913fa` без исправлений `cargo clippy --locked --package boot-protocol
+--package xtask --all-targets -- -D warnings` давал 13 ошибок: 11
+`manual_is_multiple_of` и 1 `manual_div_ceil` в `crates/boot-protocol`, 1
+`unused_unit` в `tools/xtask/src/build.rs` (ранее скрыт остановкой на
+boot-protocol). Исправлено заменой на `is_multiple_of`/`div_ceil` и `{}`;
+для единообразия так же заменены три однотипные проверки выравнивания в
+`validate_reserved_ranges`/`validate_load_segments`. Делители — ненулевые
+константы или `stride >= 40`, проверенный раньше в том же условии, поэтому
+результаты проверок не меняются.
+
+Проверка в основном checkout (`b8913fa` + рабочее дерево, `dirty: true`),
+каждая команда ниже выполнена в `nix develop` по очереди (локальный
+неотслеживаемый сценарий `out/slice1-checks.sh`); логи и коды выхода —
+`out/slice1-clippy-20260925T113637Z/`:
+
+- clippy `-D warnings` для обоих пакетов, `cargo fmt --all -- --check`,
+  `python3 tests/fixtures/generate.py --check`, `cargo xtask doctor`,
+  `git diff --check` — exit 0.
+- `cargo xtask test --replay` — exit 0: 31 host-тест (6 + 16 + 9) и семь
+  QEMU-сценариев (`out/runs/1790336200760340468-769146-suite/suite.json`);
+  replay PASS и FAIL: raw serial, verdict, disk и VARS равны
+  (`out/runs/1790336319140544651-769146-pass-replay-play/replay-comparison.json`,
+  `out/runs/1790336358631110420-769146-kernel-fail-replay-play/replay-comparison.json`).
+- `cargo xtask reproduce-build` — две сборки равны, source manifest
+  `8c4ad81883ed60ec2c47dfc1670ec84e39a0f19648380619c9952ba573be846e`:
+  `out/runs/1790336384168091360-772189-reproduce-build/record.json`.
+  **Хеши бинарников изменились** относительно `b8913fa`: EFI
+  `64b3716063f092e1e264c509399fcff3c198a740e10cec8acd5657c2449f3098`
+  (было `3032af43…e719`), ELF
+  `1d5df10d5dcbbb53a92a0991a3d4e94c85256b5584b1cac37754067faeb67348`
+  (было `496ef48d…7e2`). `boot-protocol` компилируется в loader и kernel;
+  другой исходный код даёт другой машинный код. Поведение подтверждено
+  тестами и QEMU-сценариями выше, не сравнением бинарников.
+
 ## Известный долг
 
-- `cargo clippy --locked --package boot-protocol --package xtask --all-targets -- -D warnings`
-  не проходит: lints `manual_div_ceil` и `manual_is_multiple_of` в
-  `crates/boot-protocol`; из-за остановки xtask не получил полного анализа.
-  Это не gate M0 и не ошибка сборки/тестов.
 - `docs/specs/machine-profile.toml` входит в source fingerprint, но не
   читается `cargo xtask doctor`/runner; имя машины можно переопределить
   `NANOX_QEMU_MACHINE` без сверки с профилем. Фактические tool/firmware hashes
@@ -171,8 +203,7 @@
 
 Отдельными задачами, по одной:
 
-1. Устранить Clippy-долг: `cargo clippy --locked --package boot-protocol
-   --package xtask --all-targets -- -D warnings` проходит без ошибок.
+1. ~~Clippy-долг~~ — выполнено, см. «Срез 1: Clippy»; ожидает ревью.
 2. Полная сверка runtime-профиля с `docs/specs/machine-profile.toml`: все
    исполняемые поля профиля, в том числе machine, версия и патч QEMU, CPU,
    vCPU, RAM, accelerator, RTC, network, display, boot controller, serial,
