@@ -7,20 +7,52 @@
   перенести в Rust-реализацию. Это **не требование** и не спецификация: каждый
   пункт — предложение, решение о переносе принимают Codex и владелец проекта.
 - **База.** Ревизия `152a67a` (`origin/main`, merge PR #3). Все ссылки на файлы,
-  сценарии и разделы документов относятся к этой ревизии. Где в C что-то только
+  сценарии и разделы документов относятся к этой ревизии, кроме помеченных
+  префиксом `b8913fa:` (Rust, см. «Как проверить ссылки»). Где в C что-то только
   описано, но не выполнялось, это сказано явно.
 - **Статус C-ветки.** Разработка на C остановлена; C-реализация **не
   каноническая**. Каноническая база — Rust-реализация (Rust stable, `no_std`
   загрузчик и ядро, `cargo xtask`, Nix, QEMU 9.2.4, `pc-q35-9.2`, ROADMAP
   M0–M10), сейчас на M0. Этапы C (M0–M5) — это этапы ARCHITECTURE.md §15, а не
   ROADMAP Rust-реализации.
-- **Rust-этапы.** ROADMAP Rust-реализации автору этого документа не виден.
-  Сопоставление с ним оставлено Codex: колонка «Rust-этап» в таблицах пустая.
+- **Rust-этапы.** Колонку «Rust-этап» заполнил Claude по ROADMAP
+  Rust-реализации (`b8913fa:docs/ROADMAP.md`, ветка `codex/m0`, коммит
+  `b8913fa5a89a288347deae389f53d7f2b4a9261b`); сопоставление **требует
+  подтверждения Codex**. В ячейке — этап ROADMAP (M0–M10) и состояние в Rust
+  на `b8913fa`: «есть в Rust M0», «частично есть: <чего не хватает>» или «нет».
+  Сопоставления, в которых автор не уверен, помечены «(предварительно —
+  подтвердить Codex)». Rust сейчас на M0, поэтому для этапов M1 и дальше
+  состояние везде «нет».
 - **Reviewer:** Codex.
-- **Как проверить ссылки.** Каждый путь в обратных кавычках существует в
-  `152a67a` (`git cat-file -e 152a67a:<путь>`), каждое имя сценария есть в
-  `tests/qemu/scenarios.json`. Пути `out/...` и `bin/...` — артефакты сборки и
-  пути внутри initramfs, их в дереве нет.
+- **Как проверить ссылки.** Пути в обратных кавычках относятся к разным
+  ревизиям в зависимости от класса:
+  - обычный путь (`tools/bench/harness.py`) — C-реализация, существует в
+    `152a67a` (`git cat-file -e 152a67a:<путь>`);
+  - путь с префиксом `b8913fa:` (`b8913fa:tools/xtask/src/runner.rs`) —
+    Rust-реализация, существует в `b8913fa`
+    (`git cat-file -e b8913fa:<путь>`); ссылки на строки ведут на GitHub
+    по полному хешу этого коммита;
+  - имя сценария (`normal`, `m4-crash`) есть в `tests/qemu/scenarios.json`
+    на `152a67a`. Имена Rust-сценариев (pass, kernel-fail и т. п. из
+    `b8913fa:tools/xtask/src/main.rs`) пишутся без обратных кавычек.
+
+  Исключения — пути, которых в дереве `152a67a` **намеренно нет**:
+  - артефакты сборки и пути внутри initramfs: `out/...`, `bin/...`,
+    `BOOTX64.EFI`, `kernel.elf`, `initrd.img`, `nanox.img`, `data.img`,
+    `KERNEL.ELF`, `INITRD.IMG`, `OVMF_VARS.fd`;
+  - имена файлов и подкаталогов в каталоге запуска C (`out/runs/<UTC>-<сценарий>/`
+    на `152a67a`): `record.json`, `serial.log`, `qemu-output.log`,
+    `bridge-trace.jsonl`, `bridge-wire.log`, `boot-<n>/`,
+    `k<K>-<политика>/{crash,check}/`, `summary.json`, `repeat.json`, `gdb.log`;
+  - имена файлов в каталоге запуска Rust (`out/runs/<run-id>/` на `b8913fa`,
+    `b8913fa:docs/specs/TESTING-REPLAY.md` §5): `record.json`, `inputs.json`,
+    `serial.bin`, `serial.txt`, `initial.img`, `initial-code.fd`,
+    `initial-vars.fd`, `BOOT.CFG`, `suite.json`, `replay-comparison.json`;
+  - корневые файлы Rust-реализации, которых в C нет: `flake.lock` (в C не
+    создан, раздел 5), `Cargo.lock`, `rust-toolchain.toml` — существуют в
+    `b8913fa`;
+  - не пути: имена веток (`origin/main`, `codex/m0`) и операций NCI
+    (`task.spawn/terminate`).
 
 Главные источники: `tests/qemu/scenarios.json` (54 сценария),
 `tools/bench/harness.py`, `tools/bench/qemu.py`, `tools/bench/storecheck.py`,
@@ -58,6 +90,12 @@
 можно менять, но правило «маркер только с начала строки, гость не может его
 подделать» стоит оставить.
 
+**Rust-этап:** M0 — частично есть: маркеры вида `NANOX:<КОМПОНЕНТ>:<СОБЫТИЕ>`
+ищутся как подстрока в любом месте serial-потока ([`b8913fa:tools/xtask/src/runner.rs` L25–27](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L25-L27)),
+требования «с начала строки» и порядка нет (см. 1.3). Свойство «гость не
+подделает маркер» становится существенным с появлением пользовательских
+задач — M2 (предварительно — подтвердить Codex).
+
 ### 1.2 Коды выхода (isa-debug-exit)
 
 Источник: `docs/boot-info.md` §8, `docs/m0-bench.md` §6 «Коды выхода».
@@ -77,6 +115,12 @@
 
 Коды нечётные и ≠ 0/1, поэтому их нельзя спутать ни с нормальным завершением
 QEMU, ни с его собственной ошибкой. Переносимость: **высокая**.
+
+**Rust-этап:** M0 — частично есть: устройство то же (`iosize=4`), значения
+`0x10` → 33 и `0x11` → 35 (`b8913fa:docs/specs/TESTING-REPLAY.md` §4). FAIL,
+panic и отказ загрузчика в Rust M0 все дают 35 и различаются только маркером
+([`b8913fa:tools/xtask/src/runner.rs` L67–89](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L67-L89)); отдельных кодов для panic, loader
+error, исключения CPU (M1) и точки сбоя (M4) нет.
 
 ### 1.3 Классы вердикта и правило «маркер + код»
 
@@ -107,6 +151,16 @@ QEMU, ни с его собственной ошибкой. Переносимо
 чистая функция `(serial, exit_status, timed_out) → verdict`, её легко
 покрыть теми же таблицами случаев.
 
+**Rust-этап:** M0 («PASS, FAIL и timeout различаются автоматически») —
+частично есть: нет проверки порядка маркеров и единственности PASS
+([`b8913fa:tools/xtask/src/runner.rs` L29–64](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L29-L64): `classify` проверяет только
+наличие пяти маркеров и статус 33). Есть: статус без маркеров никогда не PASS,
+маркеры ошибок важнее PASS, таймаут важнее PASS, любая подстрока `PANIC`/`FAIL`
+→ FAIL; тесты `exit_without_evidence_is_never_pass`,
+`errors_override_success_markers`
+([`b8913fa:tools/xtask/src/runner.rs` L599–615](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L599-L615)). Классы `exception` (M1) и
+`crash_point` (M4) появятся на своих этапах.
+
 ### 1.4 Ожидания сценария (`expect`)
 
 Источник: `docs/m0-bench.md` §6, `tests/qemu/scenarios.json`.
@@ -131,6 +185,11 @@ QEMU, ни с его собственной ошибкой. Переносимо
 обязательных сценариев и компилируемость всех выражений. Переносимость:
 **высокая**. Особо рекомендуется идея `expect.bridge.problems`: отрицательный
 контроль должен падать по ожидаемой причине, а не по любой.
+
+**Rust-этап:** M0 — частично есть: ожидание каждого из семи сценариев
+зашито в код функции `expected` ([`b8913fa:tools/xtask/src/runner.rs` L67–89](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L67-L89)),
+а не в декларативный файл сценариев; регулярных выражений по логу и
+подстановок хешей нет. `bridge.problems` — M3, `store`/`boots` — M4.
 
 ### 1.5 Запись запуска (run record)
 
@@ -161,6 +220,53 @@ QEMU, ни с его собственной ошибкой. Переносимо
 Копия `OVMF_VARS.fd` на каждый запуск свежая и удаляется; в записи остаётся
 хеш шаблона. Переносимость: **высокая** (формат JSON, язык не важен).
 
+**Rust-этап:** M0 («Сохранён полный RunRecord») — частично есть. Rust
+пишет `out/runs/<run-id>/record.json` и `inputs.json`
+([`b8913fa:tools/xtask/src/runner.rs` L311–403](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L311-L403)); схема —
+`b8913fa:docs/specs/TESTING-REPLAY.md` §5. Сопоставление полей:
+
+| Поле C `record.json` | Rust `record.json` на `b8913fa` | Состояние |
+| --- | --- | --- |
+| `scenario`, `started_utc`, `duration_s` | `scenario`, `mode`, `started_unix_ms`, `result.process.elapsed_ms` | есть |
+| `source.git_rev`, `git_dirty`, `git_dirty_paths` | `source.commit`, `branch`, `dirty`, `manifest_sha256`, `patch_sha256`, `files` (хеш каждого входного файла, включая неотслеживаемые) — `b8913fa:tools/xtask/src/record.rs` | есть, подробнее, чем в C |
+| `qemu.argv`, `qemu.timeout_s` | `invocation.argv`, `invocation.environment`, `invocation.timeout_seconds` | есть |
+| `artifacts.*` (путь, SHA-256, размер) | `inputs` — SHA-256 `initial.img`, `initial-code.fd`, `initial-vars.fd`, `BOOTX64.EFI`, `KERNEL.ELF`, `BOOT.CFG`; копии файлов лежат в каталоге запуска | есть (без размеров) |
+| `toolchain.profile`, `lock_ok`, `versions` | `tools`: версии rustc/cargo/QEMU/qemu-img/sgdisk/mtools, SHA-256 бинарника QEMU, хеши `flake.lock`, `Cargo.lock`, `rust-toolchain.toml` | частично: версии и хеши есть, итог сверки с закреплённым профилем (аналог `lock_ok`) в запись не попадает — его выдаёт только `doctor` в `out/doctor.json` |
+| отдельного поля нет: параметры машины в C видны только в `qemu.argv`, канон — `docs/m0-bench.md` §2 | `machine`: machine type, CPU, vCPU, RAM, accelerator, RTC, сеть, контроллер диска, serial, `icount`, способ подключения прошивки | есть; см. ниже |
+| `host` | — | нет |
+| `result.*`, `verdict`, `failure_class`, `reason` | `result.verdict`, `result.reason`, `result.process` (`exit_code`, `timed_out`, `spawn_error`, `signal`) | есть |
+| `serial.sha256`, `serial.markers`, `serial.raw` | `outputs.serial_sha256` + файлы `serial.bin`/`serial.txt` | частично: разобранного списка маркеров нет |
+| `expected`, `expectation_met`, `expectation_problems` | `result.expectation_met` | частично: только флаг, без списка расхождений |
+| `exception`, `backtrace`; `bridge`, `data_disk` | — | нет; этапы M1, M3, M4 |
+| `summary.json`, `repeat.json` | `suite.json` (`cargo xtask test`), `replay-comparison.json` | есть аналог `summary.json`; `repeat.json` — нет (см. 1.6) |
+
+**Учёт профиля машины.** Отдельного поля «версия/хеш machine profile» в
+Rust-записи нет, но **отсутствие отдельного поля не означает отсутствия
+доказательства**:
+
+- параметры машины записываются в каждую запись напрямую: `profile()` →
+  `inputs.json`/`record.json` поле `machine`
+  ([`b8913fa:tools/xtask/src/runner.rs` L91–103](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L91-L103),
+  [`b8913fa:tools/xtask/src/runner.rs` L151–164](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L151-L164), копирование в запись —
+  [`b8913fa:tools/xtask/src/runner.rs` L360–363](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L360-L363)); хеши прошивки CODE/VARS — в
+  `inputs`, бинарника QEMU — в `tools.qemu_sha256`;
+- файл `b8913fa:docs/specs/machine-profile.toml` входит в манифест входов
+  (`source.files`, `source.manifest_sha256`,
+  [`b8913fa:tools/xtask/src/record.rs` L86–100](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/record.rs#L86-L100)), так что его изменение меняет
+  хеш манифеста, а replay с другим манифестом отвергается
+  ([`b8913fa:tools/xtask/src/runner.rs` L183–201](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L183-L201)); это соответствует
+  ADR-0001 ([`b8913fa:docs/adr/0001-platform.md` L29–31](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/docs/adr/0001-platform.md#L29-L31): «versioned machine и
+  firmware hashes», «RunRecord с source/toolchain/machine hashes»).
+
+Ограничение: `doctor` **не сверяет** окружение с
+`b8913fa:docs/specs/machine-profile.toml` — он проверяет версии QEMU и Rust,
+наличие машины `pc-q35-9.2` (или значения `NANOX_QEMU_MACHINE`), прошивки как
+файлы и lock-файлы, но не читает этот TOML и не сравнивает хеши прошивки с
+`firmware_code_sha256`/`firmware_vars_sha256` из него
+([`b8913fa:tools/xtask/src/build.rs` L24–128](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/build.rs#L24-L128)). Профиль в TOML — документ и вход
+манифеста, а не исполняемая проверка. Аналог C-правила «профиль без
+`status = verified` отвергается» (раздел 1.9) отсутствует.
+
 ### 1.6 Проверка повторяемости с маскированием (`harness.py repeat`)
 
 Источник: `cmd_repeat`, `normalized_markers`, `VOLATILE_RE`,
@@ -187,6 +293,13 @@ QEMU, ни с его собственной ошибкой. Переносимо
 в C **не настраивалась** (`boot_id`, тики, доля CPU меняются;
 `docs/m3-core.md` §12).
 
+**Rust-этап:** M1 (предварительно — подтвердить Codex: в ROADMAP нет
+отдельного пункта; ближайший — «Время и внешние события имеют явные
+abstraction boundaries и trace IDs»). Состояние: нет. В Rust M0 есть
+другая проверка — record/replay с побайтным сравнением serial
+(`b8913fa:docs/specs/TESTING-REPLAY.md` §1 п. 3); повтор N свежих загрузок с
+маскированием (там же, п. 2) не автоматизирован.
+
 ### 1.7 Побайтовая воспроизводимость (`make repro-check`)
 
 Источник: `tools/repro_check.py`, `docs/m0-bench.md` §5.
@@ -211,6 +324,15 @@ QEMU, ни с его собственной ошибкой. Переносимо
   другого пути без remap-флагов (для Rust — `--remap-path-prefix`) даёт
   расхождение. Сам факт, что Rust-сборка без remap даёт разные бинарники,
   здесь не проверялся.
+- **Rust-этап:** M0 («Проверена повторяемость бинарных сборок») —
+  частично есть: `cargo xtask reproduce-build` собирает EFI/ELF дважды в
+  свежих каталогах `target` и сравнивает хеши; в записи прямо стоит
+  `disk_image_equality_tested: false`
+  ([`b8913fa:tools/xtask/src/build.rs` L220–252](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/build.rs#L220-L252)). Обе сборки идут из одного
+  checkout (другой абсолютный путь к исходникам не проверяется), отрицательного
+  контроля нет. Однократное побайтное совпадение всего образа из чистого
+  worktree записано в `b8913fa:docs/STATUS.md`, но это ручная проверка, а не
+  часть `reproduce-build`.
 
 Переносимость: **высокая**.
 
@@ -230,6 +352,13 @@ boot info. Запись — `out/runs/<время>-gdb/record.json` и `gdb.log`
 Переносимость: **средняя** — для Rust нужен неискажённый символ точки входа
 (`#[no_mangle]` или проверка по демангленному имени) и знание, в каком
 регистре передаётся boot info в Rust-ABI входа.
+
+**Rust-этап:** M0 (`cargo xtask debug`) — частично есть: `debug --run ID`
+запускает QEMU с `-S -gdb tcp:127.0.0.1:1234` на входах записанного запуска и
+печатает команды GDB ([`b8913fa:tools/xtask/src/runner.rs` L305–307](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L305-L307),
+[`b8913fa:tools/xtask/src/runner.rs` L354–358](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L354-L358)); автоматической проверки
+остановки в `kernel_main` и содержимого boot info нет, а интерактивная
+проверка точки останова, по `b8913fa:docs/STATUS.md`, ещё не завершена.
 
 ### 1.9 Прочие соглашения, которые стоит сохранить
 
@@ -273,14 +402,14 @@ C-кода.
 
 | Сценарий | Что проверяет | Тип | Вердикт, код | Файлы | Переносимость | Rust-этап |
 | --- | --- | --- | --- | --- | --- | --- |
-| `normal` | полная загрузка до `TEST PASS`; хеши ядра и initramfs из лога = хешам на хосте; RSDP; с M1 — все маркеры шагов ядра, `ram_mapped` 250–262 MiB | П | PASS, 33 | `tests/qemu/scenarios.json`, `docs/m1-kernel.md` §2 | высокая (набор маркеров — свой) | |
-| `fail` | ядро само сообщает `TEST FAIL` | И | `test_fail`, 35 | `kernel/main.c` | высокая | |
-| `unknown-test` | неизвестный `nanox.test=bogus` — провал, не PASS | И | `test_fail`, 35 | `kernel/main.c` | высокая | |
-| `panic` | путь panic, backtrace содержит `kernel_main` | И | `panic`, 37 | `kernel/panic.c` | средняя (backtrace и символы в Rust) | |
-| `hang` | вечный останов; вердикт только по таймауту harness (20 с); в логе `kernel_main` и `test hang` | И | `timeout`, — | `tools/bench/harness.py` | высокая | |
-| `missing-kernel` | нет `KERNEL.ELF` на ESP | И | `loader_error` `E_KERNEL_OPEN`, 39 | `tools/image/mkimage.py` (`--omit-kernel`), `docs/boot-info.md` §8 | высокая | |
-| `corrupt-kernel` | один байт ядра инвертирован после записи манифеста | И | `loader_error` `E_KERNEL_HASH`, 39 | `tools/image/mkimage.py` (`--corrupt-kernel`) | высокая | |
-| `framebuffer` | каноника + ровно одно `-device VGA`; необязательные поля framebuffer в boot info | П | PASS, 33 | `tools/bench/qemu.py`, `docs/boot-info.md` §9 | высокая | |
+| `normal` | полная загрузка до `TEST PASS`; хеши ядра и initramfs из лога = хешам на хосте; RSDP; с M1 — все маркеры шагов ядра, `ram_mapped` 250–262 MiB | П | PASS, 33 | `tests/qemu/scenarios.json`, `docs/m1-kernel.md` §2 | высокая (набор маркеров — свой) | M0 — частично есть: Rust-сценарий pass проверяет цепочку маркеров, BootInfo и статус 33; сверки напечатанных гостем хешей ядра с хостом нет, initramfs в Rust M0 нет, маркеры шагов ядра — M1 |
+| `fail` | ядро само сообщает `TEST FAIL` | И | `test_fail`, 35 | `kernel/main.c` | высокая | M0 — есть в Rust M0 (kernel-fail: FAIL, 35) |
+| `unknown-test` | неизвестный `nanox.test=bogus` — провал, не PASS | И | `test_fail`, 35 | `kernel/main.c` | высокая | M0 — нет: режим теста задаётся `boot_epoch`, неизвестное значение в test-профиле даёт PASS ([`b8913fa:kernel/src/main.rs` L190–204](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/kernel/src/main.rs#L190-L204)) |
+| `panic` | путь panic, backtrace содержит `kernel_main` | И | `panic`, 37 | `kernel/panic.c` | средняя (backtrace и символы в Rust) | M0 — частично есть: kernel-panic (PANIC, но код 35, не отдельный); backtrace нет |
+| `hang` | вечный останов; вердикт только по таймауту harness (20 с); в логе `kernel_main` и `test hang` | И | `timeout`, — | `tools/bench/harness.py` | высокая | M0 — есть в Rust M0 (kernel-hang: TIMEOUT, маркер `NANOX:TEST:HANG`) |
+| `missing-kernel` | нет `KERNEL.ELF` на ESP | И | `loader_error` `E_KERNEL_OPEN`, 39 | `tools/image/mkimage.py` (`--omit-kernel`), `docs/boot-info.md` §8 | высокая | M0 — есть в Rust M0 (missing-kernel: LOADER_ERROR, 35, ядро не вошло) |
+| `corrupt-kernel` | один байт ядра инвертирован после записи манифеста | И | `loader_error` `E_KERNEL_HASH`, 39 | `tools/image/mkimage.py` (`--corrupt-kernel`) | высокая | M0 — частично есть: truncated-elf и bad-segments отвергают структурно неверный ELF; манифеста хешей ядра нет, инвертированный байт в корректном ELF не обнаруживается (предварительно — подтвердить Codex) |
+| `framebuffer` | каноника + ровно одно `-device VGA`; необязательные поля framebuffer в boot info | П | PASS, 33 | `tools/bench/qemu.py`, `docs/boot-info.md` §9 | высокая | M7 («Framebuffer/input/compositor») — нет (предварительно — подтвердить Codex) |
 
 ### 2.2 M1 — собственная загрузка и ядро (13)
 
@@ -291,19 +420,19 @@ C-кода.
 
 | Сценарий | Что проверяет | Тип | Вердикт, код | Файлы | Переносимость | Rust-этап |
 | --- | --- | --- | --- | --- | --- | --- |
-| `missing-initrd` | нет `INITRD.IMG` | И | `loader_error` `E_INITRD_OPEN`, 39 | `tools/image/mkimage.py` | высокая | |
-| `corrupt-initrd` | байт initramfs инвертирован | И | `loader_error` `E_INITRD_HASH`, 39 | `tools/image/mkimage.py` | высокая | |
-| `bad-initrd` | 150 байт текста вместо cpio, манифест им **соответствует** — отвергает уже ядро | И | `panic` `initramfs invalid: E_MAGIC at offset 0`, 37 | `kernel/initramfs.c` | высокая (если формат initramfs — cpio newc) | |
-| `ud` | `ud2` → `#UD`, вектор 6, RIP в `nx_fault_ud` | И | `exception`, 41 | `kernel/faults.c` | средняя (имя функции: Rust-манглинг/инлайнинг) | |
-| `gp` | загрузка по неканоническому адресу → `#GP`, 13 | И | `exception`, 41 | `kernel/faults.c` | средняя | |
-| `divzero` | `#DE`, 0 | И | `exception`, 41 | `kernel/faults.c` | средняя (в Rust деление на 0 — паника до `div`; нужен asm) | |
-| `pagefault` | запись в `0xdead0000` → `#PF`, error `0x2`, CR2, `not-mapped` | И | `exception`, 41 | `kernel/faults.c`, `kernel/panic.c` | средняя | |
-| `nullderef` | чтение по нулю → `#PF`, error `0x0`, CR2 `0x0` | И | `exception`, 41 | `kernel/faults.c` | средняя (в Rust нужен `read_volatile` по сырому указателю) | |
-| `wprotect` | запись в `.rodata` при `CR0.WP` → `#PF`, error `0x3`, права `r--` | И | `exception`, 41 | `kernel/faults.c`, `kernel/mm/vmm.c` | средняя | |
-| `nxexec` | переход в данные при `EFER.NXE` → `#PF`, error `0x11`, CR2 = RIP | И | `exception`, 41 | `kernel/faults.c` | средняя | |
-| `stackoverflow` | рекурсия в страницу-ограничитель → `#DF` (8) на IST; строка `guard page of stack boot hit` | И | `exception`, 41 | `kernel/arch/x86_64/gdt.c`, `kernel/arch/x86_64/kernel.ld` | средняя; см. камень 4.5 (RIP при `#DF`) | |
-| `doublefree` | повторное освобождение страницы → allocator отказывает `E_DOUBLE_FREE`, panic; backtrace `nx_page_free`, `kernel_main` | И | `panic`, 37 | `kernel/mm/pmm.c` | средняя (имена функций) | |
-| `timer-masked` | LVT таймера оставлен замаскированным; самопроверка обязана заметить `ticks=0 expected=30` | И (по смыслу ОК самопроверки) | `test_fail`, 35 | `kernel/arch/x86_64/timer.c` | высокая | |
+| `missing-initrd` | нет `INITRD.IMG` | И | `loader_error` `E_INITRD_OPEN`, 39 | `tools/image/mkimage.py` | высокая | M2 (initramfs как источник userspace ELF) — нет (предварительно — подтвердить Codex) |
+| `corrupt-initrd` | байт initramfs инвертирован | И | `loader_error` `E_INITRD_HASH`, 39 | `tools/image/mkimage.py` | высокая | M2 — нет (предварительно — подтвердить Codex) |
+| `bad-initrd` | 150 байт текста вместо cpio, манифест им **соответствует** — отвергает уже ядро | И | `panic` `initramfs invalid: E_MAGIC at offset 0`, 37 | `kernel/initramfs.c` | высокая (если формат initramfs — cpio newc) | M2 — нет (предварительно — подтвердить Codex) |
+| `ud` | `ud2` → `#UD`, вектор 6, RIP в `nx_fault_ud` | И | `exception`, 41 | `kernel/faults.c` | средняя (имя функции: Rust-манглинг/инлайнинг) | M1 («GDT/IDT, исключения…») — нет |
+| `gp` | загрузка по неканоническому адресу → `#GP`, 13 | И | `exception`, 41 | `kernel/faults.c` | средняя | M1 — нет |
+| `divzero` | `#DE`, 0 | И | `exception`, 41 | `kernel/faults.c` | средняя (в Rust деление на 0 — паника до `div`; нужен asm) | M1 — нет |
+| `pagefault` | запись в `0xdead0000` → `#PF`, error `0x2`, CR2, `not-mapped` | И | `exception`, 41 | `kernel/faults.c`, `kernel/panic.c` | средняя | M1 («Проверены … page fault») — нет |
+| `nullderef` | чтение по нулю → `#PF`, error `0x0`, CR2 `0x0` | И | `exception`, 41 | `kernel/faults.c` | средняя (в Rust нужен `read_volatile` по сырому указателю) | M1 — нет |
+| `wprotect` | запись в `.rodata` при `CR0.WP` → `#PF`, error `0x3`, права `r--` | И | `exception`, 41 | `kernel/faults.c`, `kernel/mm/vmm.c` | средняя | M1 («проверка page permissions») — нет |
+| `nxexec` | переход в данные при `EFER.NXE` → `#PF`, error `0x11`, CR2 = RIP | И | `exception`, 41 | `kernel/faults.c` | средняя | M1 («проверка page permissions») — нет |
+| `stackoverflow` | рекурсия в страницу-ограничитель → `#DF` (8) на IST; строка `guard page of stack boot hit` | И | `exception`, 41 | `kernel/arch/x86_64/gdt.c`, `kernel/arch/x86_64/kernel.ld` | средняя; см. камень 4.5 (RIP при `#DF`) | M1 («guard pages», «аварийный стек») — нет |
+| `doublefree` | повторное освобождение страницы → allocator отказывает `E_DOUBLE_FREE`, panic; backtrace `nx_page_free`, `kernel_main` | И | `panic`, 37 | `kernel/mm/pmm.c` | средняя (имена функций) | M1 («double free») — нет |
+| `timer-masked` | LVT таймера оставлен замаскированным; самопроверка обязана заметить `ticks=0 expected=30` | И (по смыслу ОК самопроверки) | `test_fail`, 35 | `kernel/arch/x86_64/timer.c` | высокая | M1 («timer … работают») — нет |
 
 Повторяемость: `normal` и `pagefault` ×3 (раздел 1.6).
 
@@ -314,11 +443,11 @@ C-кода.
 
 | Сценарий | Что проверяет | Тип | Вердикт, код | Файлы | Переносимость | Rust-этап |
 | --- | --- | --- | --- | --- | --- | --- |
-| `m2-user` | `bin/hello` в ring 3 (`cpl=3`), свой корень таблиц, код `user,r-x`, стек `user,rw-`, в таблицах ядра этих адресов нет; `.data` из файла, `.bss` обнулён; после reap `free_pages`, `tables`, `tasks` равны исходным (обратные ссылки в регулярном выражении) | П | PASS, 33 | `kernel/task.c`, `kernel/mm/vmm.c`, `lib/elf_plan.c` | средняя; фиксированный адрес `data=0x8000002000` в шаблоне — хрупкий (камень 4.9) | |
-| `m2-sched` | три `bin/spin` без `yield` чередуются по таймеру; результат каждой = независимо посчитанному ядром; ядро и harness (`interleave`, `groups: 3`) независимо проверяют: первая строка прогресса каждой задачи раньше последней строки любой | П | PASS, 33 | `kernel/task.c`, `tools/bench/harness.py` | высокая (правило чередования — язык-нейтрально) | |
-| **`m2-sched-nopreempt`** | те же задачи без вытеснения идут подряд; проверка чередования обязана сработать (`preempted=0,0,0`, `tasks did not interleave`) | **ОК** к `m2-sched` | `test_fail`, 35 | `kernel/m2test.c` | высокая | |
-| `m2-ipc` | сообщение + handle объекта памяти с урезанными правами `READ\|MAP` (`0x5`); лишнее право → `EACCESS`; после передачи handle у отправителя недействителен; получатель отображает только на чтение, запись и дублирование → `EACCESS`; объекты уничтожены | П | PASS, 33 | `kernel/obj/handle.c`, `kernel/obj/ipc.c` | средняя (конкретные права — свои) | |
-| **`m2-ipc-overgrant`** | ядро намеренно отдаёт все права отправителя (`queued=0x1f`); получатель обязан заметить (`rights=0x1f expected=0x5`, код 2) | **ОК** к `m2-ipc` | `test_fail`, 35 | `kernel/m2test.c` (`nx_inject_ipc_overgrant`) | высокая | |
+| `m2-user` | `bin/hello` в ring 3 (`cpl=3`), свой корень таблиц, код `user,r-x`, стек `user,rw-`, в таблицах ядра этих адресов нет; `.data` из файла, `.bss` обнулён; после reap `free_pages`, `tables`, `tasks` равны исходным (обратные ссылки в регулярном выражении) | П | PASS, 33 | `kernel/task.c`, `kernel/mm/vmm.c`, `lib/elf_plan.c` | средняя; фиксированный адрес `data=0x8000002000` в шаблоне — хрупкий (камень 4.9) | M2 («Userspace ELF … в ring 3 с отдельным адресным пространством») — нет |
+| `m2-sched` | три `bin/spin` без `yield` чередуются по таймеру; результат каждой = независимо посчитанному ядром; ядро и harness (`interleave`, `groups: 3`) независимо проверяют: первая строка прогресса каждой задачи раньше последней строки любой | П | PASS, 33 | `kernel/task.c`, `tools/bench/harness.py` | высокая (правило чередования — язык-нейтрально) | M1 («CPU-bound поток вытесняется», kernel threads); вариант с пользовательскими задачами — M2 (предварительно — подтвердить Codex) — нет |
+| **`m2-sched-nopreempt`** | те же задачи без вытеснения идут подряд; проверка чередования обязана сработать (`preempted=0,0,0`, `tasks did not interleave`) | **ОК** к `m2-sched` | `test_fail`, 35 | `kernel/m2test.c` | высокая | M1/M2, вместе с `m2-sched` (предварительно — подтвердить Codex) — нет |
+| `m2-ipc` | сообщение + handle объекта памяти с урезанными правами `READ\|MAP` (`0x5`); лишнее право → `EACCESS`; после передачи handle у отправителя недействителен; получатель отображает только на чтение, запись и дублирование → `EACCESS`; объекты уничтожены | П | PASS, 33 | `kernel/obj/handle.c`, `kernel/obj/ipc.c` | средняя (конкретные права — свои) | M2 («Handles, subset duplicate…», IPC) — нет |
+| **`m2-ipc-overgrant`** | ядро намеренно отдаёт все права отправителя (`queued=0x1f`); получатель обязан заметить (`rights=0x1f expected=0x5`, код 2) | **ОК** к `m2-ipc` | `test_fail`, 35 | `kernel/m2test.c` (`nx_inject_ipc_overgrant`) | высокая | M2 — нет |
 
 Повторяемость: `m2-sched` ×3 с `repeat.unordered` (раздел 1.6).
 
@@ -332,13 +461,13 @@ C-кода.
 
 | Сценарий | Что проверяет | Тип | Вердикт, код | Файлы | Переносимость | Rust-этап |
 | --- | --- | --- | --- | --- | --- | --- |
-| `m3-agent` | мок-модель: `list_tasks` → `spawn_task(load)` → `measure_task` → `terminate_task` с `expect_rev` → `list_tasks`; каждое действие `SUCCEEDED verify=ok`; host отдельно видит `GONE`; трасса полна; ресурсы вернулись | П | PASS, 33; `bridge.ok` | `tools/bridge/agent.py`, `tools/bridge/adapters.py`, `user/core/core.c` | высокая (протокол); NCI-формат — свой | |
-| `m3-nci` | все операции NCI v1; события задачи ровно `created, started, killed, reaped`, номера подряд, повторный poll пуст; некорректные запросы: `REJECTED UNKNOWN_OP`, `REJECTED duplicate_argument`, `FAILED BAD_REQUEST effects=none` | П | PASS, 33 | `user/core/nci.c`, `kernel/obj/event.c`, `tools/bridge/nci.py` | высокая | |
-| **`m3-events-off`** | ядро не пишет события; проверка исполнителя `no_created_event` и host-проверка обязаны упасть | **ОК** к `m3-nci` | `test_fail`, 35; проблема `^spawn: task.spawn: FAILED VERIFY_FAILED no_created_event$` | `kernel/m3test.c` | высокая | |
-| `m3-faults` | ссылка из другой загрузки → `STALE_REF`; невыданный id → `NOT_FOUND`; `expect_rev=999` → `CONFLICT`; повтор запроса → тот же ответ `replayed=1`; тот же id с другим запросом → `ID_REUSED`; потерянный ответ → `action.status known=yes`; неотправленный запрос → `known=no`, затем исполняется один раз; старая ссылка → `GONE`, новая задача не задета | П+И | PASS, 33 | `user/core/engine.c`, `tools/bridge/scripts.py` | высокая | |
-| **`m3-nodedup`** | исполнитель не дедуплицирует: повтор запускает третью задачу; host-проверки `retry_not_replayed`, `retry_created_second_task` обязаны сработать | **ОК** к `m3-faults` | `test_fail`, 35 | `kernel/m3test.c` | высокая | |
-| `m3-model-down` | адаптер `unavailable`: 3 попытки, задача host `FAILED model_unavailable`, ни одного действия у гостя; гость управляем без модели | П+И | PASS, 33 | `tools/bridge/adapters.py`, `tools/bridge/agent.py` | высокая | |
-| **`m3-kill-noop`** | `TASK_KILL` возвращает успех без эффекта; исполнитель обязан ответить `VERIFY_FAILED still_running`, host-задача `FAILED action_failed` | **ОК** к `m3-agent` (критерий 4) | `test_fail`, 35; `core#4 exited with code 3` | `kernel/m3test.c` (`nx_inject_kill_noop`) | высокая | |
+| `m3-agent` | мок-модель: `list_tasks` → `spawn_task(load)` → `measure_task` → `terminate_task` с `expect_rev` → `list_tasks`; каждое действие `SUCCEEDED verify=ok`; host отдельно видит `GONE`; трасса полна; ресурсы вернулись | П | PASS, 33; `bridge.ok` | `tools/bridge/agent.py`, `tools/bridge/adapters.py`, `user/core/core.c` | высокая (протокол); NCI-формат — свой | M3 («ИИ получает список задач, запускает нагрузку, измеряет и останавливает её»; Verifier) — нет; в Rust M3 требуется настоящая модель, в C была мок-модель |
+| `m3-nci` | все операции NCI v1; события задачи ровно `created, started, killed, reaped`, номера подряд, повторный poll пуст; некорректные запросы: `REJECTED UNKNOWN_OP`, `REJECTED duplicate_argument`, `FAILED BAD_REQUEST effects=none` | П | PASS, 33 | `user/core/nci.c`, `kernel/obj/event.c`, `tools/bridge/nci.py` | высокая | M3 (framed COM2 protocol; события с sequence) — нет |
+| **`m3-events-off`** | ядро не пишет события; проверка исполнителя `no_created_event` и host-проверка обязаны упасть | **ОК** к `m3-nci` | `test_fail`, 35; проблема `^spawn: task.spawn: FAILED VERIFY_FAILED no_created_event$` | `kernel/m3test.c` | высокая | M3 («События имеют sequence, overflow marker и resync») — нет |
+| `m3-faults` | ссылка из другой загрузки → `STALE_REF`; невыданный id → `NOT_FOUND`; `expect_rev=999` → `CONFLICT`; повтор запроса → тот же ответ `replayed=1`; тот же id с другим запросом → `ID_REUSED`; потерянный ответ → `action.status known=yes`; неотправленный запрос → `known=no`, затем исполняется один раз; старая ссылка → `GONE`, новая задача не задета | П+И | PASS, 33 | `user/core/engine.c`, `tools/bridge/scripts.py` | высокая | M3 («stale object, duplicate request, потерянный ответ и отмена») — нет |
+| **`m3-nodedup`** | исполнитель не дедуплицирует: повтор запускает третью задачу; host-проверки `retry_not_replayed`, `retry_created_second_task` обязаны сработать | **ОК** к `m3-faults` | `test_fail`, 35 | `kernel/m3test.c` | высокая | M3 — нет |
+| `m3-model-down` | адаптер `unavailable`: 3 попытки, задача host `FAILED model_unavailable`, ни одного действия у гостя; гость управляем без модели | П+И | PASS, 33 | `tools/bridge/adapters.py`, `tools/bridge/agent.py` | высокая | M3 («Сбой provider сохраняет recovery shell») — нет |
+| **`m3-kill-noop`** | `TASK_KILL` возвращает успех без эффекта; исполнитель обязан ответить `VERIFY_FAILED still_running`, host-задача `FAILED action_failed` | **ОК** к `m3-agent` (критерий 4) | `test_fail`, 35; `core#4 exited with code 3` | `kernel/m3test.c` (`nx_inject_kill_noop`) | высокая | M3 («Verifier проверяет состояние задачи после операции») — нет |
 
 ### 2.5 M4 — постоянное состояние (9)
 
@@ -349,19 +478,27 @@ host-скрипты: `tools/bridge/m4scripts.py`; вердикт серии сб
 
 | Сценарий | Что проверяет | Тип | Вердикт, код | Файлы | Переносимость | Rust-этап |
 | --- | --- | --- | --- | --- | --- | --- |
-| `m4-blk` | оба virtio-blk по PCI; загрузочный `ro=yes` отвергает запись; 8 блоков записаны, сброшены, прочитаны, восстановлены; эмулируемый кэш держит запись до flush; диск после — пустое хранилище | П | PASS, 33; `store.gen=1` | `kernel/dev/blk.c`, `kernel/dev/virtio.c` | высокая (шаблон `id=0x10(01\|42)` учитывает legacy/modern id) | |
-| `m4-crash` | серия сбоев: остановка перед каждой из 60 операций записи/flush встроенной нагрузки × политики `all`/`none`/`torn`/`reorder` (те, что меняют исход), затем загрузка проверки; восстановлено поколение между последним `saved` и последним `begin`, содержимое = модели, host-читатель и обе проверки целостности согласны | И (серия) | `violations: 0`, `points_min: 60`; загрузки сбоя — `crash_point`, 43 | `tools/bench/harness.py` (crash-sweep), `tools/bench/storecheck.py`, `kernel/m4test.c` | средняя: методика — высокая; нужен слой сбоев в ядре и нумерация I/O | |
-| `m4-persist` | 2 загрузки на одном диске: конфигурация, blob, закрепление, `task.spawn/terminate` с write-ahead; после перезагрузки — те же значения, записи task engine, повтор запроса 1-й загрузки из записи, `ID_REUSED`, журнал фиксаций, следующая фиксация `gen+1` | П | PASS/PASS | `user/core/persist.c`, `tools/bridge/m4scripts.py` | высокая | |
-| **`m4-persist-amnesia`** | 2-я загрузка получает чистый диск (`data_disk: "fresh"`); host-проверки `persist_status`, `persist_config`, `persist_task`, `persist_replay` обязаны упасть | **ОК** к `m4-persist` | PASS / `test_fail`, 35 | `tests/qemu/scenarios.json` | высокая | |
-| `m4-corrupt-root` | между загрузками испорчен байт корня поколения 3; откат к 2 (`bad_root`), фиксация 4 в испорченный слот | П+И | PASS/PASS | `tools/store/nxstore.py` (`corrupt`) | высокая | |
-| `m4-unmountable` | испорчены оба суперблока; `no_valid_root`, `bad_crc,bad_crc`; операции хранилища `NO_STORE effects=none`, прочее NCI работает; диск не изменён (`data_disk_unchanged`) | П+И | PASS/PASS | `tools/store/nxstore.py` | высокая | |
-| `m4-full` | blob по 32 KiB до `NO_SPACE`; отказ без эффекта и без записи; удаления и prune (с резервом) освобождают место; после перезагрузки то же поколение | П+И | PASS/PASS | `lib/store.c`, `tools/bridge/m4scripts.py` | высокая | |
-| `m4-retention` | окно 4 поколения и закрепления: закреплённое вне окна читается, незакреплённое `PRUNED`, журнал помечает `pruned` | П | PASS, 33 | `lib/store.c` | высокая | |
-| **`m4-crash-noflush`** | `nanox.m4.flush=noop`: flush сообщает успех без записи; остановка сразу после каждого `store saved` (`points: "after-ack"`) с политикой `all` обязана потерять объявленное сохранённым | **ОК** к `m4-crash` | `violations_min: 1`, `^saved_lost:` (получено во всех 11 точках) | `kernel/m4test.c`, `tools/bench/storecheck.py` | высокая (при наличии слоя сбоев) | |
+| `m4-blk` | оба virtio-blk по PCI; загрузочный `ro=yes` отвергает запись; 8 блоков записаны, сброшены, прочитаны, восстановлены; эмулируемый кэш держит запись до flush; диск после — пустое хранилище | П | PASS, 33; `store.gen=1` | `kernel/dev/blk.c`, `kernel/dev/virtio.c` | высокая (шаблон `id=0x10(01\|42)` учитывает legacy/modern id) | M4 (virtio-blk; в Rust — userspace-драйвер) — нет |
+| `m4-crash` | серия сбоев: остановка перед каждой из 60 операций записи/flush встроенной нагрузки × политики `all`/`none`/`torn`/`reorder` (те, что меняют исход), затем загрузка проверки; восстановлено поколение между последним `saved` и последним `begin`, содержимое = модели, host-читатель и обе проверки целостности согласны | И (серия) | `violations: 0`, `points_min: 60`; загрузки сбоя — `crash_point`, 43 | `tools/bench/harness.py` (crash-sweep), `tools/bench/storecheck.py`, `kernel/m4test.c` | средняя: методика — высокая; нужен слой сбоев в ядре и нумерация I/O | M4 («torn writes, cutpoints») — нет |
+| `m4-persist` | 2 загрузки на одном диске: конфигурация, blob, закрепление, `task.spawn/terminate` с write-ahead; после перезагрузки — те же значения, записи task engine, повтор запроса 1-й загрузки из записи, `ID_REUSED`, журнал фиксаций, следующая фиксация `gen+1` | П | PASS/PASS | `user/core/persist.c`, `tools/bridge/m4scripts.py` | высокая | M4 («После reboot задачи восстанавливаются…») — нет |
+| **`m4-persist-amnesia`** | 2-я загрузка получает чистый диск (`data_disk: "fresh"`); host-проверки `persist_status`, `persist_config`, `persist_task`, `persist_replay` обязаны упасть | **ОК** к `m4-persist` | PASS / `test_fail`, 35 | `tests/qemu/scenarios.json` | высокая | M4 — нет |
+| `m4-corrupt-root` | между загрузками испорчен байт корня поколения 3; откат к 2 (`bad_root`), фиксация 4 в испорченный слот | П+И | PASS/PASS | `tools/store/nxstore.py` (`corrupt`) | высокая | M4 («corrupt metadata») — нет |
+| `m4-unmountable` | испорчены оба суперблока; `no_valid_root`, `bad_crc,bad_crc`; операции хранилища `NO_STORE effects=none`, прочее NCI работает; диск не изменён (`data_disk_unchanged`) | П+И | PASS/PASS | `tools/store/nxstore.py` | высокая | M4 («corrupt metadata») — нет |
+| `m4-full` | blob по 32 KiB до `NO_SPACE`; отказ без эффекта и без записи; удаления и prune (с резервом) освобождают место; после перезагрузки то же поколение | П+И | PASS/PASS | `lib/store.c`, `tools/bridge/m4scripts.py` | высокая | M4 («full disk», GC) — нет |
+| `m4-retention` | окно 4 поколения и закрепления: закреплённое вне окна читается, незакреплённое `PRUNED`, журнал помечает `pruned` | П | PASS, 33 | `lib/store.c` | высокая | M4 (GC, snapshot/restore) (предварительно — подтвердить Codex) — нет |
+| **`m4-crash-noflush`** | `nanox.m4.flush=noop`: flush сообщает успех без записи; остановка сразу после каждого `store saved` (`points: "after-ack"`) с политикой `all` обязана потерять объявленное сохранённым | **ОК** к `m4-crash` | `violations_min: 1`, `^saved_lost:` (получено во всех 11 точках) | `kernel/m4test.c`, `tools/bench/storecheck.py` | высокая (при наличии слоя сбоев) | M4 — нет |
 
-Детали серии (`docs/m4-store.md` §10): 154 пары загрузок (`all` 60, `none` 39,
-`torn` 38, `reorder` 17) + эталон; пары параллельно (`NANOX_JOBS`, по умолчанию
-3); точка, упавшая до контроллера M4, — ошибка стенда, перезапуск один раз,
+Детали серии (`docs/m4-store.md` §10): **153 пары загрузок сбоя** (сбой +
+проверка): `all` 60, `none` 38, `torn` 38, `reorder` 17 — политики по числу
+незафиксированных записей (`policies_for` в `tools/bench/storecheck.py`: 0 →
+только `all`; 1 → `all`, `none`, `torn`; ≥ 2 → ещё `reorder`); плюс **1
+эталонная точка** (полный прогон + загрузка проверки, `K = 61`) — итого **154
+результата**. Эталонная точка добавляется в результаты отдельно и считается
+под политикой `none` (`ref_point` и `results.append(ref_point)` в
+`tools/bench/harness.py`), поэтому в `summary.by_policy` и в итогах
+`docs/m4-store.md` §14 («154 пары загрузок (`all` 60, `none` 39, …)») стоит
+`none` 39 — это 38 пар сбоя + эталон. Пары выполняются параллельно
+(`NANOX_JOBS`, по умолчанию 3); точка, упавшая до контроллера M4, — ошибка стенда, перезапуск один раз,
 записывается в `summary.retried` (камень 4.1). Детерминизм: операции `1…K−1`
 загрузки сбоя совпадают с эталоном построчно.
 
@@ -375,33 +512,33 @@ host-скрипты: `tools/bridge/m4scripts.py`; вердикт серии сб
 
 | Сценарий | Что проверяет | Тип | Вердикт, код | Файлы | Переносимость | Rust-этап |
 | --- | --- | --- | --- | --- | --- | --- |
-| `m5-net` | virtio-net, ARP, ICMP, DNS (в т. ч. NXDOMAIN), TCP, отказ в соединении, диагностика; link down/up через QMP `set_link` | П | PASS, 33 | `kernel/dev/virtio.c`, `lib/net/net.c`, `lib/net/tcp.c`, `user/core/m5net.c` | высокая | |
-| `m5-net-loss` | то же при `nanox.m5.loss=rx:5,tx:7` (детерминированная потеря в ядре); ARP, DNS, TCP восстанавливаются | П+И | PASS, 33 | `kernel/m5test.c` | высокая (нужен детерминированный слой потерь) | |
-| `m5-tls` | CSPRNG из virtio-rng; TLS 1.3 против OpenSSL: AES-GCM и ChaCha20, ECDSA и RSA-PSS, промежуточный сертификат; отказы `expired`, `wrong-name`, `untrusted` — класс `tls`, OpenSSL видит alert, прикладные данные не ушли | П+И | PASS, 33 | `lib/tls/tls13.c`, `lib/tls/x509.c`, `user/core/m5tls.c`, `tools/net/pki.py` | высокая; см. камень 4.8 (гонка) | |
-| `m5-agent` | Core сам спрашивает provider через свой TCP/TLS без bridge; вызовы инструментов — проверенные действия task engine; телеметрия; ключ не попадает в лог | П | PASS, 33 | `user/core/agent.c`, `user/core/provider.c`, `lib/http/messages.c` | высокая | |
-| `m5-agent-loss` | `m5-agent` при потере rx:5, tx:7; TCP-повторы держат путь | П+И | PASS, 33 | `lib/net/tcp.c` | высокая | |
-| **`m5-noretx`** | та же потеря, повторная передача TCP выключена; путь provider обязан упасть | **ОК** к `m5-agent-loss` | `test_fail`, 35; `^ask_workload: FAILED .*class=net code=NET_ERROR ` | `kernel/m5test.c` | высокая | |
-| `m5-faults` | 429 с `Retry-After`, 529, 500, `error` в потоке, FIN без `close_notify`, ранний `close_notify`, молчание (тайм-аут), RST, закрытие keep-alive, исчерпание попыток, неповторяемые ошибки; каждая попытка классифицирована в телеметрии | П+И | PASS, 33 | `user/core/provider.c`, `tools/bench/provider.py` | высокая | |
-| **`m5-noretry`** | клиент делает одну попытку; проверки повторов обязаны упасть | **ОК** к `m5-faults` | `test_fail`, 35; `^retry_5xx: FAILED .*detail=overloaded ` | `kernel/m5test.c` | высокая | |
-| `m5-classes` | у одного гостя различаются `NET_ERROR` (refused, link down), `PROVIDER_ERROR` (HTTP 400, несуществующий инструмент), `ACTION_ERROR` — в ответе, телеметрии и `telemetry.status` | П+И | PASS, 33 | `lib/net/nerr.c`, `docs/m5-net.md` §9 | высокая | |
-| **`m5-flattel`** | классификация выключена (`unclassified`); проверки классов обязаны упасть | **ОК** к `m5-classes` | `test_fail`, 35; `^net_refused: FAILED .*class=unclassified code=UNCLASSIFIED_ERROR detail=conn_refused ` | `kernel/m5test.c` | высокая | |
-| `m5-console` | provider отказывает и линк опущен: агент падает чисто (`class=net`), консоль COM2 наблюдает, запускает/останавливает задачи, диагностирует; после возврата provider агент снова работает | П+И | PASS, 33 | `tools/bridge/m5scripts.py` | высокая | |
-| `m5-nokey` | нет объекта ключа: `LOCAL_ERROR no_key` до всякого соединения; консоль работает | П+И | PASS, 33 | `user/core/provider.c` | высокая | |
+| `m5-net` | virtio-net, ARP, ICMP, DNS (в т. ч. NXDOMAIN), TCP, отказ в соединении, диагностика; link down/up через QMP `set_link` | П | PASS, 33 | `kernel/dev/virtio.c`, `lib/net/net.c`, `lib/net/tcp.c`, `user/core/m5net.c` | высокая | M5 (virtio-net, Ethernet/IP/UDP/TCP/DNS) — нет |
+| `m5-net-loss` | то же при `nanox.m5.loss=rx:5,tx:7` (детерминированная потеря в ядре); ARP, DNS, TCP восстанавливаются | П+И | PASS, 33 | `kernel/m5test.c` | высокая (нужен детерминированный слой потерь) | M5 («Проверены потери, reorder…») — нет |
+| `m5-tls` | CSPRNG из virtio-rng; TLS 1.3 против OpenSSL: AES-GCM и ChaCha20, ECDSA и RSA-PSS, промежуточный сертификат; отказы `expired`, `wrong-name`, `untrusted` — класс `tls`, OpenSSL видит alert, прикладные данные не ушли | П+И | PASS, 33 | `lib/tls/tls13.c`, `lib/tls/x509.c`, `user/core/m5tls.c`, `tools/net/pki.py` | высокая; см. камень 4.8 (гонка) | M5 (entropy/CSPRNG, TLS с trust store и политикой времени) — нет |
+| `m5-agent` | Core сам спрашивает provider через свой TCP/TLS без bridge; вызовы инструментов — проверенные действия task engine; телеметрия; ключ не попадает в лог | П | PASS, 33 | `user/core/agent.c`, `user/core/provider.c`, `lib/http/messages.c` | высокая | M5 («Core вызывает provider непосредственно…», ключи не в логах) — нет |
+| `m5-agent-loss` | `m5-agent` при потере rx:5, tx:7; TCP-повторы держат путь | П+И | PASS, 33 | `lib/net/tcp.c` | высокая | M5 — нет |
+| **`m5-noretx`** | та же потеря, повторная передача TCP выключена; путь provider обязан упасть | **ОК** к `m5-agent-loss` | `test_fail`, 35; `^ask_workload: FAILED .*class=net code=NET_ERROR ` | `kernel/m5test.c` | высокая | M5 — нет |
+| `m5-faults` | 429 с `Retry-After`, 529, 500, `error` в потоке, FIN без `close_notify`, ранний `close_notify`, молчание (тайм-аут), RST, закрытие keep-alive, исчерпание попыток, неповторяемые ошибки; каждая попытка классифицирована в телеметрии | П+И | PASS, 33 | `user/core/provider.c`, `tools/bench/provider.py` | высокая | M5 («Обрывы streaming, timeout и reconnect…») — нет |
+| **`m5-noretry`** | клиент делает одну попытку; проверки повторов обязаны упасть | **ОК** к `m5-faults` | `test_fail`, 35; `^retry_5xx: FAILED .*detail=overloaded ` | `kernel/m5test.c` | высокая | M5 — нет |
+| `m5-classes` | у одного гостя различаются `NET_ERROR` (refused, link down), `PROVIDER_ERROR` (HTTP 400, несуществующий инструмент), `ACTION_ERROR` — в ответе, телеметрии и `telemetry.status` | П+И | PASS, 33 | `lib/net/nerr.c`, `docs/m5-net.md` §9 | высокая | M5 (предварительно — подтвердить Codex) — нет |
+| **`m5-flattel`** | классификация выключена (`unclassified`); проверки классов обязаны упасть | **ОК** к `m5-classes` | `test_fail`, 35; `^net_refused: FAILED .*class=unclassified code=UNCLASSIFIED_ERROR detail=conn_refused ` | `kernel/m5test.c` | высокая | M5 (предварительно — подтвердить Codex) — нет |
+| `m5-console` | provider отказывает и линк опущен: агент падает чисто (`class=net`), консоль COM2 наблюдает, запускает/останавливает задачи, диагностирует; после возврата provider агент снова работает | П+И | PASS, 33 | `tools/bridge/m5scripts.py` | высокая | M5 (с M3: «recovery shell») (предварительно — подтвердить Codex) — нет |
+| `m5-nokey` | нет объекта ключа: `LOCAL_ERROR no_key` до всякого соединения; консоль работает | П+И | PASS, 33 | `user/core/provider.c` | высокая | M5 («API credentials…») (предварительно — подтвердить Codex) — нет |
 
 ### 2.7 Сводка отрицательных контролей
 
-| Контроль | К чему | Сломанный механизм | Ожидаемая причина провала |
-| --- | --- | --- | --- |
-| `m2-sched-nopreempt` | `m2-sched` | вытеснение | `tasks did not interleave` |
-| `m2-ipc-overgrant` | `m2-ipc` | урезание прав handle при передаче | `rights=0x1f expected=0x5` |
-| `m3-events-off` | `m3-nci` | журнал событий ядра | `no_created_event` |
-| `m3-nodedup` | `m3-faults` | дедупликация запросов | `retry_not_replayed`, `retry_created_second_task` |
-| `m3-kill-noop` | `m3-agent` | эффект `TASK_KILL` | `VERIFY_FAILED still_running` / `action_failed` |
-| `m4-persist-amnesia` | `m4-persist` | сохранность диска между загрузками | `persist_status`, `persist_config`, `persist_task`, `persist_replay` |
-| `m4-crash-noflush` | `m4-crash` | flush | `saved_lost` |
-| `m5-noretx` | `m5-agent-loss` | повторная передача TCP | `class=net code=NET_ERROR` |
-| `m5-noretry` | `m5-faults` | повтор запроса к provider | `retry_5xx` |
-| `m5-flattel` | `m5-classes` | классификация ошибок | `class=unclassified` |
+| Контроль | К чему | Сломанный механизм | Ожидаемая причина провала | Rust-этап |
+| --- | --- | --- | --- | --- |
+| `m2-sched-nopreempt` | `m2-sched` | вытеснение | `tasks did not interleave` | M1/M2 (предварительно — подтвердить Codex) — нет |
+| `m2-ipc-overgrant` | `m2-ipc` | урезание прав handle при передаче | `rights=0x1f expected=0x5` | M2 — нет |
+| `m3-events-off` | `m3-nci` | журнал событий ядра | `no_created_event` | M3 — нет |
+| `m3-nodedup` | `m3-faults` | дедупликация запросов | `retry_not_replayed`, `retry_created_second_task` | M3 — нет |
+| `m3-kill-noop` | `m3-agent` | эффект `TASK_KILL` | `VERIFY_FAILED still_running` / `action_failed` | M3 — нет |
+| `m4-persist-amnesia` | `m4-persist` | сохранность диска между загрузками | `persist_status`, `persist_config`, `persist_task`, `persist_replay` | M4 — нет |
+| `m4-crash-noflush` | `m4-crash` | flush | `saved_lost` | M4 — нет |
+| `m5-noretx` | `m5-agent-loss` | повторная передача TCP | `class=net code=NET_ERROR` | M5 — нет |
+| `m5-noretry` | `m5-faults` | повтор запроса к provider | `retry_5xx` | M5 — нет |
+| `m5-flattel` | `m5-classes` | классификация ошибок | `class=unclassified` | M5 (предварительно — подтвердить Codex) — нет |
 
 Принцип (`docs/m5-net.md` §12 п. 9): отрицательный контроль для **каждого
 механизма, влияющего на вердикт**. Рекомендуется переносить контроль вместе с
@@ -645,7 +782,9 @@ slirp, `ram_mapped` 250–262 MiB, PCI-адреса) под 9.2 **не пров�
 
 ## 6. Предлагаемый порядок переноса (рекомендация)
 
-Решение за Codex и владельцем; сопоставление с ROADMAP M0–M10 — за Codex.
+Решение за Codex и владельцем. Этапы ROADMAP M0–M10 для каждого пункта — в
+пометках и колонке «Rust-этап» разделов 1–2 (заполнено Claude, требует
+подтверждения Codex).
 
 1. **Модель вердикта и её тесты** (раздел 1.2–1.3, таблицы случаев из
    `tests/host/test_harness.py`) — дёшево, язык-нейтрально, сразу защищает от
