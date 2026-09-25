@@ -362,20 +362,20 @@ boot info. Запись — `out/runs/<время>-gdb/record.json` и `gdb.log`
 
 ### 1.9 Прочие соглашения, которые стоит сохранить
 
-| Соглашение | Источник | Зачем |
-| --- | --- | --- |
-| Единственный источник командной строки QEMU (`qemu.py print`), каждое отклонение от канона перечислено | `tools/bench/qemu.py`, `docs/m0-bench.md` §2 | сценарии не расходятся незаметно |
-| `-no-user-config -nodefaults`, версионированный machine type, фиксированные CPU/RAM/SMP, `-rtc base=…,clock=vm` | `docs/m0-bench.md` §2 | детерминизм; фиксированная дата нужна и для срока сертификатов M5 (`docs/m5-net.md` §3) |
-| Свежая копия `OVMF_VARS` на запуск; прошивка закреплена по SHA-256 | `docs/m0-bench.md` §2 | одинаковое начальное NVRAM |
-| `make doctor` сверяет версии и хеши с `toolchain.lock`, профиль без `status = verified` отвергается | `tools/doctor.py`, `toolchain.lock` | непроверенное окружение не выдаётся за проверенное |
-| Неизвестное значение `nanox.test=` — `TEST FAIL`, а не молчаливый PASS | сценарий `unknown-test` | опечатка в сценарии не превращается в зелёный тест |
-| Сторожевой таймер в прерывании печатает `TEST FAIL watchdog: …` раньше таймаута harness | `docs/m2-kernel.md` §2 | содержательный вердикт вместо `timeout`; зависание с запрещёнными прерываниями остаётся таймаутом |
-| Все ожидания в ядре ограничены числом опросов; сбой — `TEST FAIL <причина>`, не зависание | `docs/m1-kernel.md` §7 | |
-| Контроллер теста сверяет счётчики ресурсов (свободные страницы, таблицы, задачи, объекты, endpoint'ы) до и после | `docs/m2-kernel.md` §2, `docs/m3-core.md` §8 | утечки видны в каждом сценарии, а не в отдельном тесте |
-| Итог host-проверок передаётся гостю (`session.close host_checks=ok\|fail`) и становится кодом выхода гостевого процесса → вердиктом ядра | `docs/m3-core.md` §2, §10 п. 8 | вердикт остаётся в конвенции «маркер + код» |
-| Хеши ядра и initramfs, напечатанные гостем, сверяются с хешами файлов на хосте | сценарий `normal` (`{kernel_sha256}`, `{initrd_sha256}`) | гость загрузил именно собранные артефакты |
-| Переключатели fault injection есть в сборке, но включаются только режимом `nanox.test=` | `kernel/main.c`, `kernel/m2test.c`, `kernel/m3test.c`, `kernel/m4test.c`, `kernel/m5test.c` | один и тот же образ для положительного сценария и его контроля |
-| Секрет не должен появляться в serial-логе — отдельная host-проверка | `check_key_secret` в `tools/bridge/m5scripts.py` | |
+| Соглашение | Источник | Зачем | Rust-этап |
+| --- | --- | --- | --- |
+| Единственный источник командной строки QEMU (`qemu.py print`), каждое отклонение от канона перечислено | `tools/bench/qemu.py`, `docs/m0-bench.md` §2 | сценарии не расходятся незаметно | M0 — есть в Rust M0: argv строит одна функция `qemu_args` и пишет в запись массивом ([`b8913fa:tools/xtask/src/runner.rs` L214–309](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L214-L309)); отдельного перечня отклонений от канона нет |
+| `-no-user-config -nodefaults`, версионированный machine type, фиксированные CPU/RAM/SMP, `-rtc base=…,clock=vm` | `docs/m0-bench.md` §2 | детерминизм; фиксированная дата нужна и для срока сертификатов M5 (`docs/m5-net.md` §3) | M0 — частично есть: `-nodefaults`, `pc-q35-9.2`, фиксированные CPU/RAM/SMP и `-rtc base=…,clock=vm` есть ([`b8913fa:tools/xtask/src/runner.rs` L214–241](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/tools/xtask/src/runner.rs#L214-L241)); `-no-user-config` нет |
+| Свежая копия `OVMF_VARS` на запуск; прошивка закреплена по SHA-256 | `docs/m0-bench.md` §2 | одинаковое начальное NVRAM | M0 — частично есть: VARS — свежий qcow2-оверлей над исходным шаблоном, хеши CODE/VARS в записи; `doctor` хеши прошивки с `b8913fa:docs/specs/machine-profile.toml` не сверяет (раздел 1.5) |
+| `make doctor` сверяет версии и хеши с `toolchain.lock`, профиль без `status = verified` отвергается | `tools/doctor.py`, `toolchain.lock` | непроверенное окружение не выдаётся за проверенное | M0 — частично есть: `doctor` проверяет версии Rust/QEMU, sysroot, машину и наличие lock-файлов; статуса профиля и сверки хешей прошивки нет (раздел 1.5) |
+| Неизвестное значение `nanox.test=` — `TEST FAIL`, а не молчаливый PASS | сценарий `unknown-test` | опечатка в сценарии не превращается в зелёный тест | M0 — нет: неизвестное значение `boot_epoch` в test-профиле даёт PASS ([`b8913fa:kernel/src/main.rs` L190–204](https://github.com/ANngrock/NANOX-OS/blob/b8913fa5a89a288347deae389f53d7f2b4a9261b/kernel/src/main.rs#L190-L204)) |
+| Сторожевой таймер в прерывании печатает `TEST FAIL watchdog: …` раньше таймаута harness | `docs/m2-kernel.md` §2 | содержательный вердикт вместо `timeout`; зависание с запрещёнными прерываниями остаётся таймаутом | M1 (timer, «ошибки … диагностика») — нет (предварительно — подтвердить Codex) |
+| Все ожидания в ядре ограничены числом опросов; сбой — `TEST FAIL <причина>`, не зависание | `docs/m1-kernel.md` §7 | зависание превращается в содержательный `TEST FAIL`, а не в `timeout` без причины | M1 («GDT/IDT, исключения, timer … работают») (предварительно — подтвердить Codex) — нет |
+| Контроллер теста сверяет счётчики ресурсов (свободные страницы, таблицы, задачи, объекты, endpoint'ы) до и после | `docs/m2-kernel.md` §2, `docs/m3-core.md` §8 | утечки видны в каждом сценарии, а не в отдельном тесте | M1 (allocator, «Проверены … исчерпание памяти»), для задач и объектов — M2 (предварительно — подтвердить Codex) — нет |
+| Итог host-проверок передаётся гостю (`session.close host_checks=ok\|fail`) и становится кодом выхода гостевого процесса → вердиктом ядра | `docs/m3-core.md` §2, §10 п. 8 | вердикт остаётся в конвенции «маркер + код» | M3 (host bridge и guest executor) — нет |
+| Хеши ядра и initramfs, напечатанные гостем, сверяются с хешами файлов на хосте | сценарий `normal` (`{kernel_sha256}`, `{initrd_sha256}`) | гость загрузил именно собранные артефакты | M0 — нет: ядро печатает BootInfo, но хеши ядра в serial с хостом не сверяются (раздел 2.1, `normal`) |
+| Переключатели fault injection есть в сборке, но включаются только режимом `nanox.test=` | `kernel/main.c`, `kernel/m2test.c`, `kernel/m3test.c`, `kernel/m4test.c`, `kernel/m5test.c` | один и тот же образ для положительного сценария и его контроля | M0 — есть в Rust M0: режим сбоя задаётся `boot_epoch` в BOOT.CFG образа только в test-профиле, бинарники EFI/ELF те же |
+| Секрет не должен появляться в serial-логе — отдельная host-проверка | `check_key_secret` в `tools/bridge/m5scripts.py` | утечка ключа в лог, который сохраняется в записи запуска, обнаруживается автоматически, а не при чтении | M5 («API credentials хранятся и используются без вывода в обычные логи») — нет |
 
 ---
 
@@ -557,31 +557,31 @@ host-скрипты: `tools/bridge/m4scripts.py`; вердикт серии сб
 
 ### 3.1 Что покрыто
 
-| Модуль | Тест | Что стоит перенести |
-| --- | --- | --- |
-| Валидатор boot info | `tests/host/test_bootinfo.c` | все коды `E_*` из `docs/boot-info.md` §5 по отдельности; `test_mutations`: 20 000 итераций детерминированного xorshift-искажения 1–4 бит в boot info, cmdline, карте памяти и RSDP — валидатор не падает (UBSan), код всегда в диапазоне, принятая структура имеет верный magic, хотя бы одно искажение отвергнуто |
-| Перевод карты памяти UEFI | `tests/host/test_mmap.c` | выравнивание, переполнение, пересечения, ёмкость |
-| Чтение initramfs (cpio newc) | `tests/host/test_initramfs.c` | все коды `E_TRUNCATED` … `E_NOT_FOUND`; 20 000 случайных искажений; чтение программ из собранного `out/initrd.img` |
-| План загрузки ELF | `tests/host/test_elf.c` | границы и порядок сегментов, окно адресов, точка входа, W+X |
-| SHA-256 | `tests/host/test_sha256.c` | известные векторы |
-| Физический allocator | `tests/host/test_pmm.c` | `E_ALIGN`, `E_UNMANAGED`, `E_DOUBLE_FREE`, страницы ниже 1 MiB |
-| Таблицы страниц | `tests/host/test_pt.c` | построение, права, `test_destroy_slots` (утечки при разборке, пропуск листьев) |
-| Таблица handle | `tests/host/test_handle.c` | права при дублировании/передаче, поколения, полная таблица, счётчики ссылок |
-| Очередь IPC | `tests/host/test_ipc.c` | пустая/полная, копирование, перенос по кругу, опустошение |
-| Журнал событий | `tests/host/test_event.c` | порядок, вытеснение из кольца, выключенный журнал |
-| Разбор NCI | `tests/host/test_nci.c` | все ошибки разбора, границы длины, отпечатки, ссылки |
-| Task engine | `tests/host/test_engine.c` | все допустимые и запрещённые переходы, дедупликация, `ID_REUSED`, вытеснение, режим без дедупликации, восстановление |
-| Хранилище | `tests/host/test_store.c` | формат, объекты, версии, `test_retention`, `test_full`, `test_recovery`, ошибки устройства, `test_crash_simulation` (ниже) |
-| Сеть | `tests/host/test_net.c` | два стека на имитированной линии: потеря, дубли, переупорядочивание, нулевое окно; DNS; классы ошибок |
-| Криптография | `tests/host/test_crypto.c`, `tests/host/crypto_vectors.h`, `tests/host/gen_crypto_vectors.py` | векторы, сгенерированные hashlib/hmac/OpenSSL, плюс отрицательные случаи с инвертированным битом |
-| JSON/HTTP/SSE/Messages | `tests/host/test_http.c` | разбор и запись JSON, ответы HTTP, SSE, поток и тело Messages |
-| TLS против OpenSSL | `tests/host/test_tls.py`, `tests/host/tlstool.c` | 14 тестов: оба набора, RSA-цепочка, wildcard, нет промежуточного, просрочен/ещё не действует, чужое имя, недоверенный УЦ, усечение; OpenSSL судит те же профили так же |
-| Harness | `tests/host/test_harness.py` | правила вердикта, разбор отчёта, маскирование, чередование, валидность сценариев |
-| Образ и initramfs | `tests/host/test_mkimage.py`, `tests/host/test_mkinitrd.py` | детерминизм, GPT, геометрия FAT32, манифест, **обратное чтение через mtools**, fault injection образа |
-| Две реализации формата хранилища | `tests/host/test_nxstore.py`, `tests/host/storetool.c` | C читает Python-формат и наоборот, одинаковые решения восстановления |
-| Вердикт серии сбоев | `tests/host/test_storecheck.py` | модель поколений, `saved_lost`, `content_mismatch`, ошибка стенда ≠ нарушение |
-| Bridge | `tests/host/test_bridge.py` | шум прошивки до `HELLO`, потеря ответа с дедупликацией и без, полнота трассы |
-| Сервисы и provider стенда | `tests/host/test_m5host.py`, `tests/host/test_provider.py` | DNS, провижининг диска, форма потока, сценарии сбоев |
+| Модуль | Тест | Что стоит перенести | Rust-этап |
+| --- | --- | --- | --- |
+| Валидатор boot info | `tests/host/test_bootinfo.c` | все коды `E_*` из `docs/boot-info.md` §5 по отдельности; `test_mutations`: 20 000 итераций детерминированного xorshift-искажения 1–4 бит в boot info, cmdline, карте памяти и RSDP — валидатор не падает (UBSan), код всегда в диапазоне, принятая структура имеет верный magic, хотя бы одно искажение отвергнуто | M0 — частично есть: `b8913fa:crates/boot-protocol/tests/boot_info.rs` проверяет версию, флаги, указатели, пересечения, stride, усечение; массового искажения (аналог 20 000 итераций) нет |
+| Перевод карты памяти UEFI | `tests/host/test_mmap.c` | выравнивание, переполнение, пересечения, ёмкость | M0/M1 — частично есть: stride, усечение, пересечения и reserved-диапазоны в `b8913fa:crates/boot-protocol/tests/boot_info.rs`; ёмкость и выравнивание для allocator — M1 (предварительно — подтвердить Codex) |
+| Чтение initramfs (cpio newc) | `tests/host/test_initramfs.c` | все коды `E_TRUNCATED` … `E_NOT_FOUND`; 20 000 случайных искажений; чтение программ из собранного `out/initrd.img` | M2 (источник userspace ELF) (предварительно — подтвердить Codex) — нет |
+| План загрузки ELF | `tests/host/test_elf.c` | границы и порядок сегментов, окно адресов, точка входа, W+X | M0 — есть в Rust M0: `b8913fa:crates/boot-protocol/tests/elf_validation.rs` + golden fixtures `b8913fa:tests/fixtures/` (усечение, пересечение, W+X, переполнение, выравнивание, окно адресов) |
+| SHA-256 | `tests/host/test_sha256.c` | известные векторы | M5 (криптографические операции) (предварительно — подтвердить Codex) — нет: в Rust M0 SHA-256 только на хосте (crate `sha2`), гостевой реализации нет |
+| Физический allocator | `tests/host/test_pmm.c` | `E_ALIGN`, `E_UNMANAGED`, `E_DOUBLE_FREE`, страницы ниже 1 MiB | M1 — нет |
+| Таблицы страниц | `tests/host/test_pt.c` | построение, права, `test_destroy_slots` (утечки при разборке, пропуск листьев) | M1 («mapping/unmapping и проверка page permissions») — нет |
+| Таблица handle | `tests/host/test_handle.c` | права при дублировании/передаче, поколения, полная таблица, счётчики ссылок | M2 — нет |
+| Очередь IPC | `tests/host/test_ipc.c` | пустая/полная, копирование, перенос по кругу, опустошение | M2 — нет |
+| Журнал событий | `tests/host/test_event.c` | порядок, вытеснение из кольца, выключенный журнал | M3 («События имеют sequence, overflow marker и resync») — нет |
+| Разбор NCI | `tests/host/test_nci.c` | все ошибки разбора, границы длины, отпечатки, ссылки | M3 (framed COM2 protocol с лимитами) — нет |
+| Task engine | `tests/host/test_engine.c` | все допустимые и запрещённые переходы, дедупликация, `ID_REUSED`, вытеснение, режим без дедупликации, восстановление | M3 — нет |
+| Хранилище | `tests/host/test_store.c` | формат, объекты, версии, `test_retention`, `test_full`, `test_recovery`, ошибки устройства, `test_crash_simulation` (ниже) | M4 — нет |
+| Сеть | `tests/host/test_net.c` | два стека на имитированной линии: потеря, дубли, переупорядочивание, нулевое окно; DNS; классы ошибок | M5 — нет |
+| Криптография | `tests/host/test_crypto.c`, `tests/host/crypto_vectors.h`, `tests/host/gen_crypto_vectors.py` | векторы, сгенерированные hashlib/hmac/OpenSSL, плюс отрицательные случаи с инвертированным битом | M5 — нет |
+| JSON/HTTP/SSE/Messages | `tests/host/test_http.c` | разбор и запись JSON, ответы HTTP, SSE, поток и тело Messages | M5 (предварительно — подтвердить Codex) — нет |
+| TLS против OpenSSL | `tests/host/test_tls.py`, `tests/host/tlstool.c` | 14 тестов: оба набора, RSA-цепочка, wildcard, нет промежуточного, просрочен/ещё не действует, чужое имя, недоверенный УЦ, усечение; OpenSSL судит те же профили так же | M5 — нет |
+| Harness | `tests/host/test_harness.py` | правила вердикта, разбор отчёта, маскирование, чередование, валидность сценариев | M0 — частично есть: тесты вердикта и таймаута в `b8913fa:tools/xtask/src/runner.rs` и `b8913fa:tools/xtask/src/record.rs`; маскирования, чередования и проверки файла сценариев нет |
+| Образ и initramfs | `tests/host/test_mkimage.py`, `tests/host/test_mkinitrd.py` | детерминизм, GPT, геометрия FAT32, манифест, **обратное чтение через mtools**, fault injection образа | M0 — частично есть: тест искажения ядра в `b8913fa:tools/xtask/src/image.rs`; побайтная повторяемость образа и обратное чтение не автоматизированы (раздел 1.7); initramfs нет |
+| Две реализации формата хранилища | `tests/host/test_nxstore.py`, `tests/host/storetool.c` | C читает Python-формат и наоборот, одинаковые решения восстановления | M4 (предварительно — подтвердить Codex) — нет |
+| Вердикт серии сбоев | `tests/host/test_storecheck.py` | модель поколений, `saved_lost`, `content_mismatch`, ошибка стенда ≠ нарушение | M4 — нет |
+| Bridge | `tests/host/test_bridge.py` | шум прошивки до `HELLO`, потеря ответа с дедупликацией и без, полнота трассы | M3 — нет |
+| Сервисы и provider стенда | `tests/host/test_m5host.py`, `tests/host/test_provider.py` | DNS, провижининг диска, форма потока, сценарии сбоев | M5 (предварительно — подтвердить Codex) — нет |
 
 Переносимость: **высокая** для самих случаев (таблицы входов/ожиданий),
 **средняя** для кода (в Rust — `#[test]`/proptest вместо макросов
