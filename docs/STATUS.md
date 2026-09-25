@@ -179,6 +179,71 @@ boot-protocol). Исправлено заменой на `is_multiple_of`/`div_c
   другой исходный код даёт другой машинный код. Поведение подтверждено
   тестами и QEMU-сценариями выше, не сравнением бинарников.
 
+## Срез M5-1: сетевые кодеки (2026-09-25)
+
+По указанию пользователя M5 начат раньше M1–M4. **M5 начат, не завершён:**
+ни один критерий M5 в ROADMAP не выполнен. Контракт и зависимости —
+[M5-NETWORK](specs/M5-NETWORK.md).
+
+- `crates/net-wire`: `no_std`, без `alloc`, `#![forbid(unsafe_code)]`, без
+  сторонних crates. Кодеки Ethernet II, ARP (Ethernet/IPv4), IPv4, ICMP
+  echo, UDP; RFC 1071 checksum. IPv4 options отдаются сырыми, фрагменты
+  отвергаются (`Fragmented`), сборки нет. Добавлен в workspace и в
+  host-тесты `cargo xtask test`.
+- `crates/net-wire/tests/wire.rs`: 14 тестов — round trip, каждое правило
+  политики отдельным негативным случаем, все усечения, 20 000
+  псевдослучайных входов без panic.
+
+Проверка в основном checkout (`b8913fa` + рабочее дерево, `dirty: true`),
+каждая команда в `nix develop`; логи и коды выхода — повторный прогон после
+ревью (добавлены QinQ, групповые MAC/IPv4 отправителя ARP в разборе и
+эмиссии) `out/m5-1-checks-20260925T132032Z/`, первый —
+`out/m5-1-checks-20260925T130157Z/`:
+
+- `cargo clippy --locked --package boot-protocol --package net-wire
+  --package xtask --all-targets -- -D warnings`,
+  `cargo build --locked --package net-wire --target x86_64-unknown-none`,
+  `cargo fmt --all -- --check`, `python3 tests/fixtures/generate.py --check`,
+  `cargo xtask doctor`, `git diff --check` — exit 0.
+- `cargo xtask test --replay` — exit 0: 45 host-тестов (6 + 16 + 14 + 9) и
+  семь QEMU-сценариев M0 без регрессий
+  (`out/runs/1790342434069814160-858686-suite/suite.json`); replay PASS и
+  FAIL совпали
+  (`out/runs/1790342549482249796-858686-pass-replay-play/replay-comparison.json`,
+  `out/runs/1790342588303281291-858686-kernel-fail-replay-play/replay-comparison.json`).
+- В QEMU сетевой код не исполняется: в guest нет драйвера, профиль M0
+  отключает сеть.
+- Исправления по ревью (часть A пакета M5-2): описание в `lib.rs` о
+  заимствовании только данных переменной длины; тесты broadcast
+  IPv4-источника (отвергается) и broadcast-назначения (принимается), round
+  trip ICMP echo reply, в том числе с пустыми данными.
+
+## Срез M5-2: DNS-кодек (2026-09-25)
+
+Модуль `net_wire::dns` (`crates/net-wire/src/dns.rs`), контракт —
+[M5-NETWORK §5](specs/M5-NETWORK.md). Stub A/IN: запрос с RD; проверка ID,
+QR/opcode/QDCOUNT, лимита записей, эха вопроса до RCODE, TC и RCODE.
+Результат — только A-записи секции Answer, достижимые от QNAME через не
+более 8 CNAME; Authority/Additional проходят те же проверки RDATA A/CNAME,
+но в результат не попадают. Циклы и конфликты CNAME, переполнение
+выходного массива (`OutputFull`; ёмкость проверяется до записи, массив не
+меняется), минимум TTL по CNAME и A, лимит имени 255 байт, указатели
+сжатия только назад. 14 тестов в `crates/net-wire/tests/dns.rs`.
+M5 по-прежнему только начат: транспорт DNS, повторы и таймауты — в
+сетевом сервисе после M1–M4.
+
+Проверка в основном checkout (`b8913fa` + рабочее дерево, `dirty: true`),
+те же команды, что для M5-1, в `nix develop`. Повторный прогон после
+ревью (ёмкость `OutputFull` до записи, RDATA в Authority/Additional) —
+`out/m5-1-checks-20260925T140324Z/`, первый —
+`out/m5-1-checks-20260925T134624Z/`: clippy `-D warnings`, `net-wire` для
+`x86_64-unknown-none`, fmt, fixtures, doctor, `git diff --check` — exit 0;
+`cargo xtask test --replay` — exit 0: 59 host-тестов (6 + 16 + 14 + 14 + 9),
+семь QEMU-сценариев (`out/runs/1790345006243449378-900379-suite/suite.json`),
+replay PASS и FAIL совпали
+(`out/runs/1790345120357154504-900379-pass-replay-play/replay-comparison.json`,
+`out/runs/1790345159487682655-900379-kernel-fail-replay-play/replay-comparison.json`).
+
 ## Известный долг
 
 - `docs/specs/machine-profile.toml` входит в source fingerprint, но не
@@ -203,7 +268,12 @@ boot-protocol). Исправлено заменой на `is_multiple_of`/`div_c
 
 Отдельными задачами, по одной:
 
-1. ~~Clippy-долг~~ — выполнено, см. «Срез 1: Clippy»; ожидает ревью.
+По указанию пользователя приоритет — M5, затем остальные этапы. Срез M5-1
+принят; M5-2 (DNS) ожидает ревью. Следующий host-проверяемый шаг M5 без
+M1–M4 — ARP neighbor cache фиксированной ёмкости с внешним временем. Затем
+M1–M4, интеграция M5 и M6–M10 по ROADMAP.
+
+1. ~~Clippy-долг~~ — выполнено и принято, см. «Срез 1: Clippy».
 2. Полная сверка runtime-профиля с `docs/specs/machine-profile.toml`: все
    исполняемые поля профиля, в том числе machine, версия и патч QEMU, CPU,
    vCPU, RAM, accelerator, RTC, network, display, boot controller, serial,
