@@ -284,6 +284,68 @@ fn bar64_ending_at_top_of_address_space_is_accepted() {
 }
 
 #[test]
+fn bar64_sized_entirely_by_upper_half() {
+    // Model-driven: the low half has no writable address bits.
+    for (size, address, prefetchable) in [
+        (4u64 << 30, 0x1_0000_0000u64, false),
+        (16 << 30, 0x40_0000_0000, true),
+        (64 << 30, 0x10_0000_0000, true),
+    ] {
+        let mut model = single(Func::endpoint(0x10DE, 0x2560, 0x03, 0, 0).mem64(
+            0,
+            size,
+            address,
+            prefetchable,
+        ));
+        let slot = probe_bar(&mut model, bdf(0, 4, 0), HeaderKind::Endpoint, 0).unwrap();
+        assert_eq!(
+            slot,
+            BarSlot::Bar(Bar {
+                index: 0,
+                kind: BarKind::Memory64,
+                prefetchable,
+                address,
+                size
+            }),
+            "size {size:#x}"
+        );
+    }
+
+    // Explicit responses: low half returns only type bits 0x4 / 0xC.
+    for (low_flags, prefetchable) in [(0x4, false), (0xC, true)] {
+        let mut f = Func::endpoint(0x10DE, 0x2560, 0x03, 0, 0);
+        f.set32(0x10, low_flags);
+        f.set32(0x14, 0x0000_0010);
+        f.bar_response[0] = Some(low_flags);
+        f.bar_response[1] = Some(0xFFFF_FFF0);
+        let mut model = single(f);
+        let slot = probe_bar(&mut model, bdf(0, 4, 0), HeaderKind::Endpoint, 0).unwrap();
+        assert_eq!(
+            slot,
+            BarSlot::Bar(Bar {
+                index: 0,
+                kind: BarKind::Memory64,
+                prefetchable,
+                address: 0x10_0000_0000,
+                size: 64 << 30
+            })
+        );
+    }
+
+    // 64 GiB BAR programmed at a 32 GiB boundary is misaligned.
+    let mut f = Func::endpoint(0x10DE, 0x2560, 0x03, 0, 0);
+    f.set32(0x10, 0xC);
+    f.set32(0x14, 0x0000_0008);
+    f.bar_response[0] = Some(0xC);
+    f.bar_response[1] = Some(0xFFFF_FFF0);
+    let mut model = single(f);
+    assert_eq!(
+        probe_bar(&mut model, bdf(0, 4, 0), HeaderKind::Endpoint, 0),
+        Err(PciError::BarResponse)
+    );
+}
+
+#[test]
 fn bar64_misaligned_to_its_huge_size_is_rejected() {
     // Upper half decodes only bit 63: an 8 EiB BAR cannot sit at 0x4000_0000_0000_0000.
     let mut f = Func::endpoint(0x1234, 0x5678, 0xFF, 0, 0);

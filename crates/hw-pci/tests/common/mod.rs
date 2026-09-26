@@ -188,8 +188,12 @@ impl Func {
         self.cap(offset, 0x10, &flags.to_le_bytes())
     }
 
-    /// Append an extended capability header at `offset` (>= 0x100).
+    /// Append an extended capability header at `offset` (>= 0x100). Offset
+    /// 0x100 always starts a new chain.
     pub fn ext_cap(mut self, offset: u16, id: u16, version: u8) -> Self {
+        if offset == 0x100 {
+            self.last_ext = 0;
+        }
         let header = u32::from(id) | (u32::from(version) << 16);
         self.set32(offset as usize, header);
         if self.last_ext != 0 {

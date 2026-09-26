@@ -133,7 +133,7 @@ pub fn write_bridge_buses<C: ConfigSpace + ?Sized>(
         return Err(PciError::SubordinateBelowSecondary);
     }
     if buses.secondary <= buses.primary {
-        return Err(PciError::BusConflict);
+        return Err(PciError::SecondaryNotAbovePrimary);
     }
     require_bridge(cfg, bdf)?;
     // Offsets 0x18..0x1B hold no write-1-to-clear bits, so a dword

@@ -2,10 +2,10 @@ mod common;
 
 use common::{bdf, lenovo, q35, segment_from, Func, Model, LENOVO_MCFG, Q35_MCFG};
 use hw_pci::{
-    enumerate, extended_capabilities, find_capability, probe_bars, read_bridge_buses, Bdf,
-    BridgeBuses, BusNumbering, BusRange, EcamSegment, EnumerationConfig, Function, HeaderKind, Msi,
-    MsiX, PciError, PcieCapability, PciePortType, CAP_ID_MSI, CAP_ID_MSIX, CAP_ID_PCIE,
-    MAX_BRIDGE_DEPTH,
+    enumerate, extended_capabilities, find_capability, probe_bars, read_bridge_buses,
+    write_bridge_buses, Bdf, BridgeBuses, BusNumbering, BusRange, EcamSegment, EnumerationConfig,
+    Function, HeaderKind, Msi, MsiX, PciError, PcieCapability, PciePortType, CAP_ID_MSI,
+    CAP_ID_MSIX, CAP_ID_PCIE, MAX_BRIDGE_DEPTH,
 };
 
 fn config(model: &Model, max_depth: u8, numbering: BusNumbering) -> EnumerationConfig {
@@ -417,6 +417,39 @@ fn assignment_detects_bridge_that_ignores_writes() {
     assert_eq!(
         run(&mut model, 4, BusNumbering::Assign),
         Err(PciError::BridgeNotProgrammed)
+    );
+}
+
+#[test]
+fn bridge_bus_writes_are_validated_before_access() {
+    let mut model = root_with_bridges(&[]);
+    model.add_bridge(0, 1, 0, Func::bridge(0x1B36, 0x000C));
+    let port = bdf(0, 1, 0);
+    let request = |primary, secondary, subordinate| BridgeBuses {
+        primary,
+        secondary,
+        subordinate,
+    };
+    for (buses, error) in [
+        (request(0, 0, 0), PciError::SecondaryNotAbovePrimary),
+        (request(5, 3, 7), PciError::SecondaryNotAbovePrimary),
+        (request(0, 4, 3), PciError::SubordinateBelowSecondary),
+    ] {
+        assert_eq!(
+            write_bridge_buses(&mut model, port, buses),
+            Err(error),
+            "{buses:?}"
+        );
+    }
+    assert!(model.writes.is_empty());
+    assert_eq!(
+        write_bridge_buses(&mut model, port, request(0, 1, 3)),
+        Ok(())
+    );
+    assert_eq!(read_bridge_buses(&mut model, port), Ok(request(0, 1, 3)));
+    assert_eq!(
+        write_bridge_buses(&mut model, bdf(0, 0, 0), request(0, 1, 1)),
+        Err(PciError::NotABridge)
     );
 }
 

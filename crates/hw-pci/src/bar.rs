@@ -112,6 +112,10 @@ const fn bar_offset(index: u8) -> u16 {
 /// the first write, unless the device itself refuses the restore
 /// ([`PciError::BarNotRestored`], [`PciError::CommandNotRestored`]).
 ///
+/// For a 64-bit BAR the low half is written and read back before the high
+/// half, the same order as Linux `__pci_read_base`; PCI 3.0 §6.2.5.1 does not
+/// require both halves to be written before either is read.
+///
 /// Sizing briefly disables decode; the caller must ensure no driver is using
 /// the function concurrently.
 pub fn probe_bar<C: ConfigSpace + ?Sized>(

@@ -103,6 +103,9 @@ pub enum PciError {
     CapabilityLoop,
     /// The capability structure extends past the end of its configuration space.
     CapabilityBounds,
+    /// An extended capability header after the first reads 0 or all ones
+    /// (function removed or list corrupt).
+    ExtendedCapabilityHeader,
     /// The structure at the given offset has a different capability ID.
     CapabilityId,
     /// MSI control uses a reserved vector encoding or enables more vectors than capable.
@@ -121,6 +124,8 @@ pub enum PciError {
     PcieCapability,
     /// Bridge primary bus number differs from the bus it was found on.
     BridgePrimaryMismatch,
+    /// Requested bridge secondary bus number is not above its primary bus.
+    SecondaryNotAbovePrimary,
     /// Bridge subordinate bus number is below its secondary bus number.
     SubordinateBelowSecondary,
     /// Bridge bus range leaves the window of its parent bridge.

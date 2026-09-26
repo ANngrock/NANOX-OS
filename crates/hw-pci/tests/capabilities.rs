@@ -202,6 +202,34 @@ fn extended_list_walk_loop_and_bounds() {
 }
 
 #[test]
+fn extended_header_of_zero_or_all_ones_after_first_is_an_error() {
+    for dead in [u32::MAX, 0] {
+        let mut f = plain().ext_cap(0x100, 0x0001, 2);
+        let header = f.get32(0x100) | (0x200 << 20);
+        f.set32(0x100, header);
+        f.set32(0x200, dead);
+        let (mut model, at) = single(f);
+        let caps: Vec<_> = extended_capabilities(&mut model, at).collect();
+        assert_eq!(
+            caps,
+            vec![
+                Ok(ExtendedCapability {
+                    id: 1,
+                    version: 2,
+                    offset: 0x100
+                }),
+                Err(PciError::ExtendedCapabilityHeader),
+            ],
+            "header {dead:#x}"
+        );
+        assert_eq!(
+            find_extended_capability(&mut model, at, 0xFFFF),
+            Err(PciError::ExtendedCapabilityHeader)
+        );
+    }
+}
+
+#[test]
 fn absent_extended_space_is_empty() {
     let (mut model, at) = single(plain());
     assert_eq!(extended_capabilities(&mut model, at).count(), 0);

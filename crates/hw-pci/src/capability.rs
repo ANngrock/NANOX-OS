@@ -110,7 +110,9 @@ impl<C: ConfigSpace + ?Sized> Iterator for Capabilities<'_, C> {
 
 /// Iterator over the PCIe extended capability list starting at 0x100. The
 /// list is empty when the first header reads 0 or all ones (no extended
-/// space). Each of the 960 dword slots can be visited once.
+/// space); a later header reading 0 or all ones is
+/// [`PciError::ExtendedCapabilityHeader`]. Each of the 960 dword slots can be
+/// visited once.
 pub struct ExtendedCapabilities<'a, C: ConfigSpace + ?Sized> {
     cfg: &'a mut C,
     bdf: Bdf,
@@ -167,9 +169,15 @@ impl<C: ConfigSpace + ?Sized> Iterator for ExtendedCapabilities<'_, C> {
         }
         *seen |= bit;
         let header = self.cfg.read_u32(self.bdf, offset);
-        if self.first && (header == 0 || header == u32::MAX) {
+        if header == 0 || header == u32::MAX {
             self.done = true;
-            return None;
+            // At 0x100 this means no extended space; after a next pointer it
+            // means the function vanished or the list is corrupt.
+            return if self.first {
+                None
+            } else {
+                Some(Err(PciError::ExtendedCapabilityHeader))
+            };
         }
         self.first = false;
         self.next = (header >> 20) as u16;
