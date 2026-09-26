@@ -237,7 +237,8 @@ pub enum Error {
     ForeignToken,
     /// Token issued before the queue was reset; its wait was discarded.
     StaleToken,
-    /// Completion status or head pointer outside the submitted window.
+    /// Completion status, head pointer or token sequence outside the
+    /// submitted window.
     BogusCompletion,
     /// Not enough free slots in the command ring.
     QueueFull,

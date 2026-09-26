@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use hw_iommu::{Access, DmaRegion, FrameAlloc, PhysMem, PAGE_SIZE};
+use hw_iommu::{Access, CommandRing, DmaRegion, FrameAlloc, PhysMem, PAGE_SIZE};
 
 /// Base of the modelled physical memory.
 pub const MEM_BASE: u64 = 0x10_0000;
@@ -35,15 +35,20 @@ pub const POOL_BASE: u64 = MEM_BASE + 128 * PAGE_SIZE;
 /// Garbage that fills memory the crate has not initialised.
 pub const GARBAGE: u64 = 0xDEAD_BEEF_A5A5_5A5A;
 
+/// Callback run after every write: (reader of the current memory, address written).
+pub type Observer = Box<dyn FnMut(&dyn Fn(u64) -> u64, u64)>;
+
 /// Word-addressed physical memory.
 pub struct ArrayMem {
     words: Vec<u64>,
+    observer: Option<Observer>,
 }
 
 impl ArrayMem {
     pub fn new() -> Self {
         Self {
             words: vec![GARBAGE; (MEM_FRAMES * PAGE_SIZE / 8) as usize],
+            observer: None,
         }
     }
 
@@ -62,6 +67,11 @@ impl ArrayMem {
         self.words[i..i + 512].to_vec()
     }
 
+    /// Installs (or removes) a callback that sees memory after each write.
+    pub fn set_observer(&mut self, observer: Option<Observer>) {
+        self.observer = observer;
+    }
+
     pub fn contains(pa: u64) -> bool {
         (MEM_BASE..MEM_BASE + MEM_FRAMES * PAGE_SIZE).contains(&pa)
     }
@@ -75,6 +85,11 @@ impl PhysMem for ArrayMem {
     fn write_u64(&mut self, pa: u64, value: u64) {
         let i = Self::index(pa);
         self.words[i] = value;
+        if let Some(mut observer) = self.observer.take() {
+            let words = &self.words;
+            observer(&|a: u64| words[Self::index(a)], pa);
+            self.observer = Some(observer);
+        }
     }
 }
 
@@ -439,21 +454,15 @@ impl VtdHw {
 
     /// Executes up to `budget` descriptors between the model's head and
     /// `tail_offset`; returns the new head offset (IQH).
-    pub fn run_queue(
-        &mut self,
-        mem: &mut ArrayMem,
-        ring_base: u64,
-        tail_offset: u64,
-        budget: usize,
-    ) -> u64 {
+    pub fn run_queue(&mut self, mem: &mut ArrayMem, ring: &CommandRing, budget: usize) -> u64 {
         let mut head = self.head;
         let (ctx_cache, iotlb) = (&mut self.ctx_cache, &mut self.iotlb);
         let h = consume_ring(
             mem,
-            ring_base,
-            256,
+            ring.base(),
+            u64::from(ring.entries()),
             &mut head,
-            tail_offset,
+            ring.tail_offset(),
             budget,
             |mem, [lo, hi]| {
                 let gran = (lo >> 4) & 3;
@@ -570,11 +579,13 @@ impl AmdHw {
                 Err(_) => Err(Fault::TargetAbort),
             };
         }
-        if mode > 6 {
+        // The crate implements 3 and 4 levels only; anything else is not
+        // something it may produce.
+        if mode != 3 && mode != 4 {
             return Err(Fault::Malformed);
         }
         let width = 12 + 9 * mode;
-        if width < 64 && iova >> width != 0 {
+        if iova >> width != 0 {
             return Err(Fault::AddressWidth);
         }
         let domid = q1 as u16;
@@ -610,21 +621,15 @@ impl AmdHw {
     }
 
     /// Executes up to `budget` commands; returns the new head offset.
-    pub fn run_queue(
-        &mut self,
-        mem: &mut ArrayMem,
-        ring_base: u64,
-        tail_offset: u64,
-        budget: usize,
-    ) -> u64 {
+    pub fn run_queue(&mut self, mem: &mut ArrayMem, ring: &CommandRing, budget: usize) -> u64 {
         let mut head = self.head;
         let (dte_cache, iotlb) = (&mut self.dte_cache, &mut self.iotlb);
         let h = consume_ring(
             mem,
-            ring_base,
-            256,
+            ring.base(),
+            u64::from(ring.entries()),
             &mut head,
-            tail_offset,
+            ring.tail_offset(),
             budget,
             |mem, [q0, q1]| match q0 >> 60 {
                 0x1 => {

@@ -67,12 +67,7 @@ impl Rig {
     }
 
     fn run_hw(&mut self, budget: usize) {
-        let head = self.hw.run_queue(
-            &mut self.mem,
-            RING_BASE,
-            self.queue.ring().tail_offset(),
-            budget,
-        );
+        let head = self.hw.run_queue(&mut self.mem, self.queue.ring(), budget);
         self.queue.update_head(head).unwrap();
         self.queue.poll(&self.mem).unwrap();
     }
@@ -443,4 +438,66 @@ fn detach_blocks_device_after_devtab_invalidation() {
     r.run_hw(usize::MAX);
     assert_eq!(r.dma(dev, 0x4000, Access::Write), Err(Fault::TargetAbort));
     assert_eq!(r.dma(dev, 0x4000, Access::Read), Err(Fault::TargetAbort));
+}
+
+/// Records every write that leaves the device table entry containing the
+/// written address with V = 0 (pass-through) while the table is live.
+fn watch_valid_bit(mem: &mut ArrayMem) -> std::rc::Rc<std::cell::RefCell<Vec<u64>>> {
+    let violations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = violations.clone();
+    let end = DEV_TABLE_BASE + u64::from(DEV_TABLE_PAGES) * PAGE;
+    mem.set_observer(Some(Box::new(move |read, pa| {
+        if (DEV_TABLE_BASE..end).contains(&pa) {
+            let q0 = pa & !(32 - 1);
+            if read(q0) & 1 == 0 {
+                sink.borrow_mut().push(pa);
+            }
+        }
+    })));
+    violations
+}
+
+#[test]
+fn device_table_entries_never_pass_through_during_updates() {
+    let mut mem = ArrayMem::new();
+    let mut alloc = TestAlloc::new();
+    // Garbage in the region has V = 0 (GARBAGE is even).
+    assert_eq!(mem.read_u64(DEV_TABLE_BASE) & 1, 0);
+    let violations = watch_valid_bit(&mut mem);
+    let mut dt = DeviceTable::new(&mut mem, DEV_TABLE_BASE, DEV_TABLE_PAGES, PHYS_BITS).unwrap();
+    let cfg = DomainConfig::new(PagingLevels::Four, 48, PHYS_BITS).unwrap();
+    let d = AmdDomain::new(&mut mem, &mut alloc, 4, cfg).unwrap();
+    for dev in [bdf(0, 3, 0), bdf(1, 31, 7)] {
+        dt.attach(&mut mem, dev, &d).unwrap();
+        dt.detach(&mut mem, dev).unwrap();
+    }
+    assert!(
+        violations.borrow().is_empty(),
+        "V = 0 after writes at {:x?}",
+        violations.borrow()
+    );
+
+    // Negative control: initialising an entry high quadword first (the
+    // previous order) exposes a V = 0 entry with a partly written body.
+    let mut fresh = ArrayMem::new();
+    let violations = watch_valid_bit(&mut fresh);
+    let slot = DEV_TABLE_BASE + 5 * 32;
+    fresh.write_u64(slot + 24, 0);
+    assert_eq!(*violations.borrow(), vec![slot + 24]);
+}
+
+#[test]
+fn invalid_entry_must_be_all_zero() {
+    let bad = |r: [u64; 4]| DeviceTableEntry::decode(r, PHYS_BITS);
+    assert_eq!(
+        bad([0, 5, 0, 0]),
+        Err(Error::ReservedBits),
+        "DomainID with V = 0"
+    );
+    assert_eq!(bad([0, 1 << 40, 0, 0]), Err(Error::ReservedBits));
+    let invalid = DeviceTableEntry {
+        translation: DteTranslation::Invalid,
+        domain_id: 5,
+    };
+    assert_eq!(invalid.encode(PHYS_BITS), Err(Error::ReservedBits));
 }

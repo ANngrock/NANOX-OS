@@ -41,10 +41,11 @@ fn flush<Q: QueueFormat>(
     mem: &mut ArrayMem,
     queue: &mut InvalidationQueue<Q>,
     command: [u64; 2],
-    run: impl FnOnce(&mut ArrayMem, u64) -> u64,
+    run: impl FnOnce(&mut ArrayMem, &CommandRing) -> u64,
 ) {
     let token = queue.submit(mem, &[command]).unwrap();
-    let head = run(mem, queue.ring().tail_offset());
+    let ring = *queue.ring();
+    let head = run(mem, &ring);
     queue.update_head(head).unwrap();
     queue.poll(mem).unwrap();
     assert!(queue.is_complete(token).unwrap());
@@ -57,7 +58,7 @@ impl Hw for Vtd {
             mem,
             &mut self.queue,
             inv::iotlb_global(inv::Drain::default()),
-            |m, t| hw.run_queue(m, RING_BASE, t, usize::MAX),
+            |m, t| hw.run_queue(m, t, usize::MAX),
         );
     }
     fn translate(&mut self, mem: &ArrayMem, iova: u64, access: Access) -> Result<u64, Fault> {
@@ -69,7 +70,7 @@ impl Hw for Amd {
     fn flush_all(&mut self, mem: &mut ArrayMem) {
         let hw = &mut self.hw;
         flush(mem, &mut self.queue, cmd::invalidate_all(), |m, t| {
-            hw.run_queue(m, RING_BASE, t, usize::MAX)
+            hw.run_queue(m, t, usize::MAX)
         });
     }
     fn translate(&mut self, mem: &ArrayMem, iova: u64, access: Access) -> Result<u64, Fault> {

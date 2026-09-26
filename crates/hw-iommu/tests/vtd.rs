@@ -73,12 +73,7 @@ impl Rig {
     /// Lets the hardware execute up to `budget` descriptors, then updates
     /// the software view of head and completion.
     fn run_hw(&mut self, budget: usize) {
-        let head = self.hw.run_queue(
-            &mut self.mem,
-            RING_BASE,
-            self.queue.ring().tail_offset(),
-            budget,
-        );
+        let head = self.hw.run_queue(&mut self.mem, self.queue.ring(), budget);
         self.queue.update_head(head).unwrap();
         self.queue.poll(&self.mem).unwrap();
     }
@@ -570,4 +565,30 @@ fn detach_needs_context_cache_invalidation_before_teardown() {
     d.destroy(&r.mem, &mut r.alloc, &r.queue, token).unwrap();
     // Only the root table and the bus-0 context table remain allocated.
     assert_eq!(r.alloc.live.len(), frames_before + 1);
+}
+
+#[test]
+fn root_table_initialisation_never_exposes_a_present_entry() {
+    let mut mem = ArrayMem::new();
+    let mut alloc = TestAlloc::new();
+    // The frame the allocator hands out first is full of entries with P = 1.
+    for i in 0..512 {
+        mem.write_u64(POOL_BASE + i * 8, 0xffff_f001);
+    }
+    let violations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = violations.clone();
+    mem.set_observer(Some(Box::new(move |read, pa| {
+        if read(pa & !0xf) & 1 != 0 {
+            sink.borrow_mut().push(pa);
+        }
+    })));
+    let root = RootTable::new(&mut mem, &mut alloc, 39).unwrap();
+    assert_eq!(root.address(), POOL_BASE);
+    assert!(
+        violations.borrow().is_empty(),
+        "present root entry after writes at {:x?}",
+        violations.borrow()
+    );
+    mem.set_observer(None);
+    assert!(mem.frame(POOL_BASE).iter().all(|w| *w == 0));
 }

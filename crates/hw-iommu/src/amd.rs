@@ -262,9 +262,10 @@ impl DeviceTableEntry {
         }
     }
 
-    /// Encodes the four quadwords.
+    /// Encodes the four quadwords. An `Invalid` entry must carry domain 0.
     pub fn encode(&self, phys_bits: u32) -> Result<[u64; 4], Error> {
         let q0 = match self.translation {
+            DteTranslation::Invalid if self.domain_id != 0 => return Err(Error::ReservedBits),
             DteTranslation::Invalid => 0,
             DteTranslation::Untranslated(perms) => perm_bits(perms) | 0b11,
             DteTranslation::Paged {
@@ -289,12 +290,13 @@ impl DeviceTableEntry {
         }
         let domain_id = q1 as u16;
         if q0 & 1 == 0 {
-            if q0 != 0 {
+            // V = 0: every other bit, DomainID included, must be clear.
+            if q0 != 0 || q1 != 0 {
                 return Err(Error::ReservedBits);
             }
             return Ok(Self {
                 translation: DteTranslation::Invalid,
-                domain_id,
+                domain_id: 0,
             });
         }
         if q0 & !(0b11 | 0x7 << 9 | ADDR_MASK | IR | IW) != 0 {
@@ -350,6 +352,16 @@ pub struct DeviceTable {
 impl DeviceTable {
     /// Takes `pages` (1..=512) contiguous pages at `base` and blocks every
     /// entry. Covers DeviceIDs `0..pages * 128`.
+    ///
+    /// The region must not be the active device table of any IOMMU until
+    /// this returns: entries not reached yet still hold whatever the memory
+    /// contained, and garbage with V = 0 means pass-through. Each entry is
+    /// initialised quadword 0 first (V = 1, TV = 1, Mode = 0, IR = IW = 0:
+    /// blocked), then quadwords 1..3 are cleared, so an entry never shows
+    /// V = 0 once its initialisation started (this limits the damage if
+    /// firmware left an IOMMU translating with this table, e.g. for
+    /// pre-boot DMA protection, but does not remove the window for entries
+    /// not reached yet).
     pub fn new<M: PhysMem>(
         mem: &mut M,
         base: u64,
@@ -378,7 +390,10 @@ impl DeviceTable {
         };
         let blocked = DeviceTableEntry::blocked().encode(phys_bits)?;
         for devid in 0..table.entries() {
-            table.write(mem, devid, blocked);
+            let slot = base + u64::from(devid) * DTE_SIZE;
+            for (i, q) in blocked.iter().enumerate() {
+                mem.write_u64(slot + i as u64 * 8, *q);
+            }
         }
         Ok(table)
     }

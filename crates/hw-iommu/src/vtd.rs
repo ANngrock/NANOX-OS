@@ -421,6 +421,14 @@ pub struct RootTable {
 
 impl RootTable {
     /// Allocates a zeroed root table (every device blocked).
+    ///
+    /// Unlike AMD-Vi, a not-present VT-d root entry (P = 0) faults every
+    /// request of its bus, so zero is the blocking state. The frame is
+    /// zeroed in address order, i.e. each entry's low quadword (holding P)
+    /// before its high quadword, so an entry never becomes present during
+    /// initialisation. The frame comes from the allocator and must not be
+    /// referenced by any `RTADDR_REG` until this returns: entries not
+    /// zeroed yet still hold the frame's old contents.
     pub fn new<M: PhysMem, A: FrameAlloc>(
         mem: &mut M,
         alloc: &mut A,

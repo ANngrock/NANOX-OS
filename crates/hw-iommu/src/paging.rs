@@ -314,7 +314,10 @@ impl<F: PteFormat> Domain<F> {
     ///
     /// Fails without any change if a page is already mapped, the range is
     /// invalid, or the allocator cannot supply every needed table frame.
-    /// If the IOMMU caches not-present entries (VT-d `CAP.CM`), the caller
+    /// If the tables change behind the domain's back between the checking
+    /// and the writing pass (unreachable otherwise; debug builds panic), the
+    /// written leaves are cleared and unused frames returned; tables linked
+    /// by then stay empty and belong to the domain. If the IOMMU caches not-present entries (VT-d `CAP.CM`), the caller
     /// must also invalidate the range after a successful map.
     pub fn map<M: PhysMem, A: FrameAlloc>(
         &mut self,
@@ -340,16 +343,51 @@ impl<F: PteFormat> Domain<F> {
         let needed = self.count_missing_tables(mem, iova, pages)?;
         let mut chain = self.reserve_frames(mem, alloc, needed)?;
 
+        let mut linked = 0;
         for i in 0..pages {
             let va = iova + i * PAGE_SIZE;
-            let slot = self.leaf_slot_create(mem, va, &mut chain)?;
-            mem.write_u64(slot, F::encode_page(phys + i * PAGE_SIZE, perms));
+            match self.leaf_slot_create(mem, va, &mut chain, &mut linked) {
+                Ok(slot) => mem.write_u64(slot, F::encode_page(phys + i * PAGE_SIZE, perms)),
+                Err(e) => {
+                    self.roll_back_map(mem, alloc, iova, i, chain, linked);
+                    // Pass 3 only sees entries pass 1 validated or that it
+                    // created itself, so this needs memory changed behind
+                    // the domain's back (debug builds stop here, after the
+                    // rollback).
+                    if cfg!(debug_assertions) {
+                        panic!("map pass 3 diverged from pass 1: {e:?}");
+                    }
+                    return Err(e);
+                }
+            }
         }
         // Pass 1 counted exactly the tables pass 3 links.
         debug_assert_eq!(chain, CHAIN_END);
         self.mapped_pages += pages;
-        self.table_frames += needed;
+        self.table_frames += linked;
         Ok(())
+    }
+
+    /// Undoes pass 3 of a failed `map`: clears the `written` leaf entries
+    /// from `iova` on and returns the unused frames of `chain`. Tables
+    /// already linked stay (empty) in the tree and are accounted to the
+    /// domain, so no frame leaks and no page becomes mapped.
+    fn roll_back_map<M: PhysMem, A: FrameAlloc>(
+        &mut self,
+        mem: &mut M,
+        alloc: &mut A,
+        iova: u64,
+        written: u64,
+        chain: u64,
+        linked: u64,
+    ) {
+        for i in 0..written {
+            if let Ok(Some(leaf)) = self.find_leaf(mem, iova + i * PAGE_SIZE) {
+                mem.write_u64(leaf.slot, 0);
+            }
+        }
+        release_chain(mem, alloc, chain);
+        self.table_frames += linked;
     }
 
     /// Unmaps `[iova, iova + len)`. Fails without change if any page of
@@ -494,6 +532,7 @@ impl<F: PteFormat> Domain<F> {
         mem: &mut M,
         va: u64,
         chain: &mut u64,
+        linked: &mut u64,
     ) -> Result<u64, Error> {
         let mut table = self.root;
         let mut level = self.config.levels.count();
@@ -510,6 +549,7 @@ impl<F: PteFormat> Domain<F> {
                     zero_frame(mem, frame);
                     // The table is zeroed before it becomes reachable.
                     mem.write_u64(slot, F::encode_table(frame, level));
+                    *linked += 1;
                     table = frame;
                 }
                 Entry::Page { .. } => return Err(Error::Corrupt),
@@ -576,6 +616,131 @@ mod tests {
         );
         let (base, order) = covering_block(0xFFFF_FFFF_F000, 0x1000).unwrap();
         assert_eq!((base, order), (0xFFFF_FFFF_F000, 0));
+    }
+
+    /// Memory whose entry at `slot` reads as `value` once more than
+    /// `after` reads were made: a change behind the domain's back between
+    /// pass 1 and pass 3 of `map`.
+    struct DivergingMem {
+        words: std::vec::Vec<u64>,
+        reads: std::cell::Cell<u64>,
+        corrupt: Option<(u64, u64, u64)>,
+    }
+
+    const BASE: u64 = 0x10_0000;
+
+    impl PhysMem for DivergingMem {
+        fn read_u64(&self, pa: u64) -> u64 {
+            self.reads.set(self.reads.get() + 1);
+            if let Some((after, slot, value)) = self.corrupt {
+                if self.reads.get() > after && pa == slot {
+                    return value;
+                }
+            }
+            self.words[((pa - BASE) / 8) as usize]
+        }
+        fn write_u64(&mut self, pa: u64, value: u64) {
+            self.words[((pa - BASE) / 8) as usize] = value;
+        }
+    }
+
+    struct Frames {
+        free: std::vec::Vec<u64>,
+        live: std::collections::BTreeSet<u64>,
+    }
+
+    impl FrameAlloc for Frames {
+        fn alloc_frame(&mut self) -> Option<u64> {
+            let pa = self.free.pop()?;
+            self.live.insert(pa);
+            Some(pa)
+        }
+        fn free_frame(&mut self, pa: u64) {
+            assert!(self.live.remove(&pa));
+            self.free.push(pa);
+        }
+    }
+
+    #[test]
+    fn diverging_pass_three_is_rolled_back() {
+        use crate::vtd::SecondLevel;
+        let mut mem = DivergingMem {
+            words: std::vec![0xA5A5_A5A5_A5A5_A5A4; 64 * 512],
+            reads: std::cell::Cell::new(0),
+            corrupt: None,
+        };
+        let mut alloc = Frames {
+            free: (0..64).rev().map(|f| BASE + f * PAGE_SIZE).collect(),
+            live: std::collections::BTreeSet::new(),
+        };
+        let cfg = DomainConfig::new(PagingLevels::Three, 39, 39).unwrap();
+        let mut d = Domain::<SecondLevel>::new(&mut mem, &mut alloc, 1, cfg).unwrap();
+        // Tables for the 2 MiB region below 0x20_0000 exist; the region
+        // above has none, so the map below pre-allocates one leaf table.
+        d.map(
+            &mut mem,
+            &mut alloc,
+            0x1f_0000,
+            0x5000,
+            PAGE_SIZE,
+            Perms::RW,
+        )
+        .unwrap();
+        let level2 = mem.read_u64(d.root()) & ADDR_MASK;
+        let snapshot: std::vec::Vec<_> = alloc
+            .live
+            .iter()
+            .map(|&pa| {
+                (
+                    pa,
+                    (0..512)
+                        .map(|i| mem.read_u64(pa + i * 8))
+                        .collect::<std::vec::Vec<_>>(),
+                )
+            })
+            .collect();
+        let frames = d.table_frames();
+
+        // Pass 1 makes 3 + 3 + 2 reads for pages 0x1fe, 0x1ff, 0x200;
+        // pass 3 writes both low leaves, then finds the level-2 entry of
+        // page 0x200 turned into a large-page entry.
+        mem.corrupt = Some((mem.reads.get() + 12, level2 + 8, 0x7000 | 1 << 7 | 3));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            d.map(
+                &mut mem,
+                &mut alloc,
+                0x1f_e000,
+                0x9000,
+                3 * PAGE_SIZE,
+                Perms::R,
+            )
+        }));
+        match res {
+            Err(_) => assert!(cfg!(debug_assertions), "only debug builds panic"),
+            Ok(r) => assert_eq!(r, Err(Error::Unsupported)),
+        }
+        mem.corrupt = None;
+        for va in [0x1f_e000, 0x1f_f000, 0x20_0000] {
+            assert_eq!(d.lookup(&mem, va), Ok(None), "{va:#x} left mapped");
+        }
+        assert_eq!(d.table_frames(), frames);
+        assert_eq!(d.mapped_pages(), 1);
+        let after: std::vec::Vec<_> = alloc
+            .live
+            .iter()
+            .map(|&pa| {
+                (
+                    pa,
+                    (0..512)
+                        .map(|i| mem.read_u64(pa + i * 8))
+                        .collect::<std::vec::Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            after, snapshot,
+            "pre-allocated frame leaked or tables changed"
+        );
     }
 
     #[test]

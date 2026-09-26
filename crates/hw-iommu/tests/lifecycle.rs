@@ -65,12 +65,7 @@ impl Rig {
     }
 
     fn run_hw(&mut self, budget: usize) {
-        let head = self.hw.run_queue(
-            &mut self.mem,
-            RING_BASE,
-            self.queue.ring().tail_offset(),
-            budget,
-        );
+        let head = self.hw.run_queue(&mut self.mem, self.queue.ring(), budget);
         self.queue.update_head(head).unwrap();
         self.queue.poll(&self.mem).unwrap();
     }
@@ -366,4 +361,24 @@ fn full_queue_refuses_without_side_effects() {
     m.confirm_invalidation(&r.queue).unwrap();
     // Unused device table handle kept alive to document the setup.
     assert!(r.dt.entries() >= 256);
+}
+
+#[test]
+fn token_beyond_issued_window_is_bogus() {
+    // Two queues misconfigured with the same id: a token of one that the
+    // other never issued is not a completion either may vouch for.
+    let mut mem = ArrayMem::new();
+    let ring = CommandRing::new(RING_BASE, 256).unwrap();
+    let mut q1 = InvalidationQueue::new(&mut mem, ring, STATUS_ADDR, 7, Invalidator).unwrap();
+    let mut mem2 = ArrayMem::new();
+    let mut q2 = InvalidationQueue::new(&mut mem2, ring, STATUS_ADDR, 7, Invalidator).unwrap();
+    let mut last = None;
+    for _ in 0..3 {
+        last = Some(q1.submit(&mut mem, &[cmd::invalidate_all()]).unwrap());
+    }
+    let t2 = q2.submit(&mut mem2, &[cmd::invalidate_all()]).unwrap();
+    mem2.write_u64(STATUS_ADDR, t2.seq());
+    q2.poll(&mem2).unwrap();
+    assert_eq!(q2.is_complete(last.unwrap()), Err(Error::BogusCompletion));
+    assert_eq!(q2.is_complete(t2), Ok(true));
 }

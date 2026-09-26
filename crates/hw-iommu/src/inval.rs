@@ -140,7 +140,7 @@ impl CommandRing {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InvalidationToken {
     queue: u32,
-    epoch: u32,
+    epoch: u64,
     seq: u64,
 }
 
@@ -153,7 +153,7 @@ impl InvalidationToken {
 
     /// Epoch of the issuing queue.
     #[must_use]
-    pub const fn epoch(&self) -> u32 {
+    pub const fn epoch(&self) -> u64 {
         self.epoch
     }
 }
@@ -162,7 +162,7 @@ impl InvalidationToken {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompletionTracker {
     id: u32,
-    epoch: u32,
+    epoch: u64,
     issued: u64,
     completed: u64,
 }
@@ -193,7 +193,7 @@ impl CompletionTracker {
 
     /// Current epoch.
     #[must_use]
-    pub const fn epoch(&self) -> u32 {
+    pub const fn epoch(&self) -> u64 {
         self.epoch
     }
 
@@ -236,7 +236,9 @@ impl CompletionTracker {
             return Err(Error::StaleToken);
         }
         if token.seq > self.issued {
-            return Err(Error::ForeignToken);
+            // Same queue id and epoch but never issued here: duplicated
+            // queue ids or a forged token, not a completion to trust.
+            return Err(Error::BogusCompletion);
         }
         Ok(token.seq <= self.completed)
     }
@@ -356,7 +358,8 @@ impl<Q: QueueFormat> InvalidationQueue<Q> {
     /// again.
     pub fn reset<M: PhysMem>(&mut self, mem: &mut M) {
         self.ring.reset();
-        self.tracker.epoch = self.tracker.epoch.wrapping_add(1);
+        // u64: 2^64 resets cannot happen, so an old epoch never recurs.
+        self.tracker.epoch += 1;
         self.tracker.completed = self.tracker.issued;
         let mask = if Q::STATUS_BITS >= 64 {
             u64::MAX
