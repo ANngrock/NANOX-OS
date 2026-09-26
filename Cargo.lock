@@ -51,6 +51,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fb-console"
+version = "0.1.0"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -69,11 +73,19 @@ name = "hw-iommu"
 version = "0.1.0"
 
 [[package]]
+name = "hw-nvme"
+version = "0.1.0"
+
+[[package]]
 name = "hw-pci"
 version = "0.1.0"
 
 [[package]]
 name = "hw-smp"
+version = "0.1.0"
+
+[[package]]
+name = "hw-xhci"
 version = "0.1.0"
 
 [[package]]
