@@ -24,8 +24,9 @@
 //!   the previous critical section is visible in the next one.
 //! - `try_lock` loads `serving` with `Acquire` and then claims ticket
 //!   `serving` by `compare_exchange` on `next`; success means no ticket was
-//!   outstanding, so `serving` could not move in between (except after 2^32
-//!   intervening acquisitions, which is not a realistic window).
+//!   outstanding, so `serving` could not move in between. The ABA case would
+//!   need 2^32 acquisitions between two adjacent instructions executed with
+//!   IRQs disabled, which is unreachable; 32-bit tickets are kept on purpose.
 //! - `owner` is `Relaxed`: it is only compared with the *executing* CPU id.
 //!   A CPU reads its own id there only if it stored it and has not yet
 //!   cleared it (read-after-write coherence on one location); other CPUs'
@@ -208,6 +209,13 @@ impl<T> TicketLock<T> {
 
 /// Proof of holding a [`TicketLock`]; releases it and restores the IRQ state
 /// on drop. Not `Send`: it must be released on the CPU that acquired it.
+///
+/// Leaking a guard (`core::mem::forget`, a reference cycle, an endless loop
+/// while holding it) keeps the lock held forever: every later caller spins
+/// with its IRQs disabled, and the leaking CPU keeps IRQs disabled as well.
+/// As with `std::sync::Mutex`, not leaking guards is the caller's contract;
+/// the lock cannot detect it.
+#[must_use = "dropping the guard immediately releases the lock"]
 pub struct TicketGuard<'a, T, I: IrqControl> {
     lock: &'a TicketLock<T>,
     irq: &'a I,

@@ -5,10 +5,13 @@
 //! One shootdown runs at a time per [`ShootdownDomain`] (the *slot*).
 //! The initiator, after it has already changed the page tables:
 //!
-//! 1. acquires the slot; while spinning for it, it keeps [servicing]
-//!    its own pending requests, so two CPUs that want to initiate at the same
-//!    time cannot deadlock waiting for each other's acknowledgement; a CPU that
-//!    already holds the slot gets [`ShootdownError::Reentrant`];
+//! 1. marks itself as initiating (per-CPU flag), then acquires the slot;
+//!    while spinning for it, it keeps [servicing] its own pending requests, so
+//!    two CPUs that want to initiate at the same time cannot deadlock waiting
+//!    for each other's acknowledgement. The flag is set *before* the slot
+//!    attempt, so a nested call on the same CPU (interrupt or NMI at any point
+//!    from there until the shootdown ends) gets [`ShootdownError::Reentrant`]
+//!    at once instead of spinning for its own slot;
 //! 2. assigns the next generation `g` and publishes the request (range or
 //!    full flush) under a seqlock;
 //! 3. computes the wait set: requested targets, minus itself, minus offline
@@ -45,6 +48,11 @@
 //!
 //! - Slot: `busy` CAS `Acquire` / store `Release` serialises initiators and
 //!   hands over `last_gen`.
+//! - Re-entrancy flag `initiating[me]`: read and written only by CPU `me`
+//!   (including its interrupt handlers). `swap(true, Acquire)` keeps the slot
+//!   CAS from being hoisted above it; `store(false, Release)` keeps the slot
+//!   release from sinking below it. It is cleared on every exit: slot timeout,
+//!   error while waiting for the slot, and [`InFlight`] drop.
 //! - Request: seqlock (`seq` odd → `Release` fence → relaxed fields → `seq`
 //!   even with `Release`; reader: `Acquire` load, relaxed fields, `Acquire`
 //!   fence, re-load).
@@ -58,14 +66,13 @@
 
 #![forbid(unsafe_code)]
 
-use core::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 
 use crate::mask::CpuMask;
 use crate::{MAX_CPUS, PAGE_SIZE};
 
 /// Encoding of [`FlushRequest::All`] in `req_pages`; never a valid range length.
 const ALL_PAGES: u64 = u64::MAX;
-const NO_HOLDER: usize = usize::MAX;
 
 /// What to invalidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +158,7 @@ struct CpuSlot {
     pending: AtomicU64,
     acked: AtomicU64,
     online: AtomicBool,
+    initiating: AtomicBool,
 }
 
 impl CpuSlot {
@@ -159,6 +167,7 @@ impl CpuSlot {
             pending: AtomicU64::new(0),
             acked: AtomicU64::new(0),
             online: AtomicBool::new(false),
+            initiating: AtomicBool::new(false),
         }
     }
 }
@@ -168,7 +177,6 @@ impl CpuSlot {
 /// its TLB.
 pub struct ShootdownDomain<const N: usize> {
     busy: AtomicBool,
-    holder: AtomicUsize,
     last_gen: AtomicU64,
     seq: AtomicU64,
     req_gen: AtomicU64,
@@ -188,7 +196,6 @@ impl<const N: usize> ShootdownDomain<N> {
         let () = Self::SIZE_OK;
         Self {
             busy: AtomicBool::new(false),
-            holder: AtomicUsize::new(NO_HOLDER),
             last_gen: AtomicU64::new(0),
             seq: AtomicU64::new(0),
             req_gen: AtomicU64::new(0),
@@ -285,23 +292,31 @@ impl<const N: usize> ShootdownDomain<N> {
             FlushRequest::range(start, pages)?;
         }
 
+        let initiating = &self.cpus[me].initiating;
+        if initiating.swap(true, Ordering::Acquire) {
+            // The outer call on this CPU owns the flag; leave it set.
+            return Err(ShootdownError::Reentrant);
+        }
         let t0 = ops.now_ticks();
         while self
             .busy
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            if self.holder.load(Ordering::Relaxed) == me {
-                return Err(ShootdownError::Reentrant);
-            }
-            self.service(me, tlb)?;
-            if ops.now_ticks().wrapping_sub(t0) > self.timeout {
-                return Err(ShootdownError::SlotTimeout);
+            let step = self.service(me, tlb).and_then(|_| {
+                if ops.now_ticks().wrapping_sub(t0) > self.timeout {
+                    Err(ShootdownError::SlotTimeout)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(e) = step {
+                initiating.store(false, Ordering::Release);
+                return Err(e);
             }
             core::hint::spin_loop();
         }
-        self.holder.store(me, Ordering::Relaxed);
-        // From here on the slot is released by `InFlight::drop`.
+        // From here on the slot and the flag are released by `InFlight::drop`.
         let gen = self.last_gen.load(Ordering::Relaxed) + 1;
         self.last_gen.store(gen, Ordering::Release);
 
@@ -368,6 +383,7 @@ impl<const N: usize> ShootdownDomain<N> {
 
 /// A published shootdown whose acknowledgements have not been collected yet.
 /// Holds the domain slot until dropped.
+#[must_use = "dropping abandons the shootdown without a completion token"]
 pub struct InFlight<'d, const N: usize> {
     domain: &'d ShootdownDomain<N>,
     gen: u64,
@@ -434,8 +450,10 @@ impl<const N: usize> InFlight<'_, N> {
 
 impl<const N: usize> Drop for InFlight<'_, N> {
     fn drop(&mut self) {
-        self.domain.holder.store(NO_HOLDER, Ordering::Relaxed);
         self.domain.busy.store(false, Ordering::Release);
+        self.domain.cpus[self.me]
+            .initiating
+            .store(false, Ordering::Release);
     }
 }
 

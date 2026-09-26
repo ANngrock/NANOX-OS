@@ -79,10 +79,17 @@ struct World {
     epoch: Instant,
 }
 
+/// Hook run by the model inside a `ShootdownOps` call, i.e. at a point where
+/// the protocol code is suspended, as it would be by an interrupt.
+type Hook<'w> = Box<dyn FnMut() + 'w>;
+
 struct Ops<'w> {
     ipi: &'w [AtomicBool],
     epoch: Instant,
     sent: Vec<usize>,
+    polls: Option<Arc<AtomicUsize>>,
+    on_ipi: Option<Hook<'w>>,
+    on_tick: Option<Hook<'w>>,
 }
 
 impl<'w> Ops<'w> {
@@ -91,6 +98,9 @@ impl<'w> Ops<'w> {
             ipi,
             epoch,
             sent: Vec::new(),
+            polls: None,
+            on_ipi: None,
+            on_tick: None,
         }
     }
 }
@@ -99,8 +109,17 @@ impl ShootdownOps for Ops<'_> {
     fn send_ipi(&mut self, cpu: usize) {
         self.sent.push(cpu);
         self.ipi[cpu].store(true, Ordering::Release);
+        if let Some(hook) = self.on_ipi.as_mut() {
+            hook();
+        }
     }
     fn now_ticks(&mut self) -> u64 {
+        if let Some(polls) = &self.polls {
+            polls.fetch_add(1, Ordering::AcqRel);
+        }
+        if let Some(hook) = self.on_tick.as_mut() {
+            hook();
+        }
         self.epoch.elapsed().as_micros() as u64
     }
 }
@@ -305,13 +324,23 @@ fn unresponsive_target_times_out() {
 type FlushLog = Arc<Mutex<Vec<(Option<u64>, Instant)>>>;
 
 /// TLB of a target whose first armed flush blocks until `gate` opens and whose
-/// second armed flush takes `slow` before completing.
+/// second armed flush announces itself on `second_started` and then blocks
+/// until `gate2` opens.
 struct HookTlb {
     armed: bool,
     calls: u32,
     gate: Arc<AtomicBool>,
-    slow: Duration,
+    second_started: Arc<AtomicBool>,
+    gate2: Arc<AtomicBool>,
     log: FlushLog,
+}
+
+fn spin_until(flag: &AtomicBool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !flag.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "gate never opened");
+        thread::yield_now();
+    }
 }
 
 impl HookTlb {
@@ -321,12 +350,11 @@ impl HookTlb {
         }
         self.calls += 1;
         match self.calls {
-            1 => {
-                while !self.gate.load(Ordering::Acquire) {
-                    thread::yield_now();
-                }
+            1 => spin_until(&self.gate),
+            2 => {
+                self.second_started.store(true, Ordering::Release);
+                spin_until(&self.gate2);
             }
-            2 => thread::sleep(self.slow),
             _ => {}
         }
         self.log.lock().unwrap().push((what, Instant::now()));
@@ -344,32 +372,39 @@ impl LocalTlb for HookTlb {
 
 /// A late acknowledgement of a timed-out generation must not complete the
 /// next generation: completion requires the flush of the new request.
+///
+/// Sequencing is explicit, without sleeps. Generation 1 times out while the
+/// target is blocked inside its flush (`gate`). The initiator opens `gate`
+/// from its `send_ipi` of generation 2, i.e. after `pending[1] = 2` has been
+/// published. The target then stores the stale ack of generation 1 and starts
+/// the flush of generation 2, which sets `second_started` (after that ack) and
+/// blocks on `gate2`. The initiator opens `gate2` only after 100 more polls
+/// with the stale ack visible. An implementation that accepted the stale ack
+/// would return during those polls, before B is flushed.
 #[test]
 fn stale_generation_ack_is_ignored() {
-    common::with_watchdog(30, || {
-        let domain = Arc::new(ShootdownDomain::<4>::new(300_000));
+    common::with_watchdog(60, || {
+        // 1 s real-time limit: generation 1 must expire, generation 2 must not.
+        let domain = Arc::new(ShootdownDomain::<4>::new(1_000_000));
         let ipi = Arc::new(ipi_flags(4));
         let gate = Arc::new(AtomicBool::new(false));
+        let second_started = Arc::new(AtomicBool::new(false));
+        let gate2 = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let log: FlushLog = Arc::default();
         let ready = Arc::new(Barrier::new(2));
         let target = {
-            let (domain, ipi, gate, stop, log, ready) = (
-                domain.clone(),
-                ipi.clone(),
-                gate.clone(),
-                stop.clone(),
-                log.clone(),
-                ready.clone(),
-            );
+            let (domain, ipi, stop, ready) =
+                (domain.clone(), ipi.clone(), stop.clone(), ready.clone());
+            let mut tlb = HookTlb {
+                armed: false,
+                calls: 0,
+                gate: gate.clone(),
+                second_started: second_started.clone(),
+                gate2: gate2.clone(),
+                log: log.clone(),
+            };
             thread::spawn(move || {
-                let mut tlb = HookTlb {
-                    armed: false,
-                    calls: 0,
-                    gate,
-                    slow: Duration::from_millis(100),
-                    log,
-                };
                 domain.mark_online(1, &mut tlb).unwrap();
                 tlb.armed = true;
                 ready.wait();
@@ -383,10 +418,10 @@ fn stale_generation_ack_is_ignored() {
         ready.wait();
         let mut tlb0 = ModelTlb::new(8);
         domain.mark_online(0, &mut tlb0).unwrap();
-        let mut ops = Ops::new(&ipi, Instant::now());
         let a = FlushRequest::range(va(1), 1).unwrap();
         let b = FlushRequest::range(va(5), 2).unwrap();
 
+        let mut ops = Ops::new(&ipi, Instant::now());
         let err = domain
             .shootdown(0, a, mask(&[1]), &mut ops, &mut tlb0)
             .unwrap_err();
@@ -397,29 +432,39 @@ fn stale_generation_ack_is_ignored() {
                 unacked: mask(&[1])
             }
         );
-        // Unblock the target 50 ms into generation 2: it then acknowledges
-        // generation 1 (stale) and only 100 ms later generation 2.
-        let opener = {
+        assert!(log.lock().unwrap().is_empty(), "target still blocked in A");
+
+        let polls_after_stale = Arc::new(AtomicUsize::new(0));
+        let mut ops = Ops::new(&ipi, Instant::now());
+        {
             let gate = gate.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(50));
-                gate.store(true, Ordering::Release);
-            })
-        };
-        let done = domain
-            .shootdown(0, b, mask(&[1]), &mut ops, &mut tlb0)
-            .unwrap();
-        let returned = Instant::now();
+            ops.on_ipi = Some(Box::new(move || gate.store(true, Ordering::Release)));
+            let (second_started, gate2, polls) = (
+                second_started.clone(),
+                gate2.clone(),
+                polls_after_stale.clone(),
+            );
+            ops.on_tick = Some(Box::new(move || {
+                if second_started.load(Ordering::Acquire)
+                    && polls.fetch_add(1, Ordering::Relaxed) + 1 >= 100
+                {
+                    gate2.store(true, Ordering::Release);
+                }
+            }));
+        }
+        let result = domain.shootdown(0, b, mask(&[1]), &mut ops, &mut tlb0);
+        let flushed: Vec<Option<u64>> = log.lock().unwrap().iter().map(|e| e.0).collect();
+        gate2.store(true, Ordering::Release); // never leave the target blocked
+        let done = result.unwrap();
         assert_eq!(done.generation(), 2);
         assert_eq!(done.acked(), mask(&[1]));
-        {
-            let log = log.lock().unwrap();
-            let starts: Vec<Option<u64>> = log.iter().map(|e| e.0).collect();
-            assert_eq!(starts, [Some(va(1)), Some(va(5))], "flush order");
-            assert!(log[1].1 <= returned, "completed before target flushed B");
-        }
+        assert_eq!(
+            flushed,
+            [Some(va(1)), Some(va(5))],
+            "generation 2 completed before the target flushed B"
+        );
+        assert!(polls_after_stale.load(Ordering::Relaxed) >= 100);
         stop.store(true, Ordering::Release);
-        opener.join().unwrap();
         target.join().unwrap();
     });
 }
@@ -436,15 +481,23 @@ fn initiators_targeting_each_other_do_not_deadlock() {
         let epoch = Instant::now();
         let online = Arc::new(Barrier::new(2));
         let go = Arc::new(Barrier::new(2));
+        // Counts CPU 1's clock reads: one before its slot loop, one per turn.
+        let cpu1_polls = Arc::new(AtomicUsize::new(0));
         let other = {
-            let (domain, ipi, online, go) =
-                (domain.clone(), ipi.clone(), online.clone(), go.clone());
+            let (domain, ipi, online, go, polls1) = (
+                domain.clone(),
+                ipi.clone(),
+                online.clone(),
+                go.clone(),
+                cpu1_polls.clone(),
+            );
             thread::spawn(move || {
                 let mut tlb1 = ModelTlb::new(8);
                 domain.mark_online(1, &mut tlb1).unwrap();
                 online.wait();
                 go.wait();
                 let mut ops1 = Ops::new(&ipi, epoch);
+                ops1.polls = Some(polls1);
                 let req = FlushRequest::range(va(6), 1).unwrap();
                 let r = domain.shootdown(1, req, mask(&[0]), &mut ops1, &mut tlb1);
                 (r.map(|d| (d.generation(), d.acked())), tlb1.range_flushes)
@@ -465,7 +518,14 @@ fn initiators_targeting_each_other_do_not_deadlock() {
             Err(ShootdownError::Reentrant)
         ));
         go.wait();
-        thread::sleep(Duration::from_millis(20)); // CPU 1 now spins for the slot
+        // Wait until CPU 1 has completed at least one turn of its slot loop
+        // (which services pending requests) before collecting acks. Only that
+        // loop can acknowledge generation 1: CPU 1 has no other service path.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cpu1_polls.load(Ordering::Acquire) < 2 {
+            assert!(Instant::now() < deadline, "CPU 1 never spun for the slot");
+            thread::yield_now();
+        }
         let done = in_flight.wait(&mut ops0, &mut tlb0).unwrap();
         assert_eq!(
             done.acked(),
@@ -653,4 +713,80 @@ fn request_and_target_validation() {
         domain.service(9, &mut tlb),
         Err(ShootdownError::InvalidCpu(9))
     );
+}
+
+type NestedLog = Arc<Mutex<Vec<(Result<u64, ShootdownError>, Duration)>>>;
+
+/// Hook that, the first time it runs, behaves like an interrupt handler on
+/// CPU 0 calling `start` and records the result and how long it took.
+fn nested_start_once<'w>(
+    domain: &'w ShootdownDomain<4>,
+    ipi: &'w [AtomicBool],
+    epoch: Instant,
+    log: NestedLog,
+) -> Hook<'w> {
+    let mut armed = true;
+    Box::new(move || {
+        if !armed {
+            return;
+        }
+        armed = false;
+        let t = Instant::now();
+        let mut ops = Ops::new(ipi, epoch);
+        let mut tlb = ModelTlb::new(8);
+        let r = domain
+            .start(0, FlushRequest::All, CpuMask::empty(), &mut ops, &mut tlb)
+            .map(|in_flight| in_flight.generation());
+        log.lock().unwrap().push((r, t.elapsed()));
+    })
+}
+
+/// An interrupt on the initiating CPU that calls `start` again must get
+/// `Reentrant` at once, wherever it lands: before the slot is acquired (hook
+/// in the first `now_ticks`) or while the request is being published (hook in
+/// `send_ipi`). Before the per-CPU flag existed, the first case was not
+/// recognised (the nested call took the slot itself). The domain timeout is
+/// 10 s, so an answer that waited for a timeout would be visible.
+#[test]
+fn nested_start_on_the_same_cpu_is_refused_immediately() {
+    common::with_watchdog(60, || {
+        let domain = ShootdownDomain::<4>::new(10_000_000);
+        let ipi = ipi_flags(4);
+        let epoch = Instant::now();
+        let mut tlb0 = ModelTlb::new(8);
+        let mut tlb1 = ModelTlb::new(8);
+        domain.mark_online(0, &mut tlb0).unwrap();
+        domain.mark_online(1, &mut tlb1).unwrap();
+
+        let nested: NestedLog = Arc::default();
+        let mut ops = Ops::new(&ipi, epoch);
+        ops.on_tick = Some(nested_start_once(&domain, &ipi, epoch, nested.clone()));
+        ops.on_ipi = Some(nested_start_once(&domain, &ipi, epoch, nested.clone()));
+        let req = FlushRequest::range(va(3), 1).unwrap();
+        let in_flight = domain
+            .start(0, req, mask(&[1]), &mut ops, &mut tlb0)
+            .unwrap();
+        domain.service(1, &mut tlb1).unwrap(); // CPU 1 answers
+        let done = in_flight.wait(&mut ops, &mut tlb0).unwrap();
+        assert_eq!(done.generation(), 1, "nested calls used no generation");
+        drop(ops);
+        let nested = nested.lock().unwrap();
+        assert_eq!(nested.len(), 2, "both interrupt points were exercised");
+        for (r, took) in nested.iter() {
+            assert_eq!(*r, Err(ShootdownError::Reentrant));
+            assert!(*took < Duration::from_secs(1), "waited {took:?}");
+        }
+        // The flag is cleared when the outer shootdown ends.
+        let mut plain = Ops::new(&ipi, epoch);
+        let again = domain
+            .shootdown(
+                0,
+                FlushRequest::All,
+                CpuMask::empty(),
+                &mut plain,
+                &mut tlb0,
+            )
+            .unwrap();
+        assert_eq!(again.generation(), 2);
+    });
 }
