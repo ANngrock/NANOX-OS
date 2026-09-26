@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "kind": "qemu-ovmf-acpi-capture",
+  "profile": "q35-smp4-intel-iommu",
+  "argv": [
+    "/nix/store/88gwzrdn0hpidwq9ls0ihrw9xhzlm6xx-qemu-9.2.4/bin/qemu-system-x86_64",
+    "-no-user-config",
+    "-nodefaults",
+    "-machine",
+    "pc-q35-9.2,accel=tcg",
+    "-cpu",
+    "qemu64,+nx,-rdrand,-rdseed",
+    "-m",
+    "512",
+    "-rtc",
+    "base=2026-09-22T00:00:00,clock=vm",
+    "-drive",
+    "if=pflash,format=raw,unit=0,readonly=on,file=/nix/store/nd7m6s6rb0dvs8r3pcnj0cvb4fr7sqwy-OVMF-202411-fd/FV/OVMF_CODE.fd",
+    "-drive",
+    "if=pflash,format=raw,unit=1,file=<fresh copy of NANOX_OVMF_VARS>",
+    "-display",
+    "none",
+    "-serial",
+    "null",
+    "-net",
+    "none",
+    "-qmp",
+    "unix:/tmp/nix-shell.na0Rxg/acpi-capture-091m3tvt/qmp.sock,server=on,wait=off",
+    "-smp",
+    "4",
+    "-device",
+    "intel-iommu"
+  ],
+  "qemu_version": "QEMU emulator version 9.2.4 (nanox-replay-exit-v1)",
+  "qemu_sha256": "17aa3a6374281ce4e850536900ea7e91f5d1ea1b7891cb80e35bff772b16d6cd",
+  "firmware_code_sha256": "dbdf27ebd6373f56035b3b2389c9bfbe8de320651e2a085293329e1b6c8170c4",
+  "firmware_vars_sha256": "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e",
+  "polls": 2,
+  "qemu_stderr": "",
+  "tables": [
+    {
+      "signature": "RSDP",
+      "file": "RSDP.bin",
+      "phys": "0x1f77e000",
+      "length": 20,
+      "sha256": "f208423a67b5ae7b205e4c9d5decf51882fe643b6e3fb6b13c0589b33e197091"
+    },
+    {
+      "signature": "RSDT",
+      "file": "RSDT.bin",
+      "phys": "0x1f77d000",
+      "length": 60,
+      "sha256": "07c72923f9ca482e9c26b646fec216427906a654458b627bc7af9f148ac4af7b"
+    },
+    {
+      "signature": "FACP",
+      "file": "FACP.bin",
+      "phys": "0x1f779000",
+      "length": 244,
+      "sha256": "48cb9c164d5dbf5948615169faed69c73d6212ecf713869981b25f9b9334282d"
+    },
+    {
+      "signature": "FACS",
+      "file": "FACS.bin",
+      "phys": "0x1f7dd000",
+      "length": 64,
+      "sha256": "3fb3115e2c3c626603dbb20ab49825295d952f171ed7901a7f464cead2f40800"
+    },
+    {
+      "signature": "DSDT",
+      "file": "DSDT.bin",
+      "phys": "0x1f77a000",
+      "length": 8532,
+      "sha256": "460f87a2d05e1f34dfff004fc5d337caa2aac1abeceb816a834ef1e016e5022c"
+    },
+    {
+      "signature": "APIC",
+      "file": "APIC.bin",
+      "phys": "0x1f778000",
+      "length": 144,
+      "sha256": "9d5af0a66a717a2fa96ff87fd7102621a02921a9498af88e38af2739bd5804af"
+    },
+    {
+      "signature": "HPET",
+      "file": "HPET.bin",
+      "phys": "0x1f777000",
+      "length": 56,
+      "sha256": "8a486edc412b6e5f1b906ebf3fcfd6a647c8987d8ec437e4cbb808f34d7e2775"
+    },
+    {
+      "signature": "MCFG",
+      "file": "MCFG.bin",
+      "phys": "0x1f776000",
+      "length": 60,
+      "sha256": "b2a0c6d44a72943e9b8708005c07023889dfd3af2e581fc3727f3da21f7e1439"
+    },
+    {
+      "signature": "DMAR",
+      "file": "DMAR.bin",
+      "phys": "0x1f775000",
+      "length": 104,
+      "sha256": "6454e6f7680f4e275cbe5e34df52ad1e54995d9806cf985133108e5ddb6cb43c"
+    },
+    {
+      "signature": "WAET",
+      "file": "WAET.bin",
+      "phys": "0x1f774000",
+      "length": 40,
+      "sha256": "21cf099f063f6422353ea0c9100bbe47a97d7be87449c12f201a8a3bb49b7f4e"
+    }
+  ]
+}

@@ -61,6 +61,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hw-acpi"
+version = "0.1.0"
+
+[[package]]
+name = "hw-iommu"
+version = "0.1.0"
+
+[[package]]
+name = "hw-pci"
+version = "0.1.0"
+
+[[package]]
+name = "hw-smp"
+version = "0.1.0"
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
