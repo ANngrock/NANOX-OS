@@ -1,6 +1,6 @@
 # M9 — физическое железо, SMP и устройства: контракт и срезы
 
-Статус: рабочий контракт, 2026-09-26. Владелец M9 — Claude (M0–M8 ведёт
+Статус: рабочий контракт, 2026-09-26; §3.5–3.7 добавлены 2026-09-27. Владелец M9 — Claude (M0–M8 ведёт
 Codex). Ни один критерий M9 в [ROADMAP](../ROADMAP.md) этим документом не
 закрывается: host-тесты и снятые таблицы не являются проверкой на железе.
 
@@ -16,6 +16,9 @@ ROADMAP ставит M9 после M2 и драйверов M4–M5. Rust-лин
 | `crates/hw-pci` | ECAM, заголовки, BAR, capability-списки, MSI/MSI-X, обход шин | после M1 (MMIO mapping) |
 | `crates/hw-smp` | топология CPU, план старта AP, per-CPU layout, lock, TLB shootdown | после M1 (IDT, LAPIC, page tables) |
 | `crates/hw-iommu` | VT-d и AMD-Vi структуры, трансляция, жизненный цикл DMA mapping | после M1/M2 и драйверов M4–M5 |
+| `crates/hw-nvme` | NVMe: регистры, init, очереди, Identify, I/O, PRP, reset/recovery | после M1/M2 (MMIO, DMA, IRQ) |
+| `crates/hw-xhci` | xHCI: регистры, handoff, init, кольца TRB, порты, Address Device, дескрипторы, recovery | после M1/M2 |
+| `crates/fb-console` | текстовая консоль на GOP framebuffer, собственный шрифт 8×16 | после передачи framebuffer в BootInfo (решение Codex) |
 
 Правила (в дополнение к `AGENTS.md`):
 
@@ -104,6 +107,35 @@ invalidate IOTLB → wait completion → free frame`; кадр нельзя ос
 раньше подтверждённой инвалидации. Host-модель транслирует DMA и выдаёт
 fault на неотображённый адрес, запрет записи и доступ после unmap.
 
+### 3.5. `hw-nvme`
+
+Драйверное ядро NVMe (Base Specification 2.0) для двух накопителей целевого
+ноутбука: регистры CAP/CC/CSTS, инициализация как автомат с тайм-аутами по
+CAP.TO, admin и I/O очереди с phase tag, Identify, Read/Write/Flush, PRP и
+PRP list с учётом MDTS. Recovery: тайм-аут команды → abort или reset
+контроллера; при reset каждая незавершённая команда завершается явной
+ошибкой ровно один раз; CSTS.CFS в любой фазе; shutdown через CC.SHN.
+Серийный номер и модель из Identify — байты для вызывающего, не для логов.
+
+### 3.6. `hw-xhci`
+
+Драйверное ядро xHCI 1.2 для двух контроллеров USB ноутбука: BIOS/OS handoff,
+reset и запуск контроллера, DCBAA и scratchpad, command/transfer/event rings
+с cycle bit и Link TRB, PORTSC с RW1C-дисциплиной, reset порта, Enable Slot,
+Address Device, control transfer GET_DESCRIPTOR, разбор дескрипторов,
+Configure Endpoint для interrupt IN. Recovery: Command Abort, stall →
+Reset Endpoint, отключение устройства с незавершёнными операциями, HSE →
+полный reset.
+
+### 3.7. `fb-console`
+
+Текстовая консоль на линейном framebuffer UEFI GOP (RGBX, BGRX, bitmask;
+BltOnly отвергается) с собственным шрифтом 8×16 для ASCII — ранняя
+диагностика на машине без COM-порта. Описание framebuffer проверяется до
+записи; скролл без чтения медленного MMIO; аварийный вывод, не зависящий от
+состояния консоли. Для интеграции loader должен передать параметры GOP в
+BootInfo — это изменение ABI в зоне Codex.
+
 ## 4. Критерии ROADMAP и что их закрывает
 
 | Критерий | Что нужно | Host-срезы дают |
@@ -112,7 +144,7 @@ fault на неотображённый адрес, запрет записи и
 | Boot, ACPI/PCI, IRQ на железе | загрузка на выбранной машине | парсеры и модели |
 | SMP, per-CPU, TLB shootdown | guest-сценарий с `-smp 4` и на железе | протоколы и потоковые тесты |
 | DMA/IOMMU | guest с `intel-iommu`/`amd-iommu`, затем железо | структуры и модель трансляции |
-| Reset/recovery | фактические тесты устройств | — |
+| Reset/recovery | фактические тесты устройств | модели NVMe и xHCI: reset с незавершёнными командами, stall, HSE, CFS |
 | GPU отдельно | после выбора устройства | — |
 
 ## 5. Проверка среза
@@ -121,8 +153,8 @@ fault на неотображённый адрес, запрет записи и
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --offline --locked -p hw-acpi -p hw-pci -p hw-smp -p hw-iommu --all-targets -- -D warnings
-cargo build --offline --locked -p hw-acpi -p hw-pci -p hw-smp -p hw-iommu --target x86_64-unknown-none
-cargo test --offline --locked -p hw-acpi -p hw-pci -p hw-smp -p hw-iommu
+cargo clippy --offline --locked -p hw-acpi -p hw-pci -p hw-smp -p hw-iommu -p hw-nvme -p hw-xhci -p fb-console --all-targets -- -D warnings
+cargo build --offline --locked -p hw-acpi -p hw-pci -p hw-smp -p hw-iommu -p hw-nvme -p hw-xhci -p fb-console --target x86_64-unknown-none
+cargo test --offline --locked -p hw-acpi -p hw-pci -p hw-smp -p hw-iommu -p hw-nvme -p hw-xhci -p fb-console
 git diff --check
 ```
