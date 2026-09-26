@@ -61,10 +61,13 @@ host-тесты: в guest (QEMU) и на физическом железе не 
   (`out/runs/1790454055920567856-482215-pass-replay-play/`,
   `out/runs/1790454102082206245-482215-kernel-fail-replay-play/`).
 
-## Физический кандидат
+## Физический профиль
 
 LENOVO 82K8 (Legion S7 15ACH6), Ryzen 7 5800H 8C/16T, BIOS HACN46WW, AMD-Vi.
-Профиль: `docs/hardware/lenovo-82k8.toml`. **Не подтверждён владельцем.**
+Профиль: `docs/hardware/lenovo-82k8.toml`, статус `confirmed`: владелец выбрал
+эту машину 2026-09-27. Критерий 1 ROADMAP пока не отмечен: устройства и firmware
+записаны только из Windows под Hyper-V; config space, функция IOMMU и
+IOMMU-группы ждут live-Linux сбора, который владелец отложил.
 Блокеры и риски: включён Secure Boot (неподписанный загрузчик не стартует);
 нет COM-порта; нет virtio — нужны драйверы NVMe и xHCI; сеть только Wi-Fi Intel
 AX200; гибридная графика AMD + NVIDIA. Не собрано: PCI config space, функция
@@ -73,10 +76,9 @@ live-USB (записывает носитель владелец).
 
 ## Следующие шаги M9
 
-1. Решение владельца: подтвердить кандидата (или выбрать другую машину) и
-   Secure Boot (отключить или регистрировать ключ).
-2. Live-Linux сбор `tools/hw-inventory/collect-linux.sh` на кандидате,
-   `profile.py --check`.
+1. Отложено владельцем: Secure Boot (отключить или регистрировать ключ).
+2. Отложено владельцем: live-Linux сбор `tools/hw-inventory/collect-linux.sh`,
+   `profile.py --check` — закроет запись устройств для критерия 1.
 3. После M1 Codex: guest-сценарии в QEMU `-smp 4` — разбор ACPI от
    `BootInfo.rsdp_phys`, перечисление PCI через ECAM, старт AP и TLB shootdown;
    затем `intel-iommu`/`amd-iommu` с драйверами M4–M5.

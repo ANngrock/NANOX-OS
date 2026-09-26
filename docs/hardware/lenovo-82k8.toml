@@ -4,11 +4,12 @@
 # status = "confirmed" is set by the machine owner, never by a tool.
 schema_version = 1
 id = "lenovo-82k8"
-status = "candidate"
-confirmed_by = ""
-confirmed_on = ""
+status = "confirmed"
+confirmed_by = "owner (GitHub ANngrock), in a Claude Code session"
+confirmed_on = "2026-09-27"
 notes = [
-  "Candidate from docs/specs/M9-HARDWARE.md section 2.2; the owner has not confirmed it.",
+  "Selected by the owner on 2026-09-27 as the single M9 physical target (docs/specs/M9-HARDWARE.md section 2.2).",
+  "Deferred by the owner: the Secure Boot decision and the live-Linux collection, until NANOX can boot usefully on this machine.",
   "Pending: collect-linux.sh from a live Linux on this machine (IOMMU PCI function, config space, IOMMU groups, dmidecode).",
 ]
 risks = [
