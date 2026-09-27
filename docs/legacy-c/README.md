@@ -59,32 +59,37 @@ engine, без host bridge в цикле. Ключ, модель и якоря �
 работающей консоли. Запрос к настоящему provider не выполнялся (в среде нет
 ключа) — см. [docs/m5-net.md](docs/m5-net.md).
 
-## Быстрый старт
+## Быстрый старт архивной C17/ASM-линии
 
-Требования (эталонная среда Ubuntu 24.04):
+Эти команды запускают сохранённый ниже C17/ASM Makefile из корня
+репозитория. Корневой `Makefile` обслуживает каноническую Rust/Nix-линию;
+для неё используйте `make doctor`, `make build` и `make test`.
+
+Требования архивной сборки (эталонная среда Ubuntu 24.04):
 
 ```sh
 sudo apt-get install clang lld qemu-system-x86 ovmf mtools python3 make gdb
 ```
 
-Затем из чистого checkout — одна последовательность:
+Из корня репозитория выполните:
 
 ```sh
-make doctor && make && make test
+make -f docs/legacy-c/Makefile doctor
+make -f docs/legacy-c/Makefile all
+make -f docs/legacy-c/Makefile test
 ```
 
-- `make doctor` сверяет версии инструментов и хеши прошивки с `toolchain.lock`;
-- `make` собирает `out/BOOTX64.EFI`, `out/kernel.elf`, `out/nanox.img` и
-  диск данных `out/data.img` (M4);
-- `make test` запускает host-тесты, все сценарии QEMU (включая серию сбоев
-  M4, около 5 минут на 4 CPU; параллельность — `NANOX_JOBS`) и проверку
-  повторяемости; каждый запуск записывается в
-  `out/runs/<время>-<сценарий>/record.json`.
+- `make -f docs/legacy-c/Makefile doctor` сверяет версии инструментов и
+  хеши прошивки с `toolchain.lock`;
+- `make -f docs/legacy-c/Makefile all` собирает архивные EFI, kernel,
+  initramfs и диск данных;
+- `make -f docs/legacy-c/Makefile test` запускает host-тесты, сценарии QEMU
+  и проверку повторяемости. Записи создаются в `out/runs/`.
 
-Прочие цели: `make run` (одна загрузка с выводом serial), `make debug` +
-`gdb -x tools/gdb/nanox.gdb` (отладка), `make repro-check` (побайтовая
-воспроизводимость). Окружение Nix описано в `flake.nix`, но ещё не проверено
-(см. [docs/m0-bench.md](docs/m0-bench.md#3-toolchain)).
+Другие цели архивного Makefile также вызывайте с `-f docs/legacy-c/Makefile`,
+например `run`, `debug` и `repro-check`. Окружение Nix описано в `flake.nix`;
+подтверждённое состояние текущей Rust-линии приведено в
+[docs/STATUS.md](../STATUS.md).
 
 ## Документация
 

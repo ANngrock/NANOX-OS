@@ -1,6 +1,6 @@
 # Статус M9: host-срезы (Claude)
 
-Обновлено: 2026-09-26. Ветка `claude/m9-hardware`, worktree
+Обновлено: 2026-09-27. Исходный host-срез создан в ветке `claude/m9-hardware`, worktree
 `/home/holod/src/NANOX-OS-m9` (от `b8913fa`). Контракт —
 [M9-HARDWARE](specs/M9-HARDWARE.md).
 
@@ -15,9 +15,9 @@ host-тесты: в guest (QEMU) и на физическом железе не 
 | Снятие ACPI из QEMU/OVMF | `tools/acpi-capture/capture.py` | — | таблицы q35 с 4 vCPU: без IOMMU, `intel-iommu` (DMAR), `amd-iommu` (IVRS); manifest с argv, хешами QEMU/OVMF и физическими адресами |
 | ACPI-парсер | `crates/hw-acpi` | 41 | RSDP v0/v2, RSDT/XSDT, MADT, FADT, HPET, MCFG, DMAR, IVRS на всех снятых таблицах; обход от RSDP по модели памяти; негативы на каждое правило; 4000 мутаций на таблицу без panic |
 | PCI/PCIe | `crates/hw-pci` | 55 | ECAM из реальных MCFG, заголовки, sizing BAR с восстановлением на всех путях, capabilities с защитой от циклов, MSI/MSI-X, обход мостов (Validate/Assign), randomized config space |
-| SMP | `crates/hw-smp` | 42 | топология по реальным MADT (4 и 16 CPU), автомат INIT-SIPI-SIPI на модели APIC, per-CPU layout, ticket lock и TLB shootdown на настоящих потоках; негативный контроль «free без подтверждений» ловит нарушения |
+| SMP | `crates/hw-smp` | 44 | топология по реальным MADT (4 и 16 CPU), автомат INIT-SIPI-SIPI на модели APIC, per-CPU layout, ticket lock и TLB shootdown на настоящих потоках; негативный контроль «free без подтверждений» ловит нарушения |
 | IOMMU | `crates/hw-iommu` | 66 | VT-d и AMD-Vi таблицы, map/unmap без частичного эффекта, жизненный цикл DMA (кадр освобождается только после подтверждённой инвалидации), модели IOMMU/IOTLB, наблюдатель записей: DTE никогда не проходит через V=0 |
-| Инвентаризация | `tools/hw-inventory`, `docs/hardware/` | 20 (Python) | сборщики Windows/live-Linux с вырезанием идентификаторов; профиль `docs/hardware/lenovo-82k8.toml` (статус `candidate`) побайтно воспроизводится из сбора, `--check` без расхождений |
+| Инвентаризация | `tools/hw-inventory`, `docs/hardware/` | 20 (Python) | сборщики Windows/live-Linux с вырезанием идентификаторов; профиль `docs/hardware/lenovo-82k8.toml` (статус `confirmed`) побайтно воспроизводится из сбора, `--check` без расхождений |
 
 Все crates: `no_std`, без alloc и сторонних crates, `forbid(unsafe_code)`; в
 `hw-smp` `unsafe` только для `UnsafeCell` в lock с SAFETY-обоснованиями.
@@ -60,6 +60,33 @@ host-тесты: в guest (QEMU) и на физическом железе не 
   raw serial, verdict, disk и VARS равны
   (`out/runs/1790454055920567856-482215-pass-replay-play/`,
   `out/runs/1790454102082206245-482215-kernel-fail-replay-play/`).
+
+## Проверка интеграционной ветки (2026-09-27)
+
+После исходного прогона ветки M9 исправлен SMP ticket lock: активный CPU
+регистрируется до ожидания тикета, поэтому NMI на том же CPU сразу получает
+`Recursive`, даже когда прерванный контекст сам ещё ждёт lock. Набор
+`hw-smp` теперь содержит 44 теста, включая детерминированную проверку окна
+handoff и сохранности диагностического owner.
+
+На интеграционном снимке `f5be9ca` плюс изменения lock в рабочем дереве:
+
+- В полном Rust workspace прошло 310 тестовых случаев; лог:
+  `out/reconcile-checks-20260927/workspace-tests.log`. В составе M9 crates:
+  ACPI 41, PCI 55, SMP 44, IOMMU 66 (206 всего).
+- `nix develop --offline --command cargo clippy --offline --locked --workspace
+  --all-targets -- -D warnings` — exit 0;
+  `out/reconcile-checks-20260927/workspace-clippy.log`.
+- Четыре M9 crates собираются для `x86_64-unknown-none`.
+- Python inventory: 20 тестов, лог
+  `out/reconcile-checks-20260927/hw-inventory-python.log`.
+- M0 QEMU suite и положительный/отрицательный replay прошли:
+  `out/runs/1790535337456723414-418161-suite/suite.json`,
+  `out/runs/1790535457490883648-418161-pass-replay-play/replay-comparison.json`,
+  `out/runs/1790535498812306816-418161-kernel-fail-replay-play/replay-comparison.json`.
+
+Это host/build/replay evidence. Оно не исполняет ACPI/PCI/SMP/IOMMU код ядра и
+не закрывает критерии M9 в ROADMAP.
 
 ## Физический профиль
 

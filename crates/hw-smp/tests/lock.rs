@@ -6,7 +6,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hw_smp::{IrqControl, LockError, TicketLock, TryLockError};
+use hw_smp::{IrqControl, LockError, TicketLock, TryLockError, MAX_CPUS};
 
 /// Model of one CPU's interrupt flag. Not shared: each thread is one CPU.
 struct ModelIrq {
@@ -212,11 +212,61 @@ fn try_lock_refuses_while_another_cpu_holds() {
 }
 
 #[test]
+fn same_cpu_nmi_is_refused_while_interrupted_context_waits() {
+    common::with_watchdog(5, || {
+        let lock = Arc::new(TicketLock::new(()));
+        let holder_irq = ModelIrq::new(0);
+        let holder = lock.lock(&holder_irq).unwrap();
+        let waiter_lock = lock.clone();
+        let waiter = thread::spawn(move || {
+            let irq = ModelIrq::new(1);
+            drop(waiter_lock.lock(&irq).unwrap());
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock.queued() != 2 {
+            assert!(Instant::now() < deadline, "CPU 1 never queued");
+            thread::yield_now();
+        }
+
+        // Simulate an NMI on CPU 1 while its interrupted context is already
+        // waiting behind CPU 0. It must refuse recursion instead of taking a
+        // second ticket behind the context that cannot resume until the NMI
+        // returns.
+        let nmi_irq = ModelIrq::new(1);
+        assert_eq!(
+            lock.lock(&nmi_irq).err(),
+            Some(LockError::Recursive { cpu: 1 })
+        );
+        assert!(
+            nmi_irq.enabled.get(),
+            "IRQs restored after recursive refusal"
+        );
+        assert_eq!(
+            lock.try_lock(&nmi_irq).err(),
+            Some(TryLockError::Recursive { cpu: 1 })
+        );
+        assert!(
+            nmi_irq.enabled.get(),
+            "IRQs restored after try_lock refusal"
+        );
+        drop(holder);
+        waiter.join().unwrap();
+    });
+}
+
+#[test]
 fn reserved_cpu_id_is_rejected() {
     let lock = TicketLock::new(());
-    let irq = ModelIrq::new(u32::MAX);
-    assert_eq!(lock.lock(&irq).err(), Some(LockError::InvalidCpuId));
-    assert_eq!(lock.try_lock(&irq).err(), Some(TryLockError::InvalidCpuId));
-    assert!(irq.enabled.get());
+    for cpu in [MAX_CPUS as u32, u32::MAX] {
+        let irq = ModelIrq::new(cpu);
+        assert_eq!(lock.lock(&irq).err(), Some(LockError::InvalidCpuId));
+        assert_eq!(lock.try_lock(&irq).err(), Some(TryLockError::InvalidCpuId));
+        assert!(irq.enabled.get());
+    }
     assert!(!lock.is_locked());
+
+    let highest_valid_cpu = ModelIrq::new((MAX_CPUS - 1) as u32);
+    drop(lock.lock(&highest_valid_cpu).unwrap());
+    assert!(highest_valid_cpu.enabled.get());
 }

@@ -351,64 +351,63 @@ M5 остаётся незавершённым; criteria ROADMAP не отмеч
 
 ## Текущая интеграция и повторная проверка (2026-09-27)
 
-Это обновление supersedes старую заметку выше о том, что Rust и main ещё не
-объединены. Проверочная ветка codex/reconcile-github-branches содержит Rust
-M0, M5 host crates PR #4 и документацию переноса C→Rust. GitHub main пока не
-обновлён. Основная dirty WSL копия codex/m0 с локальными M1/M2 файлами
-оставлена без изменений. Исторические C17/ASM исходники сохранены в
-репозитории для справки и не являются активным Cargo/kernel путём.
+Интеграционная ветка `codex/reconcile-github-branches` собирает шесть проверенных
+GitHub refs поверх `origin/main`: `codex/m0`, `claude/m2-wip`,
+`claude/slack-session-ru31dg`, `agents/t-1790303226658609` и
+`claude/m9-hardware`, а также сам `main`. Все шесть исходных heads проверены
+как предки интеграционной ветки. История веток сохранена merge-коммитами.
 
-Проверка выполнена в отдельном worktree /home/holod/src/NANOX-OS-reconcile
-на dirty merge-preview; она подтверждает этот снимок, а не опубликованный commit.
+M2 WIP вошёл в историю, но его устаревшие C-файлы не заменили более позднее
+состояние C-кода из main. Этот черновик не был проверен как рабочая реализация;
+его ABI противоречит каноническому Rust ABI-NCI. M2 не объявляется завершённым.
+C17/ASM Makefile сохранён в `docs/legacy-c/Makefile`; корневой Makefile теперь
+ведёт в закреплённые Rust/Nix `cargo xtask` команды. Основной dirty WSL checkout
+`/home/holod/src/NANOX-OS` на ветке `codex/m0` с локальной работой M1–M5
+интеграционной проверкой не менялся.
 
-- nix develop --offline --command cargo test --offline --locked --workspace:
-  101 host-тест прошёл; включены boot-protocol, net-wire, net-tcp, net-stack и xtask.
-- nix develop --offline --command cargo fmt --all -- --check и
-  git diff --check прошли.
-- nix develop --offline --command cargo clippy --offline --locked --workspace
-  --all-targets -- -D warnings прошёл после исправлений ELF/BootInfo alignment,
-  UEFI entry safety, kernel alignment и xtask doctor.
-- nix develop --offline --command cargo xtask doctor: failures пуст;
-  Rust 1.90.0, QEMU 9.2.4 nanox-replay-exit-v1, OVMF и pc-q35-9.2.
-- nix develop --offline --command cargo xtask test --replay завершился с exit 0:
-  out/runs/1790511120003562368-114827-suite/suite.json.
-  Host log: out/runs/1790511120003562368-114827-suite/host-tests.log.
-  PASS, три LOADER_ERROR, FAIL, PANIC и TIMEOUT соответствовали ожиданиям.
-  PASS/FAIL replay сохранили равные raw serial и guest verdict; изменённый ELF
-  отклонён до QEMU:
-  out/runs/1790511243081843606-114827-pass-replay-play/replay-comparison.json
-  и out/runs/1790511284677783710-114827-kernel-fail-replay-play/replay-comparison.json.
-- M5 crates остаются host-only. Они не запускались в guest, QEMU M0 использует
-  network=none, поэтому гостевая сетевая подсистема и готовность M5 не заявляются.
+Проверки снимка `f5be9ca` с изменениями интеграции в рабочем дереве выполнялись
+в `/home/holod/src/NANOX-OS-reconcile`, WSL Ubuntu, Nix offline:
 
-## Следующее действие
+- `nix develop --offline --command cargo test --offline --locked --workspace`:
+  310 тестовых случаев прошли; полный вывод —
+  `out/reconcile-checks-20260927/workspace-tests.log`.
+- `nix develop --offline --command cargo clippy --offline --locked --workspace
+  --all-targets -- -D warnings` прошёл; лог —
+  `out/reconcile-checks-20260927/workspace-clippy.log`.
+- `cargo fmt --all -- --check` и `git diff --check` прошли.
+- `nix develop --offline --command python3 -m unittest discover -s
+  tools/hw-inventory -p "test_*.py"`: 20 тестов прошли; лог —
+  `out/reconcile-checks-20260927/hw-inventory-python.log`.
+- `cargo xtask doctor`: `failures: []`; Rust 1.90.0, QEMU 9.2.4
+  `nanox-replay-exit-v1`, OVMF и `pc-q35-9.2`; лог —
+  `out/reconcile-checks-20260927/doctor.log`.
+- `cargo check --offline --locked -p hw-acpi -p hw-pci -p hw-smp -p hw-iommu
+  --target x86_64-unknown-none` прошёл.
+- `cargo xtask test --replay` завершился с exit 0:
+  `out/runs/1790535337456723414-418161-suite/suite.json`. PASS, три
+  LOADER_ERROR, FAIL, PANIC и TIMEOUT совпали с ожиданиями. Replay PASS и FAIL
+  сохранили равные raw serial и guest verdict:
+  `out/runs/1790535457490883648-418161-pass-replay-play/replay-comparison.json`
+  и
+  `out/runs/1790535498812306816-418161-kernel-fail-replay-play/replay-comparison.json`.
+- Новые SMP lock тесты покрывают NMI при ожидании тикета и окно handoff;
+  `cargo test -p hw-smp` и Clippy этого crate прошли до общего прогона.
 
-Отдельными задачами, по одной:
+Изменения M5 TCP исправляют повторную ACK для дубликата ровно до RCV.NXT и
+переполнение в RTT/RTO/persist расчётах. M5 host crates не запускались в guest;
+QEMU M0 использует `network=none`. M9 host crates также не исполнены в guest
+или на физическом устройстве. Эти проверки не закрывают критерии M1–M9 в
+`docs/ROADMAP.md`.
 
-По указанию пользователя приоритет — M5, затем остальные этапы. M5-1 и M5-2
-приняты; host-срез M5-4 реализован и проверен. M5-3 требует двух исправлений
-по перекрёстному ревью выше. После исправления и ревью частей Claude/Codex —
-M1–M4, затем интеграция M5 и M6–M10 по ROADMAP.
-
-1. ~~Clippy-долг~~ — выполнено и принято, см. «Срез 1: Clippy».
-2. Полная сверка runtime-профиля с `docs/specs/machine-profile.toml`: все
-   исполняемые поля профиля, в том числе machine, версия и патч QEMU, CPU,
-   vCPU, RAM, accelerator, RTC, network, display, boot controller, serial,
-   debug exit, timeout, Rust, firmware, хеши CODE/VARS, firmware mapping,
-   replay-режим и inputs, сверяются `doctor`/runner;
-   расхождение, в том числе через `NANOX_QEMU_MACHINE`, — ошибка.
-   Негативные host-тесты на несовпадение и повреждённый профиль.
-3. Отдельный M1-контракт в `docs/specs/` до любого кода allocator: layout
-   памяти, исключаемые диапазоны (kernel, handoff, page tables, stack,
-   reserved/device memory), источник таймера, порядок блокировок, входы,
-   выходы и негативные случаи. Физический allocator реализуется только после
-   принятия контракта.
-
+Следующая работа: сохранить и проаудировать dirty M1–M5 материалы основного WSL
+checkout, затем продолжать реализацию по критериям ROADMAP последовательно до
+M8. M8 перед реализацией требует закрыть зависимости M1–M7 и зафиксировать
+контракт модели, tokenizer, операторов, reference, метрик и восстановления.
 ## M9: host-срезы (Claude, 2026-09-26)
 
 Ветка `claude/m9-hardware`: crates `hw-acpi`, `hw-pci`, `hw-smp`, `hw-iommu`,
 снятие ACPI из QEMU/OVMF, инвентаризация и профиль
-`docs/hardware/lenovo-82k8.toml` (машину выбрал владелец 2026-09-27). 204 host-теста M9, 20 Python-тестов, семь
+`docs/hardware/lenovo-82k8.toml` (машину выбрал владелец 2026-09-27). 206 host-теста M9, 20 Python-тестов, семь
 QEMU-сценариев M0 без регрессий. **Критерии M9 не закрыты**: код не исполнялся
 в guest и на железе. Подробности, доказательства и следующие шаги —
 [M9-STATUS](M9-STATUS.md).
