@@ -1,0 +1,541 @@
+{
+    "schema_version":  1,
+    "kind":  "nanox-hw-inventory",
+    "collector":  "collect-windows.ps1",
+    "collector_version":  1,
+    "collected_utc":  "2026-09-26T00:51:03Z",
+    "host_os":  {
+                    "family":  "windows",
+                    "version":  "10.0.26200",
+                    "build":  "26200"
+                },
+    "privileged":  false,
+    "system":  {
+                   "manufacturer":  "LENOVO",
+                   "model":  "82K8",
+                   "family":  "Legion S7 15ACH6",
+                   "version":  "Legion S7 15ACH6",
+                   "sku":  "LENOVO_MT_82K8_BU_idea_FM_Legion S7 15ACH6",
+                   "board_manufacturer":  "LENOVO",
+                   "board_product":  "LNVNB161216",
+                   "board_version":  "SDK0R32862WIN",
+                   "hypervisor_present":  true
+               },
+    "bios":  {
+                 "vendor":  "LENOVO",
+                 "version":  "HACN46WW",
+                 "date":  "2024-11-14",
+                 "smbios_version":  "3.3",
+                 "release":  "1.46",
+                 "ec_release":  "1.43"
+             },
+    "firmware":  {
+                     "type":  "uefi",
+                     "secure_boot":  "enabled",
+                     "dma_protection_available":  true
+                 },
+    "cpu":  {
+                "name":  "AMD Ryzen 7 5800H with Radeon Graphics",
+                "vendor":  "AuthenticAMD",
+                "family":  25,
+                "model":  80,
+                "stepping":  0,
+                "packages":  1,
+                "cores":  8,
+                "threads":  16,
+                "max_mhz":  3201,
+                "l2_kib":  4096,
+                "l3_kib":  16384,
+                "virtualization_enabled":  true
+            },
+    "memory":  {
+                   "installed_bytes":  42949672960,
+                   "visible_bytes":  42268614656,
+                   "modules":  [
+                                   {
+                                       "locator":  "DIMM 0",
+                                       "bank":  "P0 CHANNEL A",
+                                       "size_bytes":  8589934592,
+                                       "speed_mts":  3200,
+                                       "configured_mts":  3200,
+                                       "manufacturer":  "Samsung",
+                                       "part_number":  "M471A1G44AB0-CWE",
+                                       "smbios_type":  26
+                                   },
+                                   {
+                                       "locator":  "DIMM 0",
+                                       "bank":  "P0 CHANNEL B",
+                                       "size_bytes":  34359738368,
+                                       "speed_mts":  3200,
+                                       "configured_mts":  3200,
+                                       "manufacturer":  "Kingston",
+                                       "part_number":  "9905744-066.A00G",
+                                       "smbios_type":  26
+                                   }
+                               ]
+               },
+    "pci":  [
+                {
+                    "bdf":  "0000:00:00.0",
+                    "vendor":  "1022",
+                    "device":  "1630",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "1630",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:01.0",
+                    "vendor":  "1022",
+                    "device":  "1632",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:01.1",
+                    "vendor":  "1022",
+                    "device":  "1633",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "1453",
+                    "revision":  "00",
+                    "class":  "060400",
+                    "name":  "PCI Express Root Port",
+                    "driver":  "pci"
+                },
+                {
+                    "bdf":  "0000:00:01.2",
+                    "vendor":  "1022",
+                    "device":  "1634",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "1453",
+                    "revision":  "00",
+                    "class":  "060400",
+                    "name":  "PCI Express Root Port",
+                    "driver":  "pci"
+                },
+                {
+                    "bdf":  "0000:00:01.3",
+                    "vendor":  "1022",
+                    "device":  "1634",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "1453",
+                    "revision":  "00",
+                    "class":  "060400",
+                    "name":  "PCI Express Root Port",
+                    "driver":  "pci"
+                },
+                {
+                    "bdf":  "0000:00:02.0",
+                    "vendor":  "1022",
+                    "device":  "1632",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:02.3",
+                    "vendor":  "1022",
+                    "device":  "1634",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "1453",
+                    "revision":  "00",
+                    "class":  "060400",
+                    "name":  "PCI Express Root Port",
+                    "driver":  "pci"
+                },
+                {
+                    "bdf":  "0000:00:02.4",
+                    "vendor":  "1022",
+                    "device":  "1634",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "1453",
+                    "revision":  "00",
+                    "class":  "060400",
+                    "name":  "PCI Express Root Port",
+                    "driver":  "pci"
+                },
+                {
+                    "bdf":  "0000:00:08.0",
+                    "vendor":  "1022",
+                    "device":  "1632",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:08.1",
+                    "vendor":  "1022",
+                    "device":  "1635",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "1635",
+                    "revision":  "00",
+                    "class":  "060400",
+                    "name":  "PCI Express Root Port",
+                    "driver":  "pci"
+                },
+                {
+                    "bdf":  "0000:00:14.0",
+                    "vendor":  "1022",
+                    "device":  "790b",
+                    "subsys_vendor":  "17aa",
+                    "subsys_device":  "3853",
+                    "revision":  "51",
+                    "class":  "0c0500",
+                    "name":  "AMD SMBus",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:14.3",
+                    "vendor":  "1022",
+                    "device":  "790e",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "790e",
+                    "revision":  "51",
+                    "class":  "060100",
+                    "name":  "LPC Interface Controller",
+                    "driver":  "msisadrv"
+                },
+                {
+                    "bdf":  "0000:00:18.0",
+                    "vendor":  "1022",
+                    "device":  "166a",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:18.1",
+                    "vendor":  "1022",
+                    "device":  "166b",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:18.2",
+                    "vendor":  "1022",
+                    "device":  "166c",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:18.3",
+                    "vendor":  "1022",
+                    "device":  "166d",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:18.4",
+                    "vendor":  "1022",
+                    "device":  "166e",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:18.5",
+                    "vendor":  "1022",
+                    "device":  "166f",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:18.6",
+                    "vendor":  "1022",
+                    "device":  "1670",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:00:18.7",
+                    "vendor":  "1022",
+                    "device":  "1671",
+                    "subsys_vendor":  "0000",
+                    "subsys_device":  "0000",
+                    "revision":  "00",
+                    "class":  "060000",
+                    "name":  "PCI standard host CPU bridge",
+                    "driver":  null
+                },
+                {
+                    "bdf":  "0000:01:00.0",
+                    "vendor":  "10de",
+                    "device":  "2560",
+                    "subsys_vendor":  "17aa",
+                    "subsys_device":  "3801",
+                    "revision":  "a1",
+                    "class":  "030000",
+                    "name":  "NVIDIA GeForce RTX 3060 Laptop GPU",
+                    "driver":  "nvlddmkm"
+                },
+                {
+                    "bdf":  "0000:01:00.1",
+                    "vendor":  "10de",
+                    "device":  "228e",
+                    "subsys_vendor":  "17aa",
+                    "subsys_device":  "3801",
+                    "revision":  "a1",
+                    "class":  "040300",
+                    "name":  "High Definition Audio Controller",
+                    "driver":  "HDAudBus"
+                },
+                {
+                    "bdf":  "0000:02:00.0",
+                    "vendor":  "8086",
+                    "device":  "2723",
+                    "subsys_vendor":  "1a56",
+                    "subsys_device":  "1654",
+                    "revision":  "1a",
+                    "class":  "028000",
+                    "name":  "Killer(R) Wi-Fi 6 AX1650x 160MHz Wireless Network Adapter (200NGW)",
+                    "driver":  "Netwtw10"
+                },
+                {
+                    "bdf":  "0000:03:00.0",
+                    "vendor":  "1217",
+                    "device":  "8621",
+                    "subsys_vendor":  "17aa",
+                    "subsys_device":  "384b",
+                    "revision":  "01",
+                    "class":  "080501",
+                    "name":  "BayHubTech Integrated MMC/SD controller",
+                    "driver":  "bhtsddr"
+                },
+                {
+                    "bdf":  "0000:04:00.0",
+                    "vendor":  "144d",
+                    "device":  "a808",
+                    "subsys_vendor":  "144d",
+                    "subsys_device":  "a801",
+                    "revision":  "00",
+                    "class":  "010802",
+                    "name":  "Samsung NVMe Controller",
+                    "driver":  "secnvme"
+                },
+                {
+                    "bdf":  "0000:05:00.0",
+                    "vendor":  "126f",
+                    "device":  "2263",
+                    "subsys_vendor":  "126f",
+                    "subsys_device":  "2263",
+                    "revision":  "03",
+                    "class":  "010802",
+                    "name":  "Phison NVMe 1.2 Storport Miniport",
+                    "driver":  "nvme"
+                },
+                {
+                    "bdf":  "0000:06:00.0",
+                    "vendor":  "1002",
+                    "device":  "1638",
+                    "subsys_vendor":  "17aa",
+                    "subsys_device":  "380c",
+                    "revision":  "c5",
+                    "class":  "030000",
+                    "name":  "AMD Radeon(TM) Graphics",
+                    "driver":  "amdwddmg"
+                },
+                {
+                    "bdf":  "0000:06:00.2",
+                    "vendor":  "1022",
+                    "device":  "15df",
+                    "subsys_vendor":  "17aa",
+                    "subsys_device":  "383c",
+                    "revision":  "00",
+                    "class":  "108000",
+                    "name":  "AMD PSP 10.0 Device",
+                    "driver":  "amdpsp"
+                },
+                {
+                    "bdf":  "0000:06:00.3",
+                    "vendor":  "1022",
+                    "device":  "1639",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "1639",
+                    "revision":  "00",
+                    "class":  "0c0330",
+                    "name":  "AMD USB 3.10 eXtensible Host Controller - 1.10 (Microsoft)",
+                    "driver":  "USBXHCI"
+                },
+                {
+                    "bdf":  "0000:06:00.4",
+                    "vendor":  "1022",
+                    "device":  "1639",
+                    "subsys_vendor":  "1022",
+                    "subsys_device":  "1639",
+                    "revision":  "00",
+                    "class":  "0c0330",
+                    "name":  "AMD USB 3.10 eXtensible Host Controller - 1.10 (Microsoft)",
+                    "driver":  "USBXHCI"
+                },
+                {
+                    "bdf":  "0000:06:00.5",
+                    "vendor":  "1022",
+                    "device":  "15e2",
+                    "subsys_vendor":  "17aa",
+                    "subsys_device":  "383f",
+                    "revision":  "01",
+                    "class":  "048000",
+                    "name":  "AMD Audio CoProcessor",
+                    "driver":  "amdacpbus"
+                },
+                {
+                    "bdf":  "0000:06:00.6",
+                    "vendor":  "1022",
+                    "device":  "15e3",
+                    "subsys_vendor":  "17aa",
+                    "subsys_device":  "383e",
+                    "revision":  "00",
+                    "class":  "040300",
+                    "name":  "High Definition Audio Controller",
+                    "driver":  "HDAudBus"
+                }
+            ],
+    "storage_drives":  [
+                           {
+                               "model":  "NVMe T-CREATE TM8FPE0",
+                               "bus":  "NVMe",
+                               "media":  "Unspecified",
+                               "size_bytes":  1024209543168,
+                               "firmware":  "18A3"
+                           },
+                           {
+                               "model":  "NVMe SAMSUNG MZVLB512",
+                               "bus":  "NVMe",
+                               "media":  "SSD",
+                               "size_bytes":  512110190592,
+                               "firmware":  "3L1Q"
+                           }
+                       ],
+    "network_adapters":  [
+                             {
+                                 "name":  "Killer(R) Wi-Fi 6 AX1650x 160MHz Wireless Network Adapter (200NGW)",
+                                 "manufacturer":  "Intel Corporation",
+                                 "bus":  "pci",
+                                 "vendor":  "8086",
+                                 "device":  "2723"
+                             }
+                         ],
+    "acpi_tables":  [
+                        {
+                            "signature":  "APIC",
+                            "instances":  1,
+                            "length":  312,
+                            "revision":  2,
+                            "checksum_ok":  true,
+                            "oem_id":  "LENOVO",
+                            "oem_table_id":  "CB-01",
+                            "oem_revision":  0,
+                            "creator_id":  "PTEC",
+                            "creator_revision":  2,
+                            "sha256":  "baaba1723628bd170542dc5ce948cb932856a892df4b8a1a42c85f6d6d1594a7",
+                            "data_base64":  "QVBJQzgBAAACI0xFTk9WT0NCLTAxICAgAAAAAFBURUMCAAAAAADg/gEAAAAACAAAAQAAAAAIAQEBAAAAAAgCAgEAAAAACAMDAQAAAAAIBAQBAAAAAAgFBQEAAAAACAYGAQAAAAAIBwcBAAAAAAgICAEAAAAACAkJAQAAAAAICgoBAAAAAAgLCwEAAAAACAwMAQAAAAAIDQ0BAAAAAAgODgEAAAAACA8PAQAAAAEMIAAAAMD+AAAAAAEMIQAAEMD+GAAAAAIKAAACAAAAAAACCgAJCQAAAA8ABAYABQABBAYBBQABBAYCBQABBAYDBQABBAYEBQABBAYFBQABBAYGBQABBAYHBQABBAYIBQABBAYJBQABBAYKBQABBAYLBQABBAYMBQABBAYNBQABBAYOBQABBAYPBQAB"
+                        },
+                        {
+                            "signature":  "FACP",
+                            "instances":  1,
+                            "length":  276,
+                            "revision":  6,
+                            "checksum_ok":  true,
+                            "oem_id":  "LENOVO",
+                            "oem_table_id":  "CB-01",
+                            "oem_revision":  3,
+                            "creator_id":  "PTEC",
+                            "creator_revision":  2,
+                            "sha256":  "5fd923f3fb5fb13dd2ed783cc1b73ee4c2d5d0e0fd3db9741cffd7f5195a458f",
+                            "data_base64":  "RkFDUBQBAAAGQ0xFTk9WT0NCLTAxICAgAwAAAFBURUMCAAAAANCXzADw+cgBAgkAsAAAAKChAAAABAAAAAAAAAQEAAAAAAAAAAgAAAgEAAAgBAAAAAAAAAQCAQQIAAAAZADpAwAAAAABAw0AMgMAAK3FAAABCAAB+QwAAAAAAAAGAAADAAAAAAAAAAAA8PnIAAAAAAEgAAIABAAAAAAAAAEAAAIAAAAAAAAAAAEQAAIEBAAAAAAAAAEAAAIAAAAAAAAAAAEIAAEACAAAAAAAAAEgAAMIBAAAAAAAAAFAAAMgBAAAAAAAAAEAAAMAAAAAAAAAAAEIAAAAAAAAAAAAAAEIAAAAAAAAAAAAAAAAAAAAAAAA"
+                        },
+                        {
+                            "signature":  "HPET",
+                            "instances":  1,
+                            "length":  56,
+                            "revision":  1,
+                            "checksum_ok":  true,
+                            "oem_id":  "LENOVO",
+                            "oem_table_id":  "CB-01",
+                            "oem_revision":  1,
+                            "creator_id":  "PTEC",
+                            "creator_revision":  2,
+                            "sha256":  "50a4a670ab5f03c0ae41d9815bede907d836314b388aafaeceb6157fca589a52",
+                            "data_base64":  "SFBFVDgAAAABDUxFTk9WT0NCLTAxICAgAQAAAFBURUMCAAAAEIJTQwAIAAAAAND+AAAAAAIUAAA="
+                        },
+                        {
+                            "signature":  "IVRS",
+                            "instances":  1,
+                            "length":  420,
+                            "revision":  2,
+                            "checksum_ok":  true,
+                            "oem_id":  "LENOVO",
+                            "oem_table_id":  "CB-01",
+                            "oem_revision":  1,
+                            "creator_id":  "PTEC",
+                            "creator_revision":  2,
+                            "sha256":  "1fea070b8c834cbc41420c215b3427dabffae969f3c297f14d6ca68ab7c6ac99",
+                            "data_base64":  "SVZSU6QBAAACzUxFTk9WT0NCLTAxICAgAQAAAFBURUMCAAAAQzAgAAAAAAAAAAAAELBIAAIAQAAAAND9AAAAAAAAAABvjwSAAwgAAAT+/wBDAP8AAKUAAAT//wAAAAAASAAAAACgAAJIAADXIKAAAUgAAAAhAQABEbBYAAIAQAAAAND9AAAAAAAAAAAAAgQA3kolIu9zbSAAAAAAAAAAAAMIAAAE/v8AQwD/AAClAAAE//8AAAAAAEgAAAAAoAACSAAA1yCgAAFIAAAAIQEAAUCw1AACAEAAAADQ/QAAAAAAAAAAAAIEAN5KJSLvc20gAAAAAAAAAAADCAAABP7/AEMA/wAApQAABP//AAAAAABIAAAAAKAAAkgAANcgoAABSAAAACEBAAHwpQBAQU1ESTAwMjAAAAAAAAAAAAIJXF9TQi5GVVIw8KUAQEFNREkwMDIwAAAAAAAAAAACCVxfU0IuRlVSMfClAEBBTURJMDAyMAAAAAAAAAAAAglcX1NCLkZVUjLwpQBAQU1ESTAwMjAAAAAAAAAAAAIJXF9TQi5GVVIz"
+                        },
+                        {
+                            "signature":  "MCFG",
+                            "instances":  1,
+                            "length":  60,
+                            "revision":  1,
+                            "checksum_ok":  true,
+                            "oem_id":  "LENOVO",
+                            "oem_table_id":  "CB-01",
+                            "oem_revision":  1,
+                            "creator_id":  "PTEC",
+                            "creator_revision":  2,
+                            "sha256":  "785f3d36f77a877e969264f99c05e25f3b006691bd4ad59bf9bb3867163a583d",
+                            "data_base64":  "TUNGRzwAAAAB+kxFTk9WT0NCLTAxICAgAQAAAFBURUMCAAAAAAAAAAAAAAAAAAD4AAAAAAAAAD8AAAAA"
+                        }
+                    ],
+    "acpi_skipped_count":  25,
+    "iommu":  {
+                  "firmware_tables":  [
+                                          "IVRS"
+                                      ],
+                  "groups":  null
+              },
+    "limitations":  [
+                        "PCI: config space, BARs and capabilities are not readable without a kernel driver; functions owned by the hypervisor (e.g. the AMD IOMMU) are not listed",
+                        "ACPI: Windows does not expose RSDP/XSDT addresses; only the first instance of a signature is returned",
+                        "Windows runs as the Hyper-V root partition: the hypervisor owns the IOMMU and may hide or remap devices",
+                        "IOMMU groups are not exposed by Windows"
+                    ]
+}

@@ -1,0 +1,68 @@
+--- a/include/sysemu/replay.h
++++ b/include/sysemu/replay.h
+@@ -100,5 +100,5 @@
+ 
+ /*! Called when qemu shutdown is requested. */
+-void replay_shutdown_request(ShutdownCause cause);
++void replay_shutdown_request(ShutdownCause cause, int exit_code);
+ /*! Should be called at check points in the execution.
+     These check points are skipped, if they were not met.
+--- a/system/runstate.c
++++ b/system/runstate.c
+@@ -729,5 +729,5 @@
+ {
+     trace_qemu_system_shutdown_request(reason);
+-    replay_shutdown_request(reason);
++    replay_shutdown_request(reason, shutdown_exit_code);
+     shutdown_requested = reason;
+     qemu_notify_event();
+--- a/replay/replay.c
++++ b/replay/replay.c
+@@ -23,5 +23,5 @@
+ /* Current version of the replay mechanism.
+    Increase it when file format changes. */
+-#define REPLAY_VERSION              0xe0200c
++#define REPLAY_VERSION              0xe0200d
+ /* Size of replay log header */
+ #define HEADER_SIZE                 (sizeof(uint32_t) + sizeof(uint64_t))
+@@ -32,4 +32,5 @@
+ /* Name of replay file  */
+ static char *replay_filename;
++static int replay_exit_code;
+ ReplayState replay_state;
+ static GSList *replay_blockers;
+@@ -156,8 +157,11 @@
+         }
+         switch (data_kind) {
+-        case EVENT_SHUTDOWN ... EVENT_SHUTDOWN_LAST:
++        case EVENT_SHUTDOWN ... EVENT_SHUTDOWN_LAST: {
++            int exit_code = replay_get_dword();
+             replay_finish_event();
+-            qemu_system_shutdown_request(data_kind - EVENT_SHUTDOWN);
++            qemu_system_shutdown_request_with_code(
++                data_kind - EVENT_SHUTDOWN, exit_code);
+             break;
++        }
+         default:
+             /* clock, time_t, checkpoint and other events */
+@@ -262,9 +266,11 @@
+ }
+ 
+-void replay_shutdown_request(ShutdownCause cause)
++void replay_shutdown_request(ShutdownCause cause, int exit_code)
+ {
+     if (replay_mode == REPLAY_MODE_RECORD) {
+         g_assert(replay_mutex_locked());
++        replay_exit_code = exit_code;
+         replay_put_event(EVENT_SHUTDOWN + cause);
++        replay_put_dword(exit_code);
+     }
+ }
+@@ -467,5 +473,6 @@
+              * add shutdown event here for the case of Ctrl-C.
+              */
+-            replay_shutdown_request(SHUTDOWN_CAUSE_HOST_SIGNAL);
++            replay_shutdown_request(SHUTDOWN_CAUSE_HOST_SIGNAL,
++                                    replay_exit_code);
+             /* write end event */
+             replay_put_event(EVENT_END);
