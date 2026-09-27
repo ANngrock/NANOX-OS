@@ -1,0 +1,15 @@
+[package]
+name = "nanox-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+boot-protocol = { path = "../crates/boot-protocol" }
+
+[[bin]]
+name = "nanox-kernel"
+path = "src/main.rs"
+test = false
+bench = false

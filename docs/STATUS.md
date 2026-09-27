@@ -1,6 +1,6 @@
 # Статус проекта
 
-Обновлено: 2026-09-25. Основной checkout: `/home/holod/src/NANOX-OS` в WSL Ubuntu;
+Обновлено: 2026-09-27. Основной checkout: `/home/holod/src/NANOX-OS` в WSL Ubuntu;
 из Windows: `\\wsl.localhost\Ubuntu\home\holod\src\NANOX-OS`.
 **M0 завершён** для указанного QEMU/OVMF-профиля. Исходный OneDrive-каталог
 сохранён как входной снимок; текущие файлы и артефакты находятся в Linux checkout.
@@ -348,6 +348,38 @@ M5 остаётся незавершённым; criteria ROADMAP не отмеч
   EFI/ELF побайтно равны.
 - `out/runs/1790161777762347455-26670-pass-replay-play/`: raw serial,
   итоговые VARS и disk совпали; replay exit 0 вместо 33. Не считается успехом.
+
+## Текущая интеграция и повторная проверка (2026-09-27)
+
+Это обновление supersedes старую заметку выше о том, что Rust и main ещё не
+объединены. Проверочная ветка codex/reconcile-github-branches содержит Rust
+M0, M5 host crates PR #4 и документацию переноса C→Rust. GitHub main пока не
+обновлён. Основная dirty WSL копия codex/m0 с локальными M1/M2 файлами
+оставлена без изменений. Исторические C17/ASM исходники сохранены в
+репозитории для справки и не являются активным Cargo/kernel путём.
+
+Проверка выполнена в отдельном worktree /home/holod/src/NANOX-OS-reconcile
+на dirty merge-preview; она подтверждает этот снимок, а не опубликованный commit.
+
+- nix develop --offline --command cargo test --offline --locked --workspace:
+  101 host-тест прошёл; включены boot-protocol, net-wire, net-tcp, net-stack и xtask.
+- nix develop --offline --command cargo fmt --all -- --check и
+  git diff --check прошли.
+- nix develop --offline --command cargo clippy --offline --locked --workspace
+  --all-targets -- -D warnings прошёл после исправлений ELF/BootInfo alignment,
+  UEFI entry safety, kernel alignment и xtask doctor.
+- nix develop --offline --command cargo xtask doctor: failures пуст;
+  Rust 1.90.0, QEMU 9.2.4 nanox-replay-exit-v1, OVMF и pc-q35-9.2.
+- nix develop --offline --command cargo xtask test --replay завершился с exit 0:
+  out/runs/1790511120003562368-114827-suite/suite.json.
+  Host log: out/runs/1790511120003562368-114827-suite/host-tests.log.
+  PASS, три LOADER_ERROR, FAIL, PANIC и TIMEOUT соответствовали ожиданиям.
+  PASS/FAIL replay сохранили равные raw serial и guest verdict; изменённый ELF
+  отклонён до QEMU:
+  out/runs/1790511243081843606-114827-pass-replay-play/replay-comparison.json
+  и out/runs/1790511284677783710-114827-kernel-fail-replay-play/replay-comparison.json.
+- M5 crates остаются host-only. Они не запускались в guest, QEMU M0 использует
+  network=none, поэтому гостевая сетевая подсистема и готовность M5 не заявляются.
 
 ## Следующее действие
 

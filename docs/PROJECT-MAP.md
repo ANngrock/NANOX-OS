@@ -8,7 +8,7 @@
 `serial.rs`, `transition.rs`, `transition.S`); `kernel/` (`main.rs`,
 `linker.ld`); `crates/boot-protocol/` с host-тестами; `tools/xtask/`
 (`main.rs`, `build.rs`, `image.rs`, `runner.rs`, `record.rs`);
-`tools/qemu/replay-exit-code.patch`; `tests/fixtures/`. Срез M5-1:
+`tools/qemu/replay-exit-code.patch`; `tests/fixtures/`. Срезы M5-1/2 net-wire, M5-3 net-tcp и M5-4 net-stack — host-only; ни один не подключён к guest driver/kernel. Срез M5-1:
 `crates/net-wire` (кодеки Ethernet/ARP/IPv4/ICMP/UDP, контракт
 [M5-NETWORK](specs/M5-NETWORK.md)). Фактическое деление
 M0-модулей уже, чем в дереве ниже: например, ELF parser находится в

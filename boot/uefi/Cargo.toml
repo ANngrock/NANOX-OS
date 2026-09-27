@@ -1,0 +1,14 @@
+[package]
+name = "nanox-uefi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+boot-protocol = { path = "../../crates/boot-protocol" }
+
+[[bin]]
+name = "nanox-uefi"
+path = "src/main.rs"
+test = false
+bench = false
