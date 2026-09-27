@@ -333,19 +333,28 @@ impl<'a> Connection<'a> {
 
     /// RFC 6298 section 2 with integer milliseconds.
     fn rtt_update(&mut self, sample: u64) {
-        match self.srtt {
-            None => {
-                self.srtt = Some(sample);
-                self.rttvar = sample / 2;
-            }
+        let (srtt, rttvar) = match self.srtt {
+            None => (sample, sample / 2),
             Some(srtt) => {
-                self.rttvar = (3 * self.rttvar + srtt.abs_diff(sample)) / 4;
-                self.srtt = Some((7 * srtt + sample) / 8);
+                // The weighted sums can exceed u64 for valid samples; u128
+                // holds their maximum (8 * u64::MAX) exactly.
+                let rttvar = (3 * u128::from(self.rttvar) + u128::from(srtt.abs_diff(sample))) / 4;
+                let srtt = (7 * u128::from(srtt) + u128::from(sample)) / 8;
+                (
+                    srtt.min(u128::from(u64::MAX)) as u64,
+                    rttvar.min(u128::from(u64::MAX)) as u64,
+                )
             }
-        }
-        let srtt = self.srtt.unwrap_or(sample);
-        self.rto = (srtt + CLOCK_GRANULARITY_MS.max(4 * self.rttvar))
-            .clamp(self.config.rto_min_ms, self.config.rto_max_ms);
+        };
+        self.srtt = Some(srtt);
+        self.rttvar = rttvar;
+
+        let variation = u128::from(CLOCK_GRANULARITY_MS).max(4 * u128::from(rttvar));
+        let rto = u128::from(srtt) + variation;
+        self.rto = rto.clamp(
+            u128::from(self.config.rto_min_ms),
+            u128::from(self.config.rto_max_ms),
+        ) as u64;
     }
 
     /// RFC 5681 slow start and congestion avoidance.
@@ -544,6 +553,12 @@ impl<'a> Connection<'a> {
                 self.ack_pending = true;
                 return;
             }
+            if skip == data.len() && !fin {
+                // The duplicate ends exactly at RCV.NXT. Re-ACK it so a lost
+                // previous ACK can be recovered without waiting for an RTO.
+                self.ack_pending = true;
+                return;
+            }
             data = &data[skip..];
             start = self.rcv_nxt;
         }
@@ -598,17 +613,20 @@ impl<'a> Connection<'a> {
         }
         if self.persist_deadline.is_some_and(|at| now >= at) {
             self.probe_pending = true;
-            self.persist_interval = (self.persist_interval * 2).min(self.config.rto_max_ms);
+            self.persist_interval = self
+                .persist_interval
+                .saturating_mul(2)
+                .min(self.config.rto_max_ms);
             self.persist_deadline = Some(now.saturating_add(self.persist_interval));
         }
         if self.retx_deadline.is_some_and(|at| now >= at) {
-            self.retries += 1;
-            if self.retries > self.config.max_retries {
+            if self.retries >= self.config.max_retries {
                 self.close_with(Some(TcpError::TimedOut));
                 return;
             }
+            self.retries = self.retries.saturating_add(1);
             // RFC 6298 5.5-5.7 and Karn's algorithm.
-            self.rto = (self.rto * 2).min(self.config.rto_max_ms);
+            self.rto = self.rto.saturating_mul(2).min(self.config.rto_max_ms);
             self.rtt_sample = None;
             if self.state == State::SynSent {
                 self.syn_pending = true;

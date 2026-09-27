@@ -303,6 +303,23 @@ fn receive_in_order_drops_out_of_order_and_trims_overlap() {
 }
 
 #[test]
+fn exact_duplicate_segment_ending_at_rcv_nxt_is_reacked() {
+    let (mut tx, mut rx) = ([0u8; 64], [0u8; 4096]);
+    let mut conn = open(&mut tx, &mut rx, ISS, 1000, 8000);
+
+    deliver(&mut conn, IRS + 1, ISS + 1, ACK | PSH, 8000, b"hello", 1);
+    assert_eq!(pull(&mut conn, 1)[0].h.ack, IRS + 6);
+    deliver(&mut conn, IRS + 1, ISS + 1, ACK | PSH, 8000, b"hello", 2);
+
+    let ack = pull(&mut conn, 2);
+    assert_eq!((ack.len(), ack[0].h.ack), (1, IRS + 6));
+    assert_eq!(conn.recv_buffered(), 5);
+    let mut received = [0u8; 8];
+    assert_eq!(conn.recv(&mut received), 5);
+    assert_eq!(&received[..5], b"hello");
+}
+
+#[test]
 fn full_receive_buffer_advertises_zero_then_updates() {
     let (mut tx, mut rx) = ([0u8; 64], [0u8; 8]);
     let mut conn = open(&mut tx, &mut rx, ISS, 1000, 8000);
@@ -368,6 +385,79 @@ fn rtt_estimation_follows_rfc6298() {
     deliver(&mut conn, IRS + 1, ISS + 2, ACK, 8000, &[], 1100);
     // R = 100: RTTVAR = (3 * 100 + 100) / 4 = 100, SRTT = (7 * 200 + 100) / 8.
     assert_eq!(conn.rto_ms(), 187 + 400);
+}
+
+#[test]
+fn maximum_clock_and_rto_values_do_not_overflow_rtt_or_retries() {
+    let max = u64::MAX;
+    let cfg = Config {
+        max_retries: u8::MAX,
+        rto_min_ms: max,
+        rto_initial_ms: max,
+        rto_max_ms: max,
+        time_wait_ms: max,
+        ..config()
+    };
+    let (local, remote) = endpoints();
+    let (mut tx, mut rx) = ([0u8; 64], [0u8; 64]);
+    let mut conn = Connection::connect(cfg, local, remote, ISS, &mut tx, &mut rx).unwrap();
+
+    assert_eq!(pull(&mut conn, 0).len(), 1);
+    syn_ack(&mut conn, ISS, 1000, 8000, max);
+    assert_eq!(conn.rto_ms(), max);
+    assert_eq!(pull(&mut conn, max).len(), 1);
+
+    conn.send(b"sample").unwrap();
+    let mut out = [0u8; 2048];
+    assert!(conn.poll_transmit(max, &mut out).unwrap().is_some());
+    deliver(&mut conn, IRS + 1, ISS + 1 + 6, ACK, 8000, &[], max);
+    assert_eq!(conn.rto_ms(), max);
+
+    conn.send(b"timeout").unwrap();
+    assert!(conn.poll_transmit(max, &mut out).unwrap().is_some());
+    for timeout in 0..=u16::from(u8::MAX) {
+        assert_eq!(conn.next_deadline(), Some(max));
+        let retransmission = conn.poll_transmit(max, &mut out).unwrap();
+        if timeout == u16::from(u8::MAX) {
+            assert_eq!(retransmission, None);
+        } else {
+            assert!(retransmission.is_some());
+        }
+    }
+    assert_eq!(conn.state(), State::Closed);
+    assert_eq!(conn.error(), Some(TcpError::TimedOut));
+    assert_eq!(conn.rto_ms(), max);
+}
+
+#[test]
+fn persist_backoff_saturates_for_maximum_timer_values() {
+    let max = u64::MAX;
+    let cfg = Config {
+        max_retries: u8::MAX,
+        rto_min_ms: max,
+        rto_initial_ms: max,
+        rto_max_ms: max,
+        time_wait_ms: max,
+        ..config()
+    };
+    let (local, remote) = endpoints();
+    let (mut tx, mut rx) = ([0u8; 64], [0u8; 64]);
+    let mut conn = Connection::connect(cfg, local, remote, ISS, &mut tx, &mut rx).unwrap();
+
+    pull(&mut conn, 0);
+    syn_ack(&mut conn, ISS, 1000, 0, 0);
+    pull(&mut conn, 0);
+    assert_eq!(conn.rto_ms(), max);
+    conn.send(b"pending").unwrap();
+    deliver(&mut conn, IRS + 1, ISS + 1, ACK, 0, &[], max - 1);
+    assert_eq!(conn.next_deadline(), Some(max));
+
+    let mut out = [0u8; 2048];
+    let len = conn.poll_transmit(max, &mut out).unwrap().unwrap();
+    let probe = parse_tcp(CLIENT, SERVER, &out[..len]).unwrap();
+    assert_eq!((probe.header.seq, probe.payload.len()), (ISS + 1, 1));
+    assert_eq!(conn.state(), State::Established);
+    assert_eq!(conn.next_deadline(), Some(max));
 }
 
 #[test]
