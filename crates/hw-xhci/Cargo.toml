@@ -6,3 +6,7 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dev-dependencies]
+# End-to-end typing test only; the driver itself stays independent.
+hid-keyboard = { path = "../hid-keyboard" }

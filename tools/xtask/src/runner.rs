@@ -547,6 +547,8 @@ pub fn test(options: &Options) -> Result<()> {
             "--package".into(),
             "fb-console".into(),
             "--package".into(),
+            "hid-keyboard".into(),
+            "--package".into(),
             "xtask".into(),
         ],
         &suite_dir.join("host-tests.log"),
