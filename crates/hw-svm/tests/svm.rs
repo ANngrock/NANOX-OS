@@ -712,6 +712,38 @@ fn spinning_guest_is_stopped_by_budgets() {
     assert_eq!(out.exits, 50);
 }
 
+/// The M0 kernel's UART init: the divisor written to the base port while
+/// LCR.DLAB is set is not output (svm-probe found the stray 0x01 by
+/// comparing with QEMU).
+#[test]
+fn divisor_latch_writes_are_not_serial_output() {
+    let out = |port: u16, value: u32| Step::Out {
+        port,
+        size: 1,
+        value,
+    };
+    let mut script = vec![
+        out(0x3F9, 0),
+        out(0x3FB, 0x80),
+        out(0x3F8, 1),
+        out(0x3F9, 0),
+        out(0x3FB, 3),
+        out(0x3FA, 0xC7),
+        out(0x3FC, 3),
+    ];
+    script.extend(serial_out("OK"));
+    script.push(out(0xF4, 0x10));
+    let mut rig = Rig::new(&script);
+    let mut serial = [0u8; 8];
+    let mut v = Vcpu::new(rig.cfg, &mut serial);
+    assert!(matches!(
+        run(&mut rig, &mut v).verdict,
+        Verdict::DebugExit { status: 33, .. }
+    ));
+    assert_eq!(v.serial(), b"OK");
+    rig.cpu.assert_clean();
+}
+
 #[test]
 fn serial_overflow_is_reported_not_fatal() {
     let mut script = serial_out("0123456789");

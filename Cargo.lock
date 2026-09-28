@@ -65,6 +65,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-boot"
+version = "0.1.0"
+dependencies = [
+ "boot-protocol",
+]
+
+[[package]]
 name = "hid-keyboard"
 version = "0.1.0"
 
@@ -207,6 +214,8 @@ dependencies = [
 name = "svm-probe"
 version = "0.1.0"
 dependencies = [
+ "boot-protocol",
+ "guest-boot",
  "hw-svm",
 ]
 

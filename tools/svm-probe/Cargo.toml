@@ -8,6 +8,8 @@ publish = false
 
 [dependencies]
 hw-svm = { path = "../../crates/hw-svm" }
+guest-boot = { path = "../../crates/guest-boot" }
+boot-protocol = { path = "../../crates/boot-protocol" }
 
 [[bin]]
 name = "svm-probe"

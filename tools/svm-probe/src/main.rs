@@ -13,14 +13,20 @@
 //!   with it (recorded, compared, not required);
 //! * `NANOX:SVM-PROBE:RESULT PASS|FAIL`.
 //!
-//! Guest layout (guest-physical, 16 pages of RAM from the probe's pool):
-//! 0 zero page (the guest IDT: every vector not present), 1 code, 2..4
-//! guest page tables identity-mapping 2 MiB, 5 scratch, 6 read-only in
-//! the nested tables, 7 stack, 9 remapped by the remap case.
+//! Guest layout of the small programs (guest-physical, 16 pages of RAM from
+//! the probe's pool): 0 zero page (the guest IDT: every vector not
+//! present), 1 code, 2..4 guest page tables identity-mapping 2 MiB, 5
+//! scratch, 6 read-only in the nested tables, 7 stack, 9 remapped by the
+//! remap case.
+//!
+//! `m0-*` cases boot a real NANOX kernel ELF (fw_cfg `opt/nanox/kernel.elf`)
+//! as a guest with 4 MiB of RAM: `guest-boot` builds the M0 handoff, and
+//! the kernel's own BootInfo validation decides whether it was right.
 
 #![no_std]
 #![no_main]
 
+mod fwcfg;
 mod guest;
 mod hw;
 
@@ -35,10 +41,15 @@ use hw_svm::{Clock, Error, FrameAlloc, Npt, NptPerms, PhysMem, SvmCpu, Vmcb, PAG
 const PAGE: usize = 4096;
 /// HSAVE, host VMSAVE area, VMCB, MSRPM (2), IOPM (3).
 const FIXED_PAGES: usize = 8;
-const FRAME_PAGES: usize = 64;
+/// Kernel guest RAM plus nested tables.
+const FRAME_PAGES: usize = KERNEL_RAM_PAGES + 64;
 const POOL_PAGES: usize = FIXED_PAGES + FRAME_PAGES;
 /// One spare page so the pool can be aligned at run time.
 static mut POOL: [u8; (POOL_PAGES + 1) * PAGE] = [0; (POOL_PAGES + 1) * PAGE];
+/// The candidate kernel ELF from fw_cfg.
+static mut ELF: [u8; 1 << 20] = [0; 1 << 20];
+const KERNEL_RAM: u64 = 4 << 20;
+const KERNEL_RAM_PAGES: usize = (KERNEL_RAM / PAGE_SIZE) as usize;
 
 const RAM_PAGES: usize = 16;
 const ENTRY: u64 = 0x1000;
@@ -101,8 +112,42 @@ impl Phys {
 
     fn copy(&mut self, pa: u64, data: &[u8]) {
         self.check(pa, data.len() as u64);
-        // SAFETY: as in `fill`; the source is the probe's .text.
+        // SAFETY: as in `fill`; the source is probe memory outside the frame
+        // region (.text, the ELF buffer or a local).
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), pa as *mut u8, data.len()) }
+    }
+
+    fn read_into(&mut self, pa: u64, out: &mut [u8]) {
+        self.check(pa, out.len() as u64);
+        // SAFETY: as in `fill`; `out` is probe memory outside the region.
+        unsafe { core::ptr::copy_nonoverlapping(pa as *const u8, out.as_mut_ptr(), out.len()) }
+    }
+}
+
+/// Guest RAM of the kernel guest: contiguous frames from `base`.
+struct GuestRam<'a> {
+    phys: &'a mut Phys,
+    base: u64,
+}
+
+impl GuestRam<'_> {
+    fn check(gpa: u64, len: usize) {
+        assert!(
+            gpa.checked_add(len as u64).is_some_and(|e| e <= KERNEL_RAM),
+            "guest access outside RAM: {gpa:#x}+{len:#x}"
+        );
+    }
+}
+
+impl guest_boot::GuestMemory for GuestRam<'_> {
+    fn write(&mut self, gpa: u64, bytes: &[u8]) {
+        Self::check(gpa, bytes.len());
+        self.phys.copy(self.base + gpa, bytes);
+    }
+
+    fn read(&mut self, gpa: u64, out: &mut [u8]) {
+        Self::check(gpa, out.len());
+        self.phys.read_into(self.base + gpa, out);
     }
 }
 
@@ -399,6 +444,143 @@ fn remap(env: &mut Env, page: &mut [u8; 4096]) {
     print_outcome(&second, vcpu.serial());
 }
 
+fn has(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+type KernelExpect = fn(&Outcome, &[u8]) -> bool;
+type Corrupt = fn(&mut GuestRam<'_>, &guest_boot::Entry);
+
+/// Boots `elf` as a guest with the M0 handoff built by `guest-boot`.
+fn kernel_case(
+    env: &mut Env,
+    page: &mut [u8; 4096],
+    name: &str,
+    elf: &[u8],
+    boot: (bool, u64),
+    corrupt: Option<Corrupt>,
+    expect: KernelExpect,
+) {
+    env.frames.reset();
+    let base = env.frames.alloc_frame().expect("RAM frame");
+    for i in 1..KERNEL_RAM_PAGES {
+        let f = env.frames.alloc_frame().expect("RAM frame");
+        assert_eq!(f, base + (i * PAGE) as u64, "contiguous guest RAM");
+    }
+    for i in 0..KERNEL_RAM_PAGES {
+        env.phys.fill(base + (i * PAGE) as u64, 0);
+    }
+    let mut npt = Npt::new(&mut env.phys, &mut env.frames, 48).expect("nested root");
+    npt.map(
+        &mut env.phys,
+        &mut env.frames,
+        0,
+        base,
+        KERNEL_RAM,
+        NptPerms::RWX,
+    )
+    .expect("map guest RAM");
+    let cfg = guest_boot::Config {
+        ram_bytes: KERNEL_RAM,
+        test_profile: boot.0,
+        boot_epoch: boot.1,
+    };
+    let mut ram = GuestRam {
+        phys: &mut env.phys,
+        base,
+    };
+    let entry = guest_boot::load(elf, &mut ram, &cfg).expect("guest-boot");
+    if let Some(c) = corrupt {
+        c(&mut ram, &entry);
+    }
+    let mut vcfg = VmConfig::new(1, env.msrpm, env.iopm, npt.root(), env.nrips);
+    vcfg.flush_by_asid = env.flush_by_asid;
+    vcfg.max_exits = 100_000;
+    vcfg.max_time_us = u64::MAX;
+    let mut serial = [0u8; 1024];
+    let mut vcpu = Vcpu::new(vcfg, &mut serial);
+    {
+        let mut v = Vmcb::new(page);
+        v.setup_long_mode(entry.rip, entry.cr3, entry.rsp);
+        vcpu.prepare(&mut v);
+    }
+    let mut gprs = Gprs {
+        rdi: entry.rdi,
+        ..Gprs::default()
+    };
+    let o = vcpu.run(&mut env.cpu, &mut NoClock, &mut Vmcb::wrap(page), &mut gprs);
+    let ok = expect(&o, vcpu.serial());
+    env.report("CASE", name, ok);
+    print_outcome(&o, vcpu.serial());
+}
+
+/// Marks the transition reservation as kernel memory: the kernel's
+/// `validate_buffers` must then refuse the handoff (Ownership).
+fn drop_transition(ram: &mut GuestRam<'_>, e: &guest_boot::Entry) {
+    use guest_boot::GuestMemory;
+    let mut count = [0u8; 4];
+    ram.read(e.boot_info_gpa + 80, &mut count);
+    let last = u64::from(u32::from_le_bytes(count)) - 1;
+    let kind = e.boot_info_gpa + guest_boot::RANGES_OFFSET + 24 * last + 16;
+    ram.write(kind, &boot_protocol::KIND_KERNEL.to_le_bytes());
+}
+
+/// The M0 harness's default boot epoch (tools/xtask/src/main.rs), so the
+/// PASS run is comparable with the QEMU record byte for byte.
+const M0_EPOCH: u64 = 20260922;
+
+fn kernel_cases(env: &mut Env, page: &mut [u8; 4096], elf: &[u8]) {
+    const VALIDATED: &[u8] = b"NANOX:KERNEL:BOOTINFO_VALIDATED\n";
+    const FAIL35: Verdict = Verdict::DebugExit {
+        value: 0x11,
+        status: 35,
+    };
+    kernel_case(env, page, "m0-pass", elf, (true, M0_EPOCH), None, |o, s| {
+        o.verdict == PASS && has(s, VALIDATED) && has(s, b"NANOX:TEST:PASS\n")
+    });
+    kernel_case(env, page, "m0-fail", elf, (true, u64::MAX), None, |o, s| {
+        o.verdict == FAIL35 && has(s, VALIDATED) && has(s, b"NANOX:TEST:FAIL:injected\n")
+    });
+    kernel_case(
+        env,
+        page,
+        "m0-panic",
+        elf,
+        (true, u64::MAX - 2),
+        None,
+        |o, s| o.verdict == FAIL35 && has(s, b"NANOX:KERNEL:PANIC:"),
+    );
+    kernel_case(
+        env,
+        page,
+        "m0-hang",
+        elf,
+        (true, u64::MAX - 1),
+        None,
+        |o, s| o.verdict == Verdict::Halted && has(s, b"NANOX:TEST:HANG:injected\n"),
+    );
+    kernel_case(
+        env,
+        page,
+        "m0-normal-profile",
+        elf,
+        (false, M0_EPOCH),
+        None,
+        |o, s| {
+            o.verdict == Verdict::Halted && has(s, b"NANOX:KERNEL:IDLE\n") && !has(s, b"NANOX:TEST")
+        },
+    );
+    kernel_case(
+        env,
+        page,
+        "m0-bad-handoff",
+        elf,
+        (true, M0_EPOCH),
+        Some(drop_transition),
+        |o, s| o.verdict == FAIL35 && has(s, b"NANOX:KERNEL:BOOTINFO_ERROR:Ownership\n"),
+    );
+}
+
 type Edit = fn(&mut Vmcb<'_>);
 
 /// Each VMRUN consistency violation from a valid baseline: `Vmcb::check`
@@ -642,6 +824,19 @@ pub extern "efiapi" fn efi_main(_image: *mut u8, _system: *mut u8) -> usize {
     };
     cases(&mut env, vmcb);
     checks(&mut env, vmcb);
+    let elf_buf: *mut [u8; 1 << 20] = &raw mut ELF;
+    // SAFETY: the ELF buffer is a static of the probe, borrowed once here.
+    let buf = unsafe { &mut *elf_buf };
+    match fwcfg::read_file("opt/nanox/kernel.elf", buf) {
+        Ok(elf) => {
+            out!("NANOX:SVM-PROBE:KERNEL bytes={}\n", elf.len());
+            kernel_cases(&mut env, vmcb, elf);
+        }
+        Err(e) => {
+            env.report("CASE", "m0-kernel-elf", false);
+            out!(" fw_cfg={e}\n");
+        }
+    }
     if env.failures == 0 {
         out!("NANOX:SVM-PROBE:RESULT PASS\n");
         hw::exit(0x10)

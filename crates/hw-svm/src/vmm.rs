@@ -2,8 +2,9 @@
 //! every I/O port and every MSR outside a small allowlist intercepted, and
 //! just enough devices for the M0 test protocol:
 //!
-//! * a 16550 transmit path at `serial_base` (THR writes are captured, LSR
-//!   reads report an empty transmitter, other registers read 0);
+//! * a 16550 transmit path at `serial_base` (THR writes are captured unless
+//!   LCR.DLAB selects the divisor latch, LSR reads report an empty
+//!   transmitter, other registers read 0);
 //! * the `isa-debug-exit` port: a write of `v` ends the run with exit
 //!   status `(v << 1) | 1`, exactly as QEMU reports it to the M0 harness,
 //!   so a candidate's test mode behaves the same under this VMM.
@@ -123,6 +124,9 @@ pub struct Vcpu<'s> {
     serial: &'s mut [u8],
     serial_len: usize,
     truncated: bool,
+    /// Last write to the line control register; with DLAB (bit 7) set,
+    /// `serial_base` is the divisor latch, not the transmitter.
+    lcr: u8,
     flush: u8,
     exits: u64,
     msr_faults: u32,
@@ -146,6 +150,7 @@ impl<'s> Vcpu<'s> {
             serial,
             serial_len: 0,
             truncated: false,
+            lcr: 0,
             flush: tlb::FLUSH_ALL,
             exits: 0,
             msr_faults: 0,
@@ -384,7 +389,11 @@ impl<'s> Vcpu<'s> {
                 (vmcb.rax() & !mask) | (v & mask)
             };
             vmcb.set_rax(rax);
-        } else if io.port == base {
+        } else if io.port == base + 3 {
+            self.lcr = vmcb.rax() as u8;
+        } else if io.port == base && self.lcr & 0x80 == 0 {
+            // Found by booting the M0 kernel under svm-probe: its UART init
+            // writes the divisor (1) to the base port with DLAB set.
             let byte = vmcb.rax() as u8;
             if self.serial_len < self.serial.len() {
                 self.serial[self.serial_len] = byte;

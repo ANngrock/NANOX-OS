@@ -92,12 +92,16 @@ QEMU-сценариев M0 без регрессий. **Критерии M9 не
 Ветка `claude/m10-vmm` поверх `claude/m9-hardware`: `crates/hw-svm` — ядро
 VMM на AMD-V для испытания кандидатов внутри NANOX (VMCB и проверки VMRUN,
 карты разрешений, вложенные таблицы, #VMEXIT, цикл vCPU с вердиктом как у
-harness M0), 22 теста на скриптовом процессоре. `tools/svm-probe` —
+harness M0), 23 теста на скриптовом процессоре. `tools/svm-probe` —
 UEFI-зонд, который выполняет настоящий VMRUN с вложенными таблицами в
 QEMU TCG (`python3 tools/svm-probe/run.py`, профили qemu64+SVM,
 EPYC-Milan+SVM и без SVM): девять гостевых случаев и сверка 15 нарушений
 состояния с процессором; найдены и исправлены 32-битный VMEXIT_INVALID,
-отсутствие FlushByAsid и правило EVENTINJ. **Критерии M10 не закрыты**:
+отсутствие FlushByAsid и правило EVENTINJ. `crates/guest-boot` строит
+handoff M0 в памяти гостя: настоящее ядро M0 (`out/KERNEL.ELF`) под VMM
+проходит pass/fail/panic/hang с тем же статусом и serial, что в QEMU
+(сравнение нашло лишний байт делителя UART — исправлено). **Критерии M10
+не закрыты**:
 VMRUN не выполняет ядро NANOX, на Ryzen не запускалось. Контракт и
 недостающие части — [M10-VMM](specs/M10-VMM.md).
 
