@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "kind": "windows-firmware-table-capture",
+  "source": "GetSystemFirmwareTable('ACPI') on the running Windows 11 host, unprivileged, read-only, 2026-09-26",
+  "system": "LENOVO 82K8, board LNVNB161216, BIOS LENOVO HACN46WW (2024-11-14), AMD Ryzen 7 5800H 8C/16T",
+  "note": "Candidate physical M9 profile, not yet confirmed by the owner. Only tables needed by M9 parsers are kept; MSDM (product key), VFCT (VBIOS image), SSDT/DSDT AML and other tables are deliberately not stored. Windows does not expose RSDP/XSDT addresses.",
+  "tables": [
+    {
+      "signature": "APIC",
+      "file": "APIC.bin",
+      "length": 312,
+      "sha256": "baaba1723628bd170542dc5ce948cb932856a892df4b8a1a42c85f6d6d1594a7",
+      "checksum_ok": true
+    },
+    {
+      "signature": "FACP",
+      "file": "FACP.bin",
+      "length": 276,
+      "sha256": "5fd923f3fb5fb13dd2ed783cc1b73ee4c2d5d0e0fd3db9741cffd7f5195a458f",
+      "checksum_ok": true
+    },
+    {
+      "signature": "HPET",
+      "file": "HPET.bin",
+      "length": 56,
+      "sha256": "50a4a670ab5f03c0ae41d9815bede907d836314b388aafaeceb6157fca589a52",
+      "checksum_ok": true
+    },
+    {
+      "signature": "IVRS",
+      "file": "IVRS.bin",
+      "length": 420,
+      "sha256": "1fea070b8c834cbc41420c215b3427dabffae969f3c297f14d6ca68ab7c6ac99",
+      "checksum_ok": true
+    },
+    {
+      "signature": "MCFG",
+      "file": "MCFG.bin",
+      "length": 60,
+      "sha256": "785f3d36f77a877e969264f99c05e25f3b006691bd4ad59bf9bb3867163a583d",
+      "checksum_ok": true
+    }
+  ]
+}

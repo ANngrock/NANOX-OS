@@ -51,6 +51,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fb-console"
+version = "0.1.0"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -58,6 +62,37 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "hid-keyboard"
+version = "0.1.0"
+
+[[package]]
+name = "hw-acpi"
+version = "0.1.0"
+
+[[package]]
+name = "hw-iommu"
+version = "0.1.0"
+
+[[package]]
+name = "hw-nvme"
+version = "0.1.0"
+
+[[package]]
+name = "hw-pci"
+version = "0.1.0"
+
+[[package]]
+name = "hw-smp"
+version = "0.1.0"
+
+[[package]]
+name = "hw-xhci"
+version = "0.1.0"
+dependencies = [
+ "hid-keyboard",
 ]
 
 [[package]]
