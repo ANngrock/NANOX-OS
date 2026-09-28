@@ -19,7 +19,7 @@ host-тесты: в guest (QEMU) и на физическом железе не 
 | IOMMU | `crates/hw-iommu` | 66 | VT-d и AMD-Vi таблицы, map/unmap без частичного эффекта, жизненный цикл DMA (кадр освобождается только после подтверждённой инвалидации), модели IOMMU/IOTLB, наблюдатель записей: DTE никогда не проходит через V=0 |
 | NVMe | `crates/hw-nvme` | 37 | автомат инициализации с тайм-аутами CAP.TO, очереди с phase tag, Identify, I/O с проверкой данных через все формы PRP (включая цепочку из двух листов), abort, reset и abandon с незавершёнными командами (каждая отчитывается ровно один раз), CFS, неверные CID/SQ head, shutdown, randomized-сценарий со сбоями против эталонного диска; мутационная проверка |
 | Framebuffer-консоль | `crates/fb-console` | 68 | GOP RGBX/BGRX/bitmask, собственный шрифт 8×16, скролл без чтения MMIO, аварийный вывод; текстовый буфер в `TextBuffer` с `const fn new` (может быть `static`) |
-| xHCI | `crates/hw-xhci` | — | **в работе**: исходники драйверного ядра написаны, тестов и модели контроллера нет, в `claude/m9-hardware` не слит |
+| xHCI | `crates/hw-xhci` | 23 | BIOS handoff, halt/reset/run с тайм-аутами, кольца команд/передач/событий с Link TRB, PORTSC без порчи RW1C, reset портов USB2 и warm reset USB3, перечисление (full speed, пересчёт EP0, SuperSpeed, BSR, 64-байтные контексты), конфигурация и interrupt IN, abort команды, stall и recovery обоих endpoint, отключение с незавершёнными передачами, HSE/HCE и recover, randomized hot-plug; модель контроллера фиксирует нарушения протокола; мутационная проверка |
 | Инвентаризация | `tools/hw-inventory`, `docs/hardware/` | 20 (Python) | сборщики Windows/live-Linux с вырезанием идентификаторов; профиль `docs/hardware/lenovo-82k8.toml` (статус `confirmed`) побайтно воспроизводится из сбора, `--check` без расхождений |
 
 Все crates: `no_std`, без alloc и сторонних crates, `forbid(unsafe_code)`; в
@@ -59,8 +59,21 @@ host-тесты: в guest (QEMU) и на физическом железе не 
 - Консоль (`732e465`): ревью лидера нашло текстовый буфер ~32 КиБ внутри
   `Console`, возвращаемой по значению, — риск переполнения стека ядра; буфер
   вынесен в `TextBuffer`, консоль меньше 512 байт (тест).
+- xHCI (`71760e9`): исходники драйвера написал агент; лидер написал модель
+  контроллера (регистры, TRB и контексты декодируются независимо от драйвера)
+  и 23 теста. Модель нашла дефект: после HSE/HCE драйвер публиковал работу и
+  звонил в doorbell остановленного контроллера; теперь USBSTS проверяется до
+  публикации. Четыре мутанта (запись PORTSC прочитанным значением, ERDP не
+  сдвигается, потеря отчётов при recover, ERSTBA раньше ERDP) проваливают
+  набор. Независимого ревью агентом не было.
 
 ## Доказательства
+
+Прогон с xHCI на `claude/m9-hardware` `3ed2448` (тот же скрипт): fmt, clippy
+`-D warnings`, сборка для `x86_64-unknown-none`, `git diff --check` — exit 0;
+`cargo test` семи crates M9: 332 прошли; 20 Python-тестов; `cargo xtask test
+--replay` — exit 0, семь QEMU-сценариев M0 (`out/runs/1790599040808539584-262897-suite/suite.json`), replay PASS и
+FAIL совпали (`out/runs/1790599177962306281-262897-pass-replay-play/`, `out/runs/1790599217679930016-262897-kernel-fail-replay-play/`). Логи: `out/m9-checks-20260928T123647Z/`.
 
 Прогон второй волны на `claude/m9-hardware` `b84ca8b` (WSL, `nix develop --offline`,
 тот же скрипт): fmt, clippy `-D warnings`, сборка для `x86_64-unknown-none`,
