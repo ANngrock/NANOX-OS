@@ -1,0 +1,476 @@
+use vmm_devices::decode::{decode, merge, source_value, DecodeError, Operation, Reg, Source};
+use vmm_devices::lapic::{self, reg, Lapic, LVT_MASKED, LVT_PERIODIC, SVR_ENABLE};
+use vmm_devices::pit::{self, Pit2};
+
+fn r(index: u8) -> Reg {
+    Reg {
+        index,
+        high8: false,
+    }
+}
+
+// ---- decode -----------------------------------------------------------------
+
+#[test]
+fn decodes_the_mmio_forms() {
+    use Operation::*;
+    let load = |reg, size| Load {
+        reg,
+        size,
+        dest: size,
+    };
+    let store = |reg, size| Store {
+        src: Source::Reg(reg),
+        size,
+    };
+    let cases: &[(&[u8], Operation, u8)] = &[
+        // mov eax, [rcx+0x390]
+        (&[0x8B, 0x81, 0x90, 0x03, 0, 0], load(r(0), 4), 6),
+        // mov [rax+0xb0], ecx
+        (&[0x89, 0x88, 0xB0, 0, 0, 0], store(r(1), 4), 6),
+        // mov r8d, [rdi]
+        (&[0x44, 0x8B, 0x07], load(r(8), 4), 3),
+        // mov rax, [rip+0x10]
+        (&[0x48, 0x8B, 0x05, 0x10, 0, 0, 0], load(r(0), 8), 7),
+        // mov eax, [rsp+8]  (SIB, disp8)
+        (&[0x8B, 0x44, 0x24, 0x08], load(r(0), 4), 4),
+        // mov eax, [rax*4+0x1000]  (SIB, no base, disp32)
+        (&[0x8B, 0x04, 0x85, 0x00, 0x10, 0, 0], load(r(0), 4), 7),
+        // mov [rax], cx
+        (&[0x66, 0x89, 0x08], store(r(1), 2), 3),
+        // mov r15d, [r13+0]  (REX.RB, rm=5 with mod=1)
+        (&[0x45, 0x8B, 0x7D, 0x00], load(r(15), 4), 4),
+        // mov al, [rbx]
+        (&[0x8A, 0x03], load(r(0), 1), 2),
+        // mov ah, [rbx]
+        (
+            &[0x8A, 0x23],
+            load(
+                Reg {
+                    index: 0,
+                    high8: true,
+                },
+                1,
+            ),
+            2,
+        ),
+        // mov spl, [rbx]  (REX: no high-byte registers)
+        (&[0x40, 0x8A, 0x23], load(r(4), 1), 3),
+        // mov byte [rdx], dl
+        (&[0x88, 0x12], store(r(2), 1), 2),
+        // movzx eax, byte [rdx]
+        (
+            &[0x0F, 0xB6, 0x02],
+            Load {
+                reg: r(0),
+                size: 1,
+                dest: 4,
+            },
+            3,
+        ),
+        // movzx ecx, word [rsi+4]
+        (
+            &[0x0F, 0xB7, 0x4E, 0x04],
+            Load {
+                reg: r(1),
+                size: 2,
+                dest: 4,
+            },
+            4,
+        ),
+        // mov dword [rax], 0x12345678
+        (
+            &[0xC7, 0x00, 0x78, 0x56, 0x34, 0x12],
+            Store {
+                src: Source::Imm(0x1234_5678),
+                size: 4,
+            },
+            6,
+        ),
+        // mov qword [rax], -1  (imm32 sign-extended)
+        (
+            &[0x48, 0xC7, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+            Store {
+                src: Source::Imm(u64::MAX),
+                size: 8,
+            },
+            7,
+        ),
+        // mov word [rax+2], 0xBEEF
+        (
+            &[0x66, 0xC7, 0x40, 0x02, 0xEF, 0xBE],
+            Store {
+                src: Source::Imm(0xBEEF),
+                size: 2,
+            },
+            6,
+        ),
+        // mov byte [rax], 7
+        (
+            &[0xC6, 0x00, 0x07],
+            Store {
+                src: Source::Imm(7),
+                size: 1,
+            },
+            3,
+        ),
+        // ds: segment override, then mov eax, [rcx]
+        (&[0x3E, 0x8B, 0x01], load(r(0), 4), 3),
+    ];
+    for (bytes, op, len) in cases {
+        let mut padded = bytes.to_vec();
+        padded.extend_from_slice(&[0x90; 8]); // what follows must not matter
+        assert_eq!(
+            decode(&padded),
+            Ok(vmm_devices::decode::Insn { op: *op, len: *len }),
+            "{bytes:02x?}"
+        );
+        // Exactly the instruction's bytes suffice; one fewer does not.
+        assert!(decode(bytes).is_ok(), "{bytes:02x?}");
+        assert_eq!(
+            decode(&bytes[..bytes.len() - 1]),
+            Err(DecodeError::Truncated),
+            "{bytes:02x?}"
+        );
+    }
+}
+
+#[test]
+fn refuses_what_it_does_not_emulate() {
+    assert_eq!(decode(&[0x8B, 0xC0]), Err(DecodeError::RegisterOperand));
+    assert_eq!(decode(&[0x0F, 0x10, 0x00]), Err(DecodeError::Unsupported)); // movups
+    assert_eq!(decode(&[0xF0, 0x89, 0x08]), Err(DecodeError::Unsupported)); // lock
+    assert_eq!(decode(&[0xF3, 0xA5]), Err(DecodeError::Unsupported)); // rep movs
+    assert_eq!(
+        decode(&[0xC7, 0x08, 0, 0, 0, 0]),
+        Err(DecodeError::Unsupported)
+    ); // C7 /1
+    assert_eq!(decode(&[0x01, 0x08]), Err(DecodeError::Unsupported)); // add
+    assert_eq!(decode(&[0x66; 16]), Err(DecodeError::TooLong));
+    assert_eq!(decode(&[]), Err(DecodeError::Truncated));
+}
+
+#[test]
+fn register_merge_rules() {
+    let old = 0x1122_3344_5566_7788;
+    assert_eq!(
+        merge(old, r(0), 4, 0xAABB_CCDD),
+        0xAABB_CCDD,
+        "32-bit zero-extends"
+    );
+    assert_eq!(merge(old, r(0), 2, 0xAABB), 0x1122_3344_5566_AABB);
+    assert_eq!(merge(old, r(0), 1, 0xAA), 0x1122_3344_5566_77AA);
+    let ah = Reg {
+        index: 0,
+        high8: true,
+    };
+    assert_eq!(merge(old, ah, 1, 0xAA), 0x1122_3344_5566_AA88);
+    assert_eq!(merge(old, r(0), 8, 5), 5);
+    assert_eq!(source_value(old, ah), 0x77);
+    assert_eq!(source_value(old, r(0)), old);
+}
+
+// ---- LAPIC ------------------------------------------------------------------
+
+const BUS: u64 = 1_000_000_000;
+
+#[test]
+fn reset_state_and_base_msr() {
+    let mut a = Lapic::new(BUS);
+    assert_eq!(a.read(reg::VERSION, 0), lapic::VERSION);
+    assert_eq!(a.read(reg::SVR, 0), 0xFF);
+    assert_eq!(a.read(reg::LVT_TIMER, 0), LVT_MASKED);
+    assert_eq!(a.read(reg::DFR, 0), 0xFFFF_FFFF);
+    assert_eq!(a.base(), lapic::DEFAULT_BASE);
+    let msr = a.read_msr();
+    assert_eq!(msr, 0xFEE0_0900);
+    assert!(a.write_msr(msr & !lapic::MSR_ENABLE).is_ok());
+    assert!(a.write_msr(msr).is_ok());
+    assert!(a.write_msr(msr | lapic::MSR_X2APIC).is_err(), "no x2APIC");
+    assert!(a.write_msr(0xFEC0_0900).is_err(), "no relocation");
+    assert!(a.write_msr(msr & !lapic::MSR_BSP).is_err());
+}
+
+fn enabled() -> Lapic {
+    let mut a = Lapic::new(BUS);
+    a.write(reg::SVR, 0x1FF, 0);
+    a.write(reg::TIMER_DIVIDE, 3, 0); // /16: 62.5 MHz
+    a
+}
+
+#[test]
+fn one_shot_counts_down_and_fires_once() {
+    let mut a = enabled();
+    a.write(reg::LVT_TIMER, 0x40, 0);
+    a.write(reg::TIMER_INITIAL, 1000, 0); // 16 us
+    assert_eq!(a.read(reg::TIMER_CURRENT, 0), 1000);
+    assert_eq!(a.read(reg::TIMER_CURRENT, 8_000), 500);
+    assert_eq!(a.next_deadline(), Some(16_000));
+    assert_eq!(a.pending(), None);
+    assert_eq!(a.read(reg::TIMER_CURRENT, 16_000), 0);
+    assert_eq!(a.pending(), Some(0x40));
+    assert_eq!(a.read(reg::IRR + 0x20, 16_000), 1, "vector 0x40 in IRR");
+    a.accept(0x40);
+    assert_eq!(a.pending(), None);
+    assert_eq!(a.read(reg::ISR + 0x20, 16_000), 1);
+    a.write(reg::EOI, 0, 16_000);
+    assert_eq!(a.read(reg::ISR + 0x20, 16_000), 0);
+    a.update(1_000_000);
+    assert_eq!(a.pending(), None, "one-shot fires once");
+    assert_eq!(a.next_deadline(), None);
+}
+
+#[test]
+fn periodic_reloads_and_coalesces_missed_expirations() {
+    let mut a = enabled();
+    a.write(reg::LVT_TIMER, 0x40 | LVT_PERIODIC, 0);
+    a.write(reg::TIMER_INITIAL, 625_000, 0); // 10 ms
+    assert_eq!(a.next_deadline(), Some(10_000_000));
+    a.update(10_000_000);
+    assert_eq!(a.pending(), Some(0x40));
+    a.accept(0x40);
+    a.write(reg::EOI, 0, 10_000_000);
+    assert_eq!(a.next_deadline(), Some(20_000_000));
+    assert_eq!(a.read(reg::TIMER_CURRENT, 15_000_000), 312_500);
+    // Three more periods pass without the guest taking the interrupt.
+    a.update(40_000_000);
+    assert_eq!(a.pending(), Some(0x40));
+    assert_eq!(a.coalesced, 2);
+    assert_eq!(a.next_deadline(), Some(50_000_000));
+}
+
+#[test]
+fn masked_timer_and_software_disable_deliver_nothing() {
+    let mut a = enabled();
+    a.write(reg::LVT_TIMER, 0x40 | LVT_MASKED, 0);
+    a.write(reg::TIMER_INITIAL, 100, 0);
+    a.update(1_000_000);
+    assert_eq!(a.pending(), None);
+    assert_eq!(a.read(reg::IRR + 0x20, 1_000_000), 0, "masked: no IRR");
+    assert_eq!(a.next_deadline(), None);
+    // SVR bit 8 clear masks the LVT and cannot be overridden.
+    let mut b = Lapic::new(BUS);
+    b.write(reg::LVT_TIMER, 0x40, 0);
+    assert_eq!(b.read(reg::LVT_TIMER, 0), 0x40 | LVT_MASKED);
+    b.write(reg::SVR, SVR_ENABLE | 0xFF, 0);
+    b.write(reg::LVT_TIMER, 0x40, 0);
+    b.write(reg::SVR, 0xFF, 0);
+    assert_eq!(b.read(reg::LVT_TIMER, 0) & LVT_MASKED, LVT_MASKED);
+}
+
+#[test]
+fn priority_tpr_isr_and_eoi_order() {
+    let mut a = enabled();
+    a.write(reg::LVT_TIMER, 0x40, 0);
+    a.write(reg::TIMER_INITIAL, 1, 0);
+    a.update(1_000);
+    a.write(reg::TPR, 0x40, 1_000);
+    assert_eq!(a.pending(), None, "TPR class 4 blocks vector 0x40");
+    assert_eq!(a.read(reg::PPR, 1_000), 0x40);
+    a.write(reg::TPR, 0x30, 1_000);
+    assert_eq!(a.pending(), Some(0x40));
+    a.accept(0x40);
+    // A second timer interrupt of the same class waits for the EOI.
+    a.write(reg::TIMER_INITIAL, 1, 1_000);
+    a.update(2_000);
+    assert_eq!(a.pending(), None, "same class as the in-service vector");
+    a.write(reg::EOI, 0, 2_000);
+    assert_eq!(a.pending(), Some(0x40));
+}
+
+#[test]
+fn divide_change_keeps_the_count_continuous() {
+    let mut a = enabled();
+    a.write(reg::LVT_TIMER, 0x40 | LVT_MASKED, 0);
+    a.write(reg::TIMER_INITIAL, 1_000_000, 0);
+    let before = a.read(reg::TIMER_CURRENT, 1_000_000); // 62_500 counts done
+    assert_eq!(before, 937_500);
+    a.write(reg::TIMER_DIVIDE, 0xB, 1_000_000); // /1: 1 GHz
+    let after = a.read(reg::TIMER_CURRENT, 1_000_000);
+    assert!(before.abs_diff(after) <= 1, "{before} {after}");
+    assert_eq!(
+        a.read(reg::TIMER_CURRENT, 1_001_000)
+            .abs_diff(after - 1_000),
+        0
+    );
+    for (d, div) in [
+        (0, 2),
+        (1, 4),
+        (2, 8),
+        (3, 16),
+        (8, 32),
+        (9, 64),
+        (0xA, 128),
+        (0xB, 1),
+    ] {
+        let mut b = Lapic::new(BUS);
+        b.write(reg::TIMER_DIVIDE, d, 0);
+        b.write(reg::TIMER_INITIAL, u32::MAX, 0);
+        let counted = u32::MAX - b.read(reg::TIMER_CURRENT, 1_000_000);
+        assert_eq!(u64::from(counted), 1_000_000 / div, "divide {d:#x}");
+    }
+}
+
+// ---- PIT --------------------------------------------------------------------
+
+#[test]
+fn pit_mode0_out2_and_gate() {
+    let mut p = Pit2::new();
+    assert_eq!(p.read(pit::PORT_SPEAKER, 0), Some(0));
+    p.write(pit::PORT_SPEAKER, 0, 0);
+    p.write(pit::PORT_CONTROL, pit::CONTROL_MODE0, 0);
+    p.write(pit::PORT_CHANNEL2, 100, 0);
+    p.write(pit::PORT_CHANNEL2, 0, 0); // count 100, gate still closed
+    assert!(!p.out2(1_000_000), "gate closed: no counting");
+    p.write(pit::PORT_SPEAKER, 1, 1_000_000);
+    // 101 clocks of 1.193182 MHz = 84.6476 us, rounded up to whole ns.
+    let done = p.out2_deadline().unwrap();
+    assert_eq!(done, 1_000_000 + 84_648);
+    assert!(!p.out2(done - 1));
+    assert!(p.out2(done));
+    assert_eq!(p.read(pit::PORT_SPEAKER, done), Some(0x21));
+    // Closing the gate pauses the count.
+    let mut q = Pit2::new();
+    q.write(pit::PORT_CONTROL, pit::CONTROL_MODE0, 0);
+    q.write(pit::PORT_CHANNEL2, 100, 0);
+    q.write(pit::PORT_CHANNEL2, 0, 0);
+    q.write(pit::PORT_SPEAKER, 1, 0);
+    q.write(pit::PORT_SPEAKER, 0, 50_000);
+    assert!(!q.out2(10_000_000));
+    q.write(pit::PORT_SPEAKER, 1, 10_000_000);
+    assert!(!q.out2(10_000_000 + 30_000));
+    assert!(q.out2(10_000_000 + 40_000));
+    assert_eq!(q.unsupported, 0);
+}
+
+#[test]
+fn pit_unsupported_programming_keeps_out2_low() {
+    let mut p = Pit2::new();
+    p.write(pit::PORT_CONTROL, 0xB6, 0); // mode 3 (square wave)
+    p.write(pit::PORT_CHANNEL2, 1, 0);
+    p.write(pit::PORT_CHANNEL2, 0, 0);
+    p.write(pit::PORT_SPEAKER, 1, 0);
+    assert!(!p.out2(1_000_000_000));
+    assert_eq!(p.read(pit::PORT_CHANNEL2, 0), Some(0));
+    p.write(pit::PORT_CONTROL, 0x34, 0); // channel 0
+    assert_eq!(p.unsupported, 3);
+    assert!(!p.write(0x40, 0, 0), "channel 0 port not modeled");
+    assert_eq!(p.read(0x40, 0), None);
+}
+
+// ---- the NANOX M1 calibration, access by access ------------------------------
+
+/// A guest's view: every device access is one VM exit, and the VMM
+/// advances virtual time by a fixed quantum per exit.
+struct Machine {
+    now: u64,
+    quantum: u64,
+    lapic: Lapic,
+    pit: Pit2,
+    ticks: u64,
+    irq_enabled: bool,
+}
+
+impl Machine {
+    fn exit(&mut self) {
+        self.now += self.quantum;
+        self.lapic.update(self.now);
+        if self.irq_enabled {
+            if let Some(v) = self.lapic.pending() {
+                // The kernel's handler: count, EOI.
+                self.lapic.accept(v);
+                self.ticks += 1;
+                self.lapic.write(reg::EOI, 0, self.now);
+            }
+        }
+    }
+    fn inb(&mut self, port: u16) -> u8 {
+        self.exit();
+        self.pit.read(port, self.now).unwrap()
+    }
+    fn outb(&mut self, port: u16, v: u8) {
+        self.exit();
+        assert!(self.pit.write(port, v, self.now));
+    }
+    fn read_apic(&mut self, off: u32) -> u32 {
+        self.exit();
+        self.lapic.read(off, self.now)
+    }
+    fn write_apic(&mut self, off: u32, v: u32) {
+        self.exit();
+        self.lapic.write(off, v, self.now);
+    }
+    fn wait_out2(&mut self, high: bool) -> bool {
+        (0..10_000_000).any(|_| (self.inb(0x61) & 0x20 != 0) == high)
+    }
+    /// kernel/src/timer.rs measure_pit2 (codex/m1-m8-continuation).
+    fn measure_pit2(&mut self, count: u16) -> (u32, u32, u64, u64) {
+        let saved = self.inb(0x61);
+        self.outb(0x61, saved & !1);
+        self.outb(0x43, 0xB0);
+        self.outb(0x42, count as u8);
+        self.outb(0x42, (count >> 8) as u8);
+        self.outb(0x61, (saved & !3) | 1);
+        assert!(self.wait_out2(false), "PIT did not start");
+        let initial = self.read_apic(reg::TIMER_CURRENT);
+        let t0 = self.ticks;
+        assert!(self.wait_out2(true), "PIT did not finish");
+        let t1 = self.ticks;
+        let fin = self.read_apic(reg::TIMER_CURRENT);
+        self.outb(0x61, saved);
+        (initial, fin, t0, t1)
+    }
+}
+
+#[test]
+fn m1_kernel_calibration_and_periodic_verification_pass() {
+    const PIT_CALIBRATION_COUNT: u16 = 11_932;
+    const PIT_VERIFY_COUNT: u16 = 59_659;
+    let mut m = Machine {
+        now: 0,
+        quantum: 1_000, // 1 us per exit
+        lapic: Lapic::new(BUS),
+        pit: Pit2::new(),
+        ticks: 0,
+        irq_enabled: false,
+    };
+    // finish_setup
+    m.write_apic(reg::LVT_TIMER, 0x40 | LVT_MASKED);
+    m.write_apic(reg::TPR, 0);
+    let svr = m.read_apic(reg::SVR);
+    m.write_apic(reg::SVR, (svr & !0x1FF) | 0xFF | 1 << 8);
+    m.write_apic(reg::TIMER_DIVIDE, 3);
+    m.write_apic(reg::TIMER_INITIAL, 0);
+    m.write_apic(reg::TIMER_INITIAL, u32::MAX);
+    let (initial, fin, _, _) = m.measure_pit2(PIT_CALIBRATION_COUNT);
+    m.write_apic(reg::TIMER_INITIAL, 0);
+    let delta = u64::from(initial - fin);
+    let hz = delta * pit::HZ / u64::from(PIT_CALIBRATION_COUNT);
+    assert!((10_000_000..=1_000_000_000).contains(&hz), "hz {hz}");
+    assert!(
+        hz.abs_diff(BUS / 16) < BUS / 16 / 200,
+        "hz {hz} vs 62.5 MHz"
+    );
+    let reload = ((delta * pit::HZ + u64::from(PIT_CALIBRATION_COUNT) * 50)
+        / (u64::from(PIT_CALIBRATION_COUNT) * 100)) as u32;
+
+    // measure_periodic_irq, not suppressed.
+    m.write_apic(reg::LVT_TIMER, 0x40 | LVT_PERIODIC | LVT_MASKED);
+    m.write_apic(reg::TIMER_INITIAL, 0);
+    m.write_apic(reg::TIMER_INITIAL, reload);
+    m.write_apic(reg::LVT_TIMER, 0x40 | LVT_PERIODIC);
+    // mask_pic writes 0x21/0xA1: two exits the VMM ignores (no PIC model).
+    m.exit();
+    m.exit();
+    m.irq_enabled = true;
+    let mut total = 0;
+    for _ in 0..10 {
+        let (_, _, t0, t1) = m.measure_pit2(PIT_VERIFY_COUNT);
+        let per_window = t1 - t0;
+        assert!((4..=6).contains(&per_window), "{per_window} ticks in 50 ms");
+        total += per_window;
+    }
+    m.irq_enabled = false;
+    assert!((45..=55).contains(&total), "{total} ticks in 500 ms");
+    assert_eq!(m.lapic.coalesced, 0, "1 us quantum: nothing merged");
+}
