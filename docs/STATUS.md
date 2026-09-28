@@ -80,8 +80,9 @@ GDB breakpoint; команда `debug` реализована, но началь
 ## M9: host-срезы (Claude, 2026-09-26)
 
 Ветка `claude/m9-hardware`: crates `hw-acpi`, `hw-pci`, `hw-smp`, `hw-iommu`,
+`hw-nvme`, `fb-console` (xHCI в работе),
 снятие ACPI из QEMU/OVMF, инвентаризация и профиль
-`docs/hardware/lenovo-82k8.toml` (машину выбрал владелец 2026-09-27). 204 host-теста M9, 20 Python-тестов, семь
+`docs/hardware/lenovo-82k8.toml` (машину выбрал владелец 2026-09-27). 309 host-тестов M9, 20 Python-тестов, семь
 QEMU-сценариев M0 без регрессий. **Критерии M9 не закрыты**: код не исполнялся
 в guest и на железе. Подробности, доказательства и следующие шаги —
 [M9-STATUS](M9-STATUS.md).

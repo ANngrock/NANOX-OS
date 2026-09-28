@@ -1,6 +1,6 @@
 # Статус M9: host-срезы (Claude)
 
-Обновлено: 2026-09-26. Ветка `claude/m9-hardware`, worktree
+Обновлено: 2026-09-28. Ветка `claude/m9-hardware`, worktree
 `/home/holod/src/NANOX-OS-m9` (от `b8913fa`). Контракт —
 [M9-HARDWARE](specs/M9-HARDWARE.md).
 
@@ -17,7 +17,10 @@ host-тесты: в guest (QEMU) и на физическом железе не 
 | PCI/PCIe | `crates/hw-pci` | 55 | ECAM из реальных MCFG, заголовки, sizing BAR с восстановлением на всех путях, capabilities с защитой от циклов, MSI/MSI-X, обход мостов (Validate/Assign), randomized config space |
 | SMP | `crates/hw-smp` | 42 | топология по реальным MADT (4 и 16 CPU), автомат INIT-SIPI-SIPI на модели APIC, per-CPU layout, ticket lock и TLB shootdown на настоящих потоках; негативный контроль «free без подтверждений» ловит нарушения |
 | IOMMU | `crates/hw-iommu` | 66 | VT-d и AMD-Vi таблицы, map/unmap без частичного эффекта, жизненный цикл DMA (кадр освобождается только после подтверждённой инвалидации), модели IOMMU/IOTLB, наблюдатель записей: DTE никогда не проходит через V=0 |
-| Инвентаризация | `tools/hw-inventory`, `docs/hardware/` | 20 (Python) | сборщики Windows/live-Linux с вырезанием идентификаторов; профиль `docs/hardware/lenovo-82k8.toml` (статус `candidate`) побайтно воспроизводится из сбора, `--check` без расхождений |
+| NVMe | `crates/hw-nvme` | 37 | автомат инициализации с тайм-аутами CAP.TO, очереди с phase tag, Identify, I/O с проверкой данных через все формы PRP (включая цепочку из двух листов), abort, reset и abandon с незавершёнными командами (каждая отчитывается ровно один раз), CFS, неверные CID/SQ head, shutdown, randomized-сценарий со сбоями против эталонного диска; мутационная проверка |
+| Framebuffer-консоль | `crates/fb-console` | 68 | GOP RGBX/BGRX/bitmask, собственный шрифт 8×16, скролл без чтения MMIO, аварийный вывод; текстовый буфер в `TextBuffer` с `const fn new` (может быть `static`) |
+| xHCI | `crates/hw-xhci` | — | **в работе**: исходники драйверного ядра написаны, тестов и модели контроллера нет, в `claude/m9-hardware` не слит |
+| Инвентаризация | `tools/hw-inventory`, `docs/hardware/` | 20 (Python) | сборщики Windows/live-Linux с вырезанием идентификаторов; профиль `docs/hardware/lenovo-82k8.toml` (статус `confirmed`) побайтно воспроизводится из сбора, `--check` без расхождений |
 
 Все crates: `no_std`, без alloc и сторонних crates, `forbid(unsafe_code)`; в
 `hw-smp` `unsafe` только для `UnsafeCell` в lock с SAFETY-обоснованиями.
@@ -43,9 +46,30 @@ host-тесты: в guest (QEMU) и на физическом железе не 
 - ACPI: реальных дефектов не найдено; разбор IVHD 11h в IVRS ревизии 1
   оставлен намеренно — так таблицу публикует QEMU 9.2.
 
+Вторая волна (2026-09-27/28). Агенты NVMe и xHCI остановились на лимите API,
+затем плагин `agentforce-adlc` со сломанным хуком заблокировал Bash у лидера и
+агентов; с разрешения владельца лидер продолжил через Desktop Commander:
+
+- NVMe (`bd5e8f4`, `e3efb4c`): лидер исправил дефект, пойманный тестом агента
+  (DMA-области проверялись только на переполнение u64 — очередь по адресу
+  `0xFFFF_FFFF_FFFF_F000` принималась; теперь все области ограничены
+  `PHYS_ADDRESS_LIMIT = 2^52`), и написал `tests/io.rs`. Четыре мутанта
+  (двойной отчёт при reset, потерянный отчёт, doorbell не звонится, нет
+  проверки дедлайнов) проваливают набор. Независимого ревью агентом не было.
+- Консоль (`732e465`): ревью лидера нашло текстовый буфер ~32 КиБ внутри
+  `Console`, возвращаемой по значению, — риск переполнения стека ядра; буфер
+  вынесен в `TextBuffer`, консоль меньше 512 байт (тест).
+
 ## Доказательства
 
-Финальный прогон на `claude/m9-hardware` `f65d96b`, WSL Ubuntu, `nix develop --offline`
+Прогон второй волны на `claude/m9-hardware` `b84ca8b` (WSL, `nix develop --offline`,
+тот же скрипт): fmt, clippy `-D warnings`, сборка для `x86_64-unknown-none`,
+`git diff --check` — exit 0; `cargo test` шести слитых crates и заглушки xHCI:
+309 прошли; 20 Python-тестов; `cargo xtask test --replay` — exit 0, семь
+QEMU-сценариев M0 (`out/runs/1790597888959563355-239359-suite/suite.json`), replay PASS и FAIL совпали
+(`out/runs/1790598030058241480-239359-pass-replay-play/`, `out/runs/1790598071412755317-239359-kernel-fail-replay-play/`). Логи: `out/m9-checks-20260928T121738Z/`.
+
+Первый прогон на `claude/m9-hardware` `f65d96b`, WSL Ubuntu, `nix develop --offline`
 (Rust 1.90.0, QEMU 9.2.4 `nanox-replay-exit-v1`), скрипт по §5 контракта плюс
 `cargo xtask test --replay`. Логи и коды выхода:
 `out/m9-checks-20260926T201826Z/` (в worktree).
