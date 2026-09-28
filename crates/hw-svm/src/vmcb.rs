@@ -208,6 +208,13 @@ impl<'a> Vmcb<'a> {
         self.page
     }
 
+    /// The page for the kernel's VMRUN path: its physical address goes to
+    /// VMRUN, and the processor's writes on #VMEXIT happen through this
+    /// pointer, derived from the exclusive borrow.
+    pub fn as_mut_ptr(&mut self) -> *mut [u8; 4096] {
+        core::ptr::from_mut(&mut *self.page)
+    }
+
     pub fn read_u8(&self, off: usize) -> u8 {
         self.page[off]
     }
@@ -414,9 +421,12 @@ impl<'a> Vmcb<'a> {
         let inj = self.event_inj();
         if inj & (1 << 31) != 0 {
             let ty = (inj >> 8) & 7;
-            // Types: 0 INTR, 2 NMI, 3 exception, 4 software interrupt;
-            // 1, 5, 6, 7 are reserved.
-            if !matches!(ty, 0 | 2 | 3 | 4) || (ty == 2 && inj & 0xFF != 2) {
+            let vector = inj & 0xFF;
+            // Types: 0 INTR, 2 NMI (vector ignored), 3 exception, 4 software
+            // interrupt; 1, 5, 6, 7 are reserved. An exception may not use
+            // the NMI vector or a vector above 31 (APM 15.20, verify; QEMU
+            // 9.2 also refuses vector 31).
+            if !matches!(ty, 0 | 2 | 3 | 4) || (ty == 3 && (vector == 2 || vector > 31)) {
                 return fail(StateError::EventInjection);
             }
         }

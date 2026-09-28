@@ -204,6 +204,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-probe"
+version = "0.1.0"
+dependencies = [
+ "hw-svm",
+]
+
+[[package]]
 name = "syn"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

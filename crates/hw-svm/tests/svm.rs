@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use hw_svm::caps::CpuidMsr;
 use hw_svm::perm::{IoPermissionMap, MsrPermissionMap, IOPM_BYTES, MSRPM_BYTES};
-use hw_svm::vmcb::{attr, bits, ctl, misc2, save, StateError};
+use hw_svm::vmcb::{attr, bits, ctl, misc2, save, tlb, StateError};
 use hw_svm::vmm::{Vcpu, Verdict, VENDOR};
 use hw_svm::{Error, FrameAlloc, Npt, NptPerms, PhysMem, SvmCaps, SvmUnavailable, PAGE_SIZE};
 
@@ -173,6 +173,50 @@ fn every_consistency_check_fires() {
         let out = v.run(&mut rig.cpu, &mut rig.clock, &mut vmcb, &mut rig.gprs);
         assert_eq!(out.verdict, Verdict::Invalid(want));
         assert_eq!(rig.cpu.vmruns, 0);
+    }
+}
+
+/// Real hardware writes EXITCODE -1; QEMU 9.2 TCG writes 0xFFFF_FFFF.
+#[test]
+fn invalid_exit_in_both_encodings() {
+    for c in [hw_svm::exit::code::INVALID, hw_svm::exit::code::INVALID_32] {
+        let mut page = [0u8; 4096];
+        let mut v = hw_svm::Vmcb::new(&mut page);
+        v.write_u64(ctl::EXIT_CODE, c);
+        assert_eq!(hw_svm::Exit::decode(&v), hw_svm::Exit::Invalid, "{c:#x}");
+    }
+}
+
+#[test]
+fn event_injection_rules() {
+    let valid = |ty: u64, vector: u64| 1 << 31 | ty << 8 | vector;
+    let cases = [
+        (valid(3, 13) | 1 << 11, true), // #GP with error code
+        (valid(3, 6), true),            // #UD
+        (valid(3, 31), true),           // last exception vector
+        (valid(3, 2), false),           // NMI vector as an exception
+        (valid(3, 32), false),          // beyond the exception vectors
+        (valid(2, 0), true),            // NMI: vector ignored
+        (valid(0, 0x40), true),         // external interrupt
+        (valid(4, 0x80), true),         // software interrupt
+        (valid(1, 0), false),           // reserved types
+        (valid(5, 0), false),
+        (valid(7, 0), false),
+        (5 << 8 | 13, true), // not valid: ignored
+    ];
+    for (inj, ok) in cases {
+        let mut rig = Rig::new(&[]);
+        let mut serial = [0u8; 16];
+        let v = Vcpu::new(rig.cfg, &mut serial);
+        let mut vmcb = rig.vmcb();
+        v.prepare(&mut vmcb);
+        vmcb.set_event_inj(inj);
+        let want = if ok {
+            Ok(())
+        } else {
+            Err(Error::InvalidState(StateError::EventInjection))
+        };
+        assert_eq!(vmcb.check(), want, "EVENTINJ {inj:#x}");
     }
 }
 
@@ -575,7 +619,7 @@ fn read_only_mapping_faults_on_write() {
 /// flush the guest keeps using the old translation (negative control).
 #[test]
 fn unmap_flushes_the_guest_tlb() {
-    for flush in [true, false] {
+    for (flush, by_asid) in [(true, true), (true, false), (false, true)] {
         let mut rig = Rig::new(&[
             Step::Load { gpa: 2 * PAGE_SIZE },
             Step::Out {
@@ -590,6 +634,7 @@ fn unmap_flushes_the_guest_tlb() {
                 value: 0x10,
             },
         ]);
+        rig.cfg.flush_by_asid = by_asid;
         let mut serial = [0u8; 4];
         let mut v = Vcpu::new(rig.cfg, &mut serial);
         assert!(matches!(
@@ -612,6 +657,13 @@ fn unmap_flushes_the_guest_tlb() {
                 "{out:?}"
             );
             assert_eq!(rig.cpu.loads, vec![2]);
+            // Flush by ASID only where the processor offers it.
+            let want = if by_asid {
+                tlb::FLUSH_ASID
+            } else {
+                tlb::FLUSH_ALL
+            };
+            assert_eq!(rig.cpu.tlb_controls.last(), Some(&want));
         } else {
             assert!(matches!(out.verdict, Verdict::DebugExit { .. }));
             assert_eq!(rig.cpu.loads, vec![2, 2], "stale translation used");

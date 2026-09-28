@@ -47,6 +47,10 @@ pub struct VmConfig {
     pub npt_root: u64,
     /// Processor saves the next RIP (SvmCaps::nrips).
     pub nrips: bool,
+    /// TLB_CONTROL 3 (flush this ASID) is supported (SvmCaps::flush_by_asid);
+    /// otherwise an unmap flushes the whole TLB (TLB_CONTROL 1). QEMU 9.2
+    /// TCG does not offer it.
+    pub flush_by_asid: bool,
     pub serial_base: u16,
     pub debug_exit_port: u16,
     /// Exits handled before the run is stopped.
@@ -64,6 +68,7 @@ impl VmConfig {
             iopm_pa,
             npt_root,
             nrips,
+            flush_by_asid: false,
             serial_base: 0x3F8,
             debug_exit_port: 0xF4,
             max_exits: 1_000_000,
@@ -193,7 +198,11 @@ impl<'s> Vcpu<'s> {
     /// this guest's TLB, after which the unmapped frames may be reused.
     pub fn note_unmap(&mut self, _token: NeedsFlush) {
         if self.flush == tlb::NOTHING {
-            self.flush = tlb::FLUSH_ASID;
+            self.flush = if self.cfg.flush_by_asid {
+                tlb::FLUSH_ASID
+            } else {
+                tlb::FLUSH_ALL
+            };
         }
     }
 

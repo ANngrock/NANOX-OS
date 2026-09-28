@@ -25,6 +25,10 @@ pub mod code {
     pub const NPF: u64 = 0x400;
     /// VMRUN refused the guest state.
     pub const INVALID: u64 = u64::MAX;
+    /// The same with only the low 32 bits set, as QEMU 9.2 TCG writes it
+    /// (svm-probe run 2026-09-28); Linux KVM also compares only the low
+    /// half of EXITCODE.
+    pub const INVALID_32: u64 = 0xFFFF_FFFF;
 }
 
 /// An intercepted IN/OUT.
@@ -113,7 +117,7 @@ impl Exit {
                 Exit::SvmInstruction(c)
             }
             code::NPF => Exit::NestedPageFault { gpa: i2, error: i1 },
-            code::INVALID => Exit::Invalid,
+            code::INVALID | code::INVALID_32 => Exit::Invalid,
             c if (code::EXCEPTION_BASE..code::EXCEPTION_BASE + 32).contains(&c) => {
                 Exit::Exception {
                     vector: (c - code::EXCEPTION_BASE) as u8,
