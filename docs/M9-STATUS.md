@@ -20,6 +20,7 @@ host-тесты: в guest (QEMU) и на физическом железе не 
 | NVMe | `crates/hw-nvme` | 37 | автомат инициализации с тайм-аутами CAP.TO, очереди с phase tag, Identify, I/O с проверкой данных через все формы PRP (включая цепочку из двух листов), abort, reset и abandon с незавершёнными командами (каждая отчитывается ровно один раз), CFS, неверные CID/SQ head, shutdown, randomized-сценарий со сбоями против эталонного диска; мутационная проверка |
 | Framebuffer-консоль | `crates/fb-console` | 68 | GOP RGBX/BGRX/bitmask, собственный шрифт 8×16, скролл без чтения MMIO, аварийный вывод; текстовый буфер в `TextBuffer` с `const fn new` (может быть `static`) |
 | xHCI | `crates/hw-xhci` | 23 | BIOS handoff, halt/reset/run с тайм-аутами, кольца команд/передач/событий с Link TRB, PORTSC без порчи RW1C, reset портов USB2 и warm reset USB3, перечисление (full speed, пересчёт EP0, SuperSpeed, BSR, 64-байтные контексты), конфигурация и interrupt IN, abort команды, stall и recovery обоих endpoint, отключение с незавершёнными передачами, HSE/HCE и recover, randomized hot-plug; модель контроллера фиксирует нарушения протокола; мутационная проверка |
+| HID-клавиатура | `crates/hid-keyboard` | 10 + 1 сквозной | boot-отчёты → события в фиксированном порядке, rollover и коды ошибок без эффекта, автоповтор без всплесков, раскладки US и ЙЦУКЕН (Alt+Shift), Caps/Num/Scroll Lock и байт LED; сквозной тест `hw-xhci/tests/typing.rs`: модель клавиатуры → модель xHCI → драйвер → «Hello, NANOX! Привет, мир!», LED через SET_REPORT |
 | Инвентаризация | `tools/hw-inventory`, `docs/hardware/` | 20 (Python) | сборщики Windows/live-Linux с вырезанием идентификаторов; профиль `docs/hardware/lenovo-82k8.toml` (статус `confirmed`) побайтно воспроизводится из сбора, `--check` без расхождений |
 
 Все crates: `no_std`, без alloc и сторонних crates, `forbid(unsafe_code)`; в
@@ -69,6 +70,13 @@ host-тесты: в guest (QEMU) и на физическом железе не 
 
 ## Доказательства
 
+Прогон с `hid-keyboard` на `claude/m9-hardware` `6f95fc3` (плюс документы):
+fmt, clippy `-D warnings`, сборка для `x86_64-unknown-none`, `git diff --check`
+— exit 0; `cargo test` восьми crates M9: 343 прошли; 20 Python-тестов;
+`cargo xtask test --replay` — exit 0, семь QEMU-сценариев M0
+(`out/runs/1790599776157150634-276991-suite/suite.json`), replay PASS и FAIL совпали (`out/runs/1790599914844303117-276991-pass-replay-play/`,
+`out/runs/1790599955258095363-276991-kernel-fail-replay-play/`). Логи: `out/m9-checks-20260928T124905Z/`.
+
 Прогон с xHCI на `claude/m9-hardware` `3ed2448` (тот же скрипт): fmt, clippy
 `-D warnings`, сборка для `x86_64-unknown-none`, `git diff --check` — exit 0;
 `cargo test` семи crates M9: 332 прошли; 20 Python-тестов; `cargo xtask test
@@ -112,6 +120,10 @@ IOMMU `00:00.2` (скрыта Hyper-V), IOMMU-группы — нужен `colle
 live-USB (записывает носитель владелец).
 
 ## Следующие шаги M9
+
+План встраивания crates в ядро, требования к M1/M2 и guest-сценарии —
+[M9-INTEGRATION](specs/M9-INTEGRATION.md).
+
 
 1. Отложено владельцем: Secure Boot (отключить или регистрировать ключ).
 2. Отложено владельцем: live-Linux сбор `tools/hw-inventory/collect-linux.sh`,

@@ -19,6 +19,7 @@ ROADMAP ставит M9 после M2 и драйверов M4–M5. Rust-лин
 | `crates/hw-nvme` | NVMe: регистры, init, очереди, Identify, I/O, PRP, reset/recovery | после M1/M2 (MMIO, DMA, IRQ) |
 | `crates/hw-xhci` | xHCI: регистры, handoff, init, кольца TRB, порты, Address Device, дескрипторы, recovery | после M1/M2 |
 | `crates/fb-console` | текстовая консоль на GOP framebuffer, собственный шрифт 8×16 | после передачи framebuffer в BootInfo (решение Codex) |
+| `crates/hid-keyboard` | boot-отчёты USB-клавиатуры → события, автоповтор, раскладки US/ЙЦУКЕН, LED | вместе с `hw-xhci` |
 
 Правила (в дополнение к `AGENTS.md`):
 
@@ -135,6 +136,8 @@ BltOnly отвергается) с собственным шрифтом 8×16 �
 записи; скролл без чтения медленного MMIO; аварийный вывод, не зависящий от
 состояния консоли. Для интеграции loader должен передать параметры GOP в
 BootInfo — это изменение ABI в зоне Codex.
+
+План встраивания в ядро и guest-сценарии — [M9-INTEGRATION](M9-INTEGRATION.md).
 
 ## 4. Критерии ROADMAP и что их закрывает
 
