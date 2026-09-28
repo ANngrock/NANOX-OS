@@ -89,6 +89,10 @@ name = "hw-smp"
 version = "0.1.0"
 
 [[package]]
+name = "hw-svm"
+version = "0.1.0"
+
+[[package]]
 name = "hw-xhci"
 version = "0.1.0"
 dependencies = [
