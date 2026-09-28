@@ -320,7 +320,7 @@ fn framebuffer_smaller_than_one_cell_is_rejected() {
         let mut pixels = buffer(&info);
         let surface = SliceSurface::new(&mut pixels, &info).unwrap();
         assert_eq!(
-            Console::<_, 80, 25>::new(surface, info, Scroll::Redraw).err(),
+            Console::<_, 80, 25>::new(surface, info, Scroll::Redraw, leaked_text()).err(),
             Some(Error::TooSmallForCell),
             "{w}x{h}"
         );
@@ -340,12 +340,12 @@ fn zero_text_capacity_is_rejected() {
     let mut pixels = buffer(&info);
     let surface = SliceSurface::new(&mut pixels, &info).unwrap();
     assert_eq!(
-        Console::<_, 0, 4>::new(surface, info, Scroll::Redraw).err(),
+        Console::<_, 0, 4>::new(surface, info, Scroll::Redraw, leaked_text()).err(),
         Some(Error::ZeroTextCapacity)
     );
     let surface = SliceSurface::new(&mut pixels, &info).unwrap();
     assert_eq!(
-        Console::<_, 4, 0>::new(surface, info, Scroll::Redraw).err(),
+        Console::<_, 4, 0>::new(surface, info, Scroll::Redraw, leaked_text()).err(),
         Some(Error::ZeroTextCapacity)
     );
 }

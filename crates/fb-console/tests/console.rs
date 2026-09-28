@@ -353,7 +353,7 @@ fn copy_mode_falls_back_to_redraw_without_copy_rows() {
         inner: SliceSurface::new(&mut fallback, &info).unwrap(),
         rows_written: 0,
     };
-    let mut con = Console::<_, 10, 3>::new(surface, info, Scroll::CopyRows).unwrap();
+    let mut con = Console::<_, 10, 3>::new(surface, info, Scroll::CopyRows, leaked_text()).unwrap();
     con.write_bytes(script);
     assert_eq!(plain, fallback);
 }
@@ -366,7 +366,7 @@ fn redraw_scroll_repaints_only_changed_cells() {
         inner: SliceSurface::new(&mut pixels, &info).unwrap(),
         rows_written: 0,
     };
-    let mut con = Console::<_, 10, 3>::new(surface, info, Scroll::Redraw).unwrap();
+    let mut con = Console::<_, 10, 3>::new(surface, info, Scroll::Redraw, leaked_text()).unwrap();
     con.write_bytes(b"xx\nxx\nxx");
     let before = con.surface().rows_written;
     // Scrolling identical rows changes only the last row: two 'x' cells
@@ -387,7 +387,27 @@ fn console_works_through_a_trait_object() {
     let mut pixels = buffer(&info);
     let mut surface = SliceSurface::new(&mut pixels, &info).unwrap();
     let dynamic: &mut dyn Surface = &mut surface;
-    let mut con = Console::<_, 10, 3>::new(dynamic, info, Scroll::CopyRows).unwrap();
+    let mut con = Console::<_, 10, 3>::new(dynamic, info, Scroll::CopyRows, leaked_text()).unwrap();
     con.write_bytes(b"1\n2\n3\n4");
     assert_eq!(read_screen(&pixels, &info, 10, 3), ["2", "3", "4"]);
+}
+
+#[test]
+fn text_buffer_is_static_and_console_is_small() {
+    use std::sync::Mutex;
+    // The kernel keeps the text in a static behind its lock; `new` is const.
+    static TEXT: Mutex<fb_console::TextBuffer<240, 67>> = Mutex::new(fb_console::TextBuffer::new());
+    let info = info(1920, 1080, 1920, fb_console::PixelFormat::Bgrx8);
+    let mut pixels = buffer(&info);
+    let mut text = TEXT.lock().unwrap();
+    let surface = fb_console::SliceSurface::new(&mut pixels, &info).unwrap();
+    let mut con = Console::new(surface, info, Scroll::Redraw, &mut text).unwrap();
+    con.write_bytes(b"static text");
+    assert_eq!(con.cell(0, 0).unwrap().byte, b's');
+    assert!(
+        std::mem::size_of::<Con<'_, 240, 67>>() < 512,
+        "console must stay small: {}",
+        std::mem::size_of::<Con<'_, 240, 67>>()
+    );
+    assert!(std::mem::size_of::<fb_console::TextBuffer<240, 67>>() >= 240 * 67 * 2);
 }

@@ -15,14 +15,17 @@
 //!   over the real framebuffer with volatile, write-combining stores (and keeps
 //!   the `unsafe` there); [`SliceSurface`] implements it over `&mut [u32]` for
 //!   tests and shadow buffers. Reading pixels back is optional.
-//! * [`Console`] keeps a fixed-size text buffer (const generics, no `alloc`)
-//!   and implements cursor movement, wrapping, scrolling, colours and
-//!   [`core::fmt::Write`]. Scrolling either copies pixel rows or repaints only
-//!   the changed cells from the text buffer, so an MMIO framebuffer is never
-//!   read.
+//! * [`Console`] works on a borrowed fixed-size [`TextBuffer`] (const
+//!   generics, no `alloc`; the buffer has a `const fn new` so it can be a
+//!   `static` instead of kilobytes on a kernel stack) and implements cursor
+//!   movement, wrapping, scrolling, colours and [`core::fmt::Write`].
+//!   Scrolling either copies pixel rows or repaints only the changed cells
+//!   from the text buffer, so an MMIO framebuffer is never read.
 //! * [`emergency_message`] and [`EmergencyWriter`] draw into a fixed band at
 //!   the top of the screen using only the framebuffer geometry, for panic
-//!   paths where the console state cannot be trusted.
+//!   paths where the console state cannot be trusted. A panic handler should
+//!   give them their own [`Surface`] over the framebuffer rather than the one
+//!   inside a [`Console`], whose lock the panicking code may hold.
 //!
 //! No input makes this crate panic or write outside the validated geometry.
 
@@ -37,7 +40,7 @@ mod format;
 mod render;
 mod surface;
 
-pub use console::{Attr, Cell, Console, Scroll, DEFAULT_PALETTE};
+pub use console::{Attr, Cell, Console, Scroll, TextBuffer, DEFAULT_PALETTE};
 pub use emergency::{emergency_message, EmergencyWriter, EMERGENCY_ROWS};
 pub use format::{
     Channel, Color, Error, FramebufferDesc, FramebufferInfo, PixelFormat, PixelMasks,

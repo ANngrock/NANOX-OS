@@ -4,7 +4,7 @@
 
 use fb_console::font::{self, GLYPH_HEIGHT, GLYPH_WIDTH};
 use fb_console::{
-    Cell, Console, FramebufferDesc, FramebufferInfo, PixelFormat, Scroll, SliceSurface,
+    Cell, Console, FramebufferDesc, FramebufferInfo, PixelFormat, Scroll, SliceSurface, TextBuffer,
 };
 
 /// Value of every pixel the console must never write: stride padding and the
@@ -51,7 +51,7 @@ pub fn assert_canaries(pixels: &[u32], info: &FramebufferInfo) {
     );
 }
 
-pub type Con<'a, const C: usize, const R: usize> = Console<SliceSurface<'a>, C, R>;
+pub type Con<'a, const C: usize, const R: usize> = Console<'a, SliceSurface<'a>, C, R>;
 
 pub fn console<'a, const C: usize, const R: usize>(
     pixels: &'a mut [u32],
@@ -59,7 +59,13 @@ pub fn console<'a, const C: usize, const R: usize>(
     scroll: Scroll,
 ) -> Con<'a, C, R> {
     let surface = SliceSurface::new(pixels, &info).expect("surface");
-    Console::new(surface, info, scroll).expect("console")
+    Console::new(surface, info, scroll, leaked_text()).expect("console")
+}
+
+/// A text buffer for one test console (tests may leak; the kernel uses a
+/// `static`).
+pub fn leaked_text<const C: usize, const R: usize>() -> &'static mut TextBuffer<C, R> {
+    Box::leak(Box::new(TextBuffer::new()))
 }
 
 pub fn px(pixels: &[u32], info: &FramebufferInfo, x: usize, y: usize) -> u32 {

@@ -88,12 +88,39 @@ const NON_ASCII: u8 = 0x7F;
 const BACKSPACE: u8 = 0x08;
 const TAB_WIDTH: usize = 8;
 
+/// Text storage of a [`Console`]: `COLS` x `ROWS` cells, 2 bytes each.
+///
+/// It is kept outside the console so it never has to live on a stack: a
+/// 240x67 buffer is about 32 KiB, too much for a kernel stack and for being
+/// returned by value. [`TextBuffer::new`] is `const`, so the kernel can place
+/// it in a `static` (behind its lock) and lend it to [`Console::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextBuffer<const COLS: usize, const ROWS: usize> {
+    cells: [[Cell; COLS]; ROWS],
+}
+
+impl<const COLS: usize, const ROWS: usize> TextBuffer<COLS, ROWS> {
+    /// A blank buffer; usable in `static` initialisers.
+    pub const fn new() -> Self {
+        Self {
+            cells: [[Cell::BLANK; COLS]; ROWS],
+        }
+    }
+}
+
+impl<const COLS: usize, const ROWS: usize> Default for TextBuffer<COLS, ROWS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A text console of at most `COLS` x `ROWS` cells on a [`Surface`].
 ///
 /// The visible grid is the smaller of the framebuffer's whole 8x16 cells and
 /// the const-generic capacity, anchored at the top-left; the rest of the
 /// screen stays background. For 1920x1080 the full grid is 240x67, for
-/// 1280x800 it is 160x50.
+/// 1280x800 it is 160x50. The cells live in a borrowed [`TextBuffer`], so the
+/// console itself is small (the surface plus about 200 bytes).
 ///
 /// Control bytes: `\n` moves to the start of the next line (it implies `\r`),
 /// `\r` returns to column 0, `\t` advances to the next multiple of 8,
@@ -101,7 +128,7 @@ const TAB_WIDTH: usize = 8;
 /// Every other byte outside 0x20..=0x7E occupies one cell drawn with the
 /// replacement glyph. Writing past the last column wraps to the next line;
 /// a line feed on the last row scrolls.
-pub struct Console<S: Surface, const COLS: usize, const ROWS: usize> {
+pub struct Console<'t, S: Surface, const COLS: usize, const ROWS: usize> {
     surface: S,
     info: FramebufferInfo,
     cols: usize,
@@ -114,13 +141,19 @@ pub struct Console<S: Surface, const COLS: usize, const ROWS: usize> {
     scroll: Scroll,
     palette: [Color; 16],
     raw: [u32; 16],
-    cells: [[Cell; COLS]; ROWS],
+    cells: &'t mut [[Cell; COLS]; ROWS],
 }
 
-impl<S: Surface, const COLS: usize, const ROWS: usize> Console<S, COLS, ROWS> {
-    /// Creates the console and clears the whole framebuffer. `surface` must
-    /// draw onto the framebuffer described by `info`.
-    pub fn new(surface: S, info: FramebufferInfo, scroll: Scroll) -> Result<Self, Error> {
+impl<'t, S: Surface, const COLS: usize, const ROWS: usize> Console<'t, S, COLS, ROWS> {
+    /// Creates the console on `text`, clears the text and the whole
+    /// framebuffer. `surface` must draw onto the framebuffer described by
+    /// `info`.
+    pub fn new(
+        surface: S,
+        info: FramebufferInfo,
+        scroll: Scroll,
+        text: &'t mut TextBuffer<COLS, ROWS>,
+    ) -> Result<Self, Error> {
         if COLS == 0 || ROWS == 0 {
             return Err(Error::ZeroTextCapacity);
         }
@@ -138,7 +171,7 @@ impl<S: Surface, const COLS: usize, const ROWS: usize> Console<S, COLS, ROWS> {
             scroll,
             palette: DEFAULT_PALETTE,
             raw: DEFAULT_PALETTE.map(|color| info.encode(color)),
-            cells: [[Cell::BLANK; COLS]; ROWS],
+            cells: &mut text.cells,
         };
         console.clear();
         Ok(console)
@@ -215,7 +248,7 @@ impl<S: Surface, const COLS: usize, const ROWS: usize> Console<S, COLS, ROWS> {
 
     /// Blanks the text buffer and the whole framebuffer; cursor to (0, 0).
     pub fn clear(&mut self) {
-        for row in &mut self.cells {
+        for row in self.cells.iter_mut() {
             row.fill(Cell::BLANK);
         }
         let bg = self.raw_color(Cell::BLANK.attr.bg());
@@ -372,7 +405,7 @@ impl<S: Surface, const COLS: usize, const ROWS: usize> Console<S, COLS, ROWS> {
     }
 }
 
-impl<S: Surface, const COLS: usize, const ROWS: usize> fmt::Write for Console<S, COLS, ROWS> {
+impl<S: Surface, const COLS: usize, const ROWS: usize> fmt::Write for Console<'_, S, COLS, ROWS> {
     /// Never fails. Each non-ASCII `char` takes one replacement cell.
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for c in s.chars() {
