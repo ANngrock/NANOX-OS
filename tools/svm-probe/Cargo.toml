@@ -1,0 +1,18 @@
+[package]
+name = "svm-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+hw-svm = { path = "../../crates/hw-svm" }
+guest-boot = { path = "../../crates/guest-boot" }
+boot-protocol = { path = "../../crates/boot-protocol" }
+
+[[bin]]
+name = "svm-probe"
+path = "src/main.rs"
+test = false
+bench = false

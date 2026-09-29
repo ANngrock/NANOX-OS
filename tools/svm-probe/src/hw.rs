@@ -1,0 +1,320 @@
+//! Privileged instructions. The probe runs as a UEFI application at CPL 0
+//! under OVMF, whose page tables identity-map memory: a pointer value is
+//! the physical address.
+
+use core::arch::{asm, global_asm};
+use core::fmt;
+
+pub fn outb(port: u16, value: u8) {
+    // SAFETY: CPL 0; port I/O has no memory operands. Only the fixed COM1
+    // and isa-debug-exit ports of the probe profile are used.
+    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
+}
+
+pub fn outw(port: u16, value: u16) {
+    // SAFETY: as in `outb` (the fw_cfg selector port).
+    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) }
+}
+
+pub fn inb(port: u16) -> u8 {
+    let value;
+    // SAFETY: as in `outb`.
+    unsafe { asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack)) }
+    value
+}
+
+pub fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: CPL 0; callers read only architectural MSRs that exist on a
+    // processor reporting SVM (EFER, VM_CR, VM_HSAVE_PA).
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
+    u64::from(hi) << 32 | u64::from(lo)
+}
+
+pub fn wrmsr(msr: u32, value: u64) {
+    // SAFETY: CPL 0; callers write EFER.SVME and VM_HSAVE_PA, which change
+    // no mapping or state the probe's Rust code relies on.
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nomem, nostack),
+        );
+    }
+}
+
+pub fn cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
+    let (a, c, d): (u32, u32, u32);
+    let b: u64;
+    // SAFETY: CPUID has no side effects; RBX is reserved by the compiler,
+    // so it is saved in a scratch register and swapped back.
+    unsafe {
+        asm!(
+            "mov {t}, rbx",
+            "cpuid",
+            "xchg {t}, rbx",
+            t = out(reg) b,
+            inout("eax") leaf => a,
+            inout("ecx") subleaf => c,
+            out("edx") d,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    [a, b as u32, c, d]
+}
+
+pub fn interrupts_off() {
+    // SAFETY: the probe never returns to firmware and needs no interrupts.
+    unsafe { asm!("cli", options(nomem, nostack)) }
+}
+
+/// Ends the QEMU run through isa-debug-exit: status `(value << 1) | 1`.
+pub fn exit(value: u32) -> ! {
+    // SAFETY: the probe profile always has isa-debug-exit at 0xF4; without
+    // it the OUT is ignored and the loop below halts the processor.
+    unsafe { asm!("out dx, eax", in("dx") 0xF4u16, in("eax") value, options(nomem, nostack)) }
+    loop {
+        // SAFETY: final state; interrupts masked.
+        unsafe { asm!("cli", "hlt", options(nomem, nostack)) }
+    }
+}
+
+// VMSAVE host state, VMLOAD+VMRUN+VMSAVE the guest, restore the host.
+// sysv64: RDI = 14 guest GPRs (rbx, rcx, rdx, rsi, rdi, rbp, r8..r15),
+// RSI = VMCB physical address, RDX = host save area physical address,
+// RCX != 0: run with host IF=1 (a host interrupt then exits the guest,
+// and is taken by the host IDT between STGI and CLI).
+// VMRUN restores RSP and RAX on #VMEXIT; the VMCB address is reloaded from
+// the stack anyway. SVM instructions are emitted as bytes.
+global_asm!(
+    ".global nanox_svm_probe_vmrun",
+    "nanox_svm_probe_vmrun:",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "push rdi",
+    "push rdx",
+    "push rsi",
+    ".byte 0x0f, 0x01, 0xdd", // CLGI
+    "test rcx, rcx",
+    "jz .Lprobe_no_irq",
+    "sti", // GIF=0: nothing is taken before VMRUN
+    ".Lprobe_no_irq:",
+    "mov rax, rdx",
+    ".byte 0x0f, 0x01, 0xdb", // VMSAVE (host)
+    "mov rax, rsi",
+    "mov rbx, [rdi + 0]",
+    "mov rcx, [rdi + 8]",
+    "mov rdx, [rdi + 16]",
+    "mov rsi, [rdi + 24]",
+    "mov rbp, [rdi + 40]",
+    "mov r8, [rdi + 48]",
+    "mov r9, [rdi + 56]",
+    "mov r10, [rdi + 64]",
+    "mov r11, [rdi + 72]",
+    "mov r12, [rdi + 80]",
+    "mov r13, [rdi + 88]",
+    "mov r14, [rdi + 96]",
+    "mov r15, [rdi + 104]",
+    "mov rdi, [rdi + 32]",
+    ".byte 0x0f, 0x01, 0xda", // VMLOAD (guest)
+    ".byte 0x0f, 0x01, 0xd8", // VMRUN
+    "mov rax, [rsp]",
+    ".byte 0x0f, 0x01, 0xdb", // VMSAVE (guest)
+    "push rdi",
+    "mov rdi, [rsp + 24]",
+    "mov [rdi + 0], rbx",
+    "mov [rdi + 8], rcx",
+    "mov [rdi + 16], rdx",
+    "mov [rdi + 24], rsi",
+    "mov [rdi + 40], rbp",
+    "mov [rdi + 48], r8",
+    "mov [rdi + 56], r9",
+    "mov [rdi + 64], r10",
+    "mov [rdi + 72], r11",
+    "mov [rdi + 80], r12",
+    "mov [rdi + 88], r13",
+    "mov [rdi + 96], r14",
+    "mov [rdi + 104], r15",
+    "pop rax",
+    "mov [rdi + 32], rax",
+    "pop rax",
+    "pop rax",
+    ".byte 0x0f, 0x01, 0xda", // VMLOAD (host)
+    ".byte 0x0f, 0x01, 0xdc", // STGI: a pending host interrupt is taken here
+    "cli",
+    "pop rdi",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbp",
+    "pop rbx",
+    "ret",
+);
+
+unsafe extern "sysv64" {
+    fn nanox_svm_probe_vmrun(gprs: *mut u64, vmcb: u64, host_save: u64, host_irq: u64);
+}
+
+/// # Safety
+/// `vmcb` and `host_save` are 4 KiB pages owned by the caller, the VMCB
+/// passed the consistency checks or is deliberately invalid (the processor
+/// then exits with VMEXIT_INVALID without entering the guest), EFER.SVME
+/// and VM_HSAVE_PA are set, and the nested page tables map only probe-owned
+/// frames, so the guest cannot reach host memory. With `host_irq`, the
+/// probe's host IDT ([`HostTick::start`]) must be loaded.
+pub unsafe fn vmrun(gprs: &mut [u64; 14], vmcb: *mut [u8; 4096], host_save: u64, host_irq: bool) {
+    // SAFETY: per the contract above; the routine restores every register
+    // the sysv64 ABI requires and writes only `gprs`, the VMCB and the two
+    // save areas.
+    unsafe {
+        nanox_svm_probe_vmrun(
+            gprs.as_mut_ptr(),
+            vmcb as u64,
+            host_save,
+            u64::from(host_irq),
+        )
+    }
+}
+
+// Host interrupt handler for every vector: EOI to the local APIC (address
+// patched in by HostTick::start) and return. Only interrupts are expected;
+// the probe raises no exceptions.
+global_asm!(
+    ".global nanox_probe_host_irq",
+    "nanox_probe_host_irq:",
+    "push rax",
+    "mov rax, [rip + nanox_probe_host_eoi]",
+    "mov dword ptr [rax], 0",
+    "pop rax",
+    "iretq",
+    ".data",
+    ".balign 8",
+    ".global nanox_probe_host_eoi",
+    "nanox_probe_host_eoi:",
+    ".quad 0",
+    ".text",
+);
+
+unsafe extern "C" {
+    static nanox_probe_host_irq: u8;
+    static mut nanox_probe_host_eoi: u64;
+}
+
+const HOST_TICK_VECTOR: u32 = 0xF0;
+
+/// A periodic host timer so a guest spinning without exits still leaves
+/// the guest (INTR exit) about every `period` of host time: the probe's
+/// own IDT (all vectors: EOI and return), the host local APIC timer, the
+/// 8259s masked.
+pub struct HostTick {
+    idt: [u64; 512],
+    apic: u64,
+}
+
+fn apic_write(base: u64, off: u64, v: u32) {
+    // SAFETY: the host local APIC page (IA32_APIC_BASE), identity-mapped
+    // uncached by OVMF; 32-bit aligned register access.
+    unsafe { ((base + off) as *mut u32).write_volatile(v) }
+}
+
+impl Default for HostTick {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HostTick {
+    pub const fn new() -> Self {
+        Self {
+            idt: [0; 512],
+            apic: 0,
+        }
+    }
+
+    /// Loads the probe IDT and starts the host APIC timer with `count`
+    /// ticks at bus/16.
+    pub fn start(&mut self, count: u32) {
+        self.apic = rdmsr(0x1B) & 0x000F_FFFF_FFFF_F000;
+        // SAFETY: a plain store to the probe's own handler data, before any
+        // interrupt can use it (IF=0).
+        unsafe { (&raw mut nanox_probe_host_eoi).write_volatile(self.apic + 0xB0) };
+        let handler = (&raw const nanox_probe_host_irq) as u64;
+        let cs: u16;
+        // SAFETY: reads the current code selector.
+        unsafe { asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack)) };
+        for v in 0..256 {
+            // 64-bit interrupt gate, present, DPL 0.
+            self.idt[2 * v] = (handler & 0xFFFF)
+                | u64::from(cs) << 16
+                | 0x8E00u64 << 32
+                | (handler >> 16 & 0xFFFF) << 48;
+            self.idt[2 * v + 1] = handler >> 32;
+        }
+        let mut idtr = [0u8; 10];
+        idtr[..2].copy_from_slice(&(4095u16).to_le_bytes());
+        idtr[2..].copy_from_slice(&(self.idt.as_ptr() as u64).to_le_bytes());
+        // SAFETY: the IDT lives in `self`, which the caller keeps alive and
+        // in place while host interrupts may occur; interrupts are off.
+        unsafe { asm!("lidt [{}]", in(reg) idtr.as_ptr(), options(nostack)) };
+        outb(0x21, 0xFF);
+        outb(0xA1, 0xFF);
+        apic_write(self.apic, 0xF0, 0x1FF); // SVR: enabled, spurious 0xFF
+        apic_write(self.apic, 0x3E0, 3); // divide by 16
+        apic_write(self.apic, 0x320, HOST_TICK_VECTOR | 1 << 17); // periodic
+        apic_write(self.apic, 0x380, count);
+    }
+
+    /// Stops the host timer; the probe IDT stays loaded (harmless with
+    /// IF=0).
+    pub fn stop(&mut self) {
+        if self.apic != 0 {
+            apic_write(self.apic, 0x320, HOST_TICK_VECTOR | 1 << 16);
+            apic_write(self.apic, 0x380, 0);
+        }
+    }
+}
+
+/// COM1, polled.
+pub struct Serial;
+
+impl Serial {
+    pub fn init() {
+        for (port, value) in [
+            (0x3F9, 0),
+            (0x3FB, 0x80),
+            (0x3F8, 1),
+            (0x3F9, 0),
+            (0x3FB, 3),
+            (0x3FA, 0xC7),
+            (0x3FC, 3),
+        ] {
+            outb(port, value);
+        }
+    }
+
+    pub fn byte(b: u8) {
+        for _ in 0..100_000 {
+            if inb(0x3FD) & 0x20 != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        outb(0x3F8, b);
+    }
+}
+
+impl fmt::Write for Serial {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        s.bytes().for_each(Serial::byte);
+        Ok(())
+    }
+}

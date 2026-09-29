@@ -549,6 +549,8 @@ pub fn test(options: &Options) -> Result<()> {
             "--package".into(),
             "hid-keyboard".into(),
             "--package".into(),
+            "hw-svm".into(),
+            "--package".into(),
             "xtask".into(),
         ],
         &suite_dir.join("host-tests.log"),
