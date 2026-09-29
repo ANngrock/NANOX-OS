@@ -98,6 +98,9 @@ version = "0.1.0"
 [[package]]
 name = "hw-svm"
 version = "0.1.0"
+dependencies = [
+ "vmm-devices",
+]
 
 [[package]]
 name = "hw-xhci"

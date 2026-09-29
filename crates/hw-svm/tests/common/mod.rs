@@ -169,18 +169,53 @@ pub enum Step {
     SpinForever,
     TripleFault,
     Vmmcall,
+    /// RDMSR/WRMSR of an intercepted MSR the VMM emulates: no fault.
+    MsrEmulated {
+        msr: u32,
+        write: bool,
+        value: u64,
+    },
+    /// The instruction `insn[..len]` accesses unmapped `gpa` (a nested page
+    /// fault). With `assist` the processor supplies the instruction bytes
+    /// (decode assists); otherwise the VMM must fetch them from guest
+    /// memory at RIP.
+    Mmio {
+        gpa: u64,
+        insn: [u8; 15],
+        len: u8,
+        assist: bool,
+    },
+    /// Sets RFLAGS.IF; the next step is in the interrupt shadow.
+    Sti,
+    Cli,
 }
 
 impl Step {
-    fn len(self) -> u64 {
+    pub fn len(self) -> u64 {
         match self {
             Step::Out { .. } | Step::In { .. } | Step::OutString { .. } => 1,
-            Step::Cpuid { .. } | Step::Rdmsr { .. } | Step::Wrmsr { .. } => 2,
+            Step::Cpuid { .. }
+            | Step::Rdmsr { .. }
+            | Step::Wrmsr { .. }
+            | Step::MsrEmulated { .. } => 2,
             Step::Vmmcall => 3,
-            Step::Hlt => 1,
+            Step::Hlt | Step::Sti | Step::Cli => 1,
             Step::Load { .. } | Step::Store { .. } => 3,
             Step::Tick | Step::SpinForever | Step::TripleFault => 2,
+            Step::Mmio { len, .. } => u64::from(len),
         }
+    }
+}
+
+/// An MMIO step with the instruction's bytes.
+pub fn mmio(gpa: u64, bytes: &[u8], assist: bool) -> Step {
+    let mut insn = [0x90u8; 15];
+    insn[..bytes.len()].copy_from_slice(bytes);
+    Step::Mmio {
+        gpa,
+        insn,
+        len: bytes.len() as u8,
+        assist,
     }
 }
 
@@ -210,6 +245,12 @@ pub struct FakeCpu {
     pub msrs: HashMap<u32, u64>,
     pub host_cpuid: HashMap<(u32, u32), [u32; 4]>,
     pub violations: Vec<String>,
+    /// External interrupts delivered: (vector, RIP at delivery).
+    pub interrupts: Vec<(u8, u64)>,
+    /// N_CR3 of the last VMRUN, for `read_guest_phys`.
+    ncr3: u64,
+    /// The next step executes in the STI interrupt shadow.
+    sti_shadow: bool,
 }
 
 impl FakeCpu {
@@ -251,7 +292,30 @@ impl FakeCpu {
             msrs: HashMap::new(),
             host_cpuid,
             violations: Vec::new(),
+            interrupts: Vec::new(),
+            ncr3: 0,
+            sti_shadow: false,
         }
+    }
+
+    /// RIP of script step `index`.
+    pub fn rip_of(&self, index: usize) -> u64 {
+        self.steps[index].0
+    }
+
+    /// Nested walk without TLB or checks (for `read_guest_phys`).
+    fn npt_walk(&mut self, gpa: u64) -> Option<u64> {
+        let mut table = self.ncr3;
+        for level in (0..4).rev() {
+            let e = self
+                .mem
+                .read_u64(table + 8 * ((gpa >> (12 + 9 * level)) & 511));
+            if e & 1 == 0 {
+                return None;
+            }
+            table = e & 0x000F_FFFF_FFFF_F000;
+        }
+        Some(table | (gpa & 0xFFF))
     }
 
     pub fn assert_clean(&self) {
@@ -389,9 +453,36 @@ impl FakeCpu {
                 gprs.rcx as u32,
                 gprs.rdx as u32,
             ]),
+            Step::MsrEmulated { write: false, .. } if !injected => self
+                .rdmsr_results
+                .push(gprs.rdx << 32 | (vmcb.rax() & 0xFFFF_FFFF)),
             _ => {}
         }
         self.pos = p.index + 1;
+    }
+
+    /// An injected external interrupt (EVENTINJ type 0) is taken at the
+    /// current RIP; the script's handler returns at once.
+    fn take_interrupt(&mut self, vmcb: &mut Vmcb<'_>) {
+        let inj = vmcb.event_inj();
+        if inj & (1 << 31) != 0 && (inj >> 8) & 7 == 0 {
+            if vmcb.rflags() & (1 << 9) == 0 {
+                self.violations
+                    .push(format!("interrupt {inj:#x} injected with IF=0"));
+            }
+            if vmcb.read_u64(ctl::INTERRUPT_SHADOW) & 1 != 0 {
+                self.violations
+                    .push(format!("interrupt {inj:#x} injected in a shadow"));
+            }
+            self.interrupts.push((inj as u8, vmcb.rip()));
+            vmcb.set_event_inj(0);
+        }
+    }
+
+    fn window_open(vmcb: &Vmcb<'_>) -> bool {
+        vmcb.read_u32(ctl::INTERCEPT_MISC1) & hw_svm::vmcb::misc1::VINTR != 0
+            && vmcb.read_u64(ctl::VINTR) & hw_svm::vmcb::vintr::V_IRQ != 0
+            && vmcb.rflags() & (1 << 9) != 0
     }
 }
 
@@ -407,6 +498,8 @@ impl SvmCpu for FakeCpu {
         if tc == tlb::FLUSH_ALL || tc == tlb::FLUSH_ASID {
             self.tlb.clear();
         }
+        self.ncr3 = vmcb.read_u64(ctl::N_CR3);
+        self.take_interrupt(vmcb);
         self.settle(vmcb, gprs);
         loop {
             let Some(&(rip, step)) = self.steps.get(self.pos) else {
@@ -423,7 +516,59 @@ impl SvmCpu for FakeCpu {
                     expect_fault,
                 })
             };
+            // The shadow of an STI covers exactly this step; the VMCB
+            // reports it if this step exits.
+            let shadow = std::mem::take(&mut self.sti_shadow);
+            vmcb.write_u64(ctl::INTERRUPT_SHADOW, u64::from(shadow));
+            // The requested interrupt window opens at an instruction
+            // boundary with IF=1 outside the STI shadow.
+            if !shadow && Self::window_open(vmcb) {
+                Self::exit(vmcb, code::VINTR, 0, 0, rip);
+                self.pending = pend(false, false);
+                return;
+            }
             match step {
+                Step::Sti | Step::Cli => {
+                    let f = vmcb.read_u64(hw_svm::vmcb::save::RFLAGS);
+                    let f = if step == Step::Sti {
+                        self.sti_shadow = true;
+                        f | 1 << 9
+                    } else {
+                        f & !(1 << 9)
+                    };
+                    vmcb.write_u64(hw_svm::vmcb::save::RFLAGS, f);
+                    self.pos += 1;
+                }
+                Step::MsrEmulated { msr, write, value } => {
+                    gprs.rcx = u64::from(msr);
+                    if write {
+                        vmcb.set_rax(value & 0xFFFF_FFFF);
+                        gprs.rdx = value >> 32;
+                    }
+                    if !self.msr_intercepted(vmcb, msr, write) {
+                        self.violations
+                            .push(format!("MSR {msr:#x} not intercepted"));
+                    }
+                    Self::exit(vmcb, code::MSR, u64::from(write), 0, next);
+                    self.pending = pend(true, false);
+                    return;
+                }
+                Step::Mmio {
+                    gpa,
+                    insn,
+                    len,
+                    assist,
+                } => {
+                    // Not present, final translation.
+                    Self::exit(vmcb, code::NPF, 4 | 1 << 32, gpa, next);
+                    let n = if assist { len } else { 0 };
+                    vmcb.write_u8(ctl::INSN_LEN, n);
+                    for (i, b) in insn.iter().enumerate() {
+                        vmcb.write_u8(ctl::INSN_BYTES + i, if assist { *b } else { 0 });
+                    }
+                    self.pending = pend(true, false);
+                    return;
+                }
                 Step::Out { port, size, value }
                 | Step::In {
                     port,
@@ -547,6 +692,18 @@ impl SvmCpu for FakeCpu {
             .copied()
             .unwrap_or([0; 4])
     }
+
+    fn read_guest_phys(&mut self, gpa: u64, out: &mut [u8]) -> bool {
+        for (i, b) in out.iter_mut().enumerate() {
+            let Some(hpa) = self.npt_walk(gpa + i as u64) else {
+                return false;
+            };
+            let mut x = [0u8];
+            self.mem.read_bytes(hpa, &mut x);
+            *b = x[0];
+        }
+        true
+    }
 }
 
 pub struct FakeClock {
@@ -609,6 +766,24 @@ impl Rig {
     /// The VMCB, e.g. to corrupt guest state in a test.
     pub fn vmcb(&mut self) -> Vmcb<'_> {
         Vmcb::wrap(&mut self.page)
+    }
+
+    /// Makes the guest's code fetchable: guest page tables at GPA 0x2000
+    /// (the CR3 of `setup_long_mode`) identity-mapping 2 MiB, and the
+    /// bytes of every MMIO step at its RIP.
+    pub fn place_code(&mut self) {
+        for (page, entry) in [(2, 0x3000 | 3), (3, 0x4000 | 3), (4, 0x83)] {
+            let f = self.ram[page];
+            self.cpu.mem.write_bytes(f, &[0; 4096]);
+            self.cpu.mem.write_u64(f, entry);
+        }
+        for i in 0..self.cpu.steps.len() {
+            let (rip, step) = self.cpu.steps[i];
+            if let Step::Mmio { insn, len, .. } = step {
+                let f = self.ram[(rip >> 12) as usize] + (rip & 0xFFF);
+                self.cpu.mem.write_bytes(f, &insn[..usize::from(len)]);
+            }
+        }
     }
 }
 

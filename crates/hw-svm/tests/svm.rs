@@ -503,7 +503,7 @@ fn msr_policy_passes_state_msrs_and_faults_the_rest() {
             value: 0xFFFF_8000_1234_0000,
         },
         Step::Rdmsr { msr: 0xC000_0100 },
-        Step::Rdmsr { msr: 0x1B }, // APIC base: not virtualized
+        Step::Rdmsr { msr: 0x10 }, // TSC: not virtualized
         Step::Wrmsr {
             msr: 0xC001_0114,
             value: 0,

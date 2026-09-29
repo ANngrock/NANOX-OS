@@ -15,7 +15,10 @@
 //!   in caller frames, without partial effect on error.
 //! * [`exit`] — #VMEXIT decoding.
 //! * [`vmm`] — a vCPU loop: CPUID/MSR policy, a 16550 transmit path, the
-//!   `isa-debug-exit` port used by the M0 harness, budgets and a verdict.
+//!   `isa-debug-exit` port used by the M0 harness, the local APIC and PIT
+//!   channel 2 from `vmm-devices` on a virtual clock, budgets and a
+//!   verdict.
+//! * [`guest`] — guest page walk and instruction fetch for MMIO emulation.
 //!
 //! The kernel implements [`SvmCpu::vmrun`] (VMLOAD/VMRUN/VMSAVE and the
 //! GPR save/restore in assembly); tests implement it with a scripted CPU.
@@ -28,6 +31,7 @@
 
 pub mod caps;
 pub mod exit;
+pub mod guest;
 pub mod npt;
 pub mod perm;
 pub mod vmcb;
@@ -88,6 +92,14 @@ pub trait SvmCpu {
     /// CPUID of the host for `leaf`/`subleaf` as (EAX, EBX, ECX, EDX); the
     /// VMM filters it before the guest sees it.
     fn host_cpuid(&mut self, leaf: u32, subleaf: u32) -> [u32; 4];
+    /// Reads guest-physical memory (resolved through the nested tables) so
+    /// the VMM can fetch an instruction it emulates; false if `gpa` is not
+    /// guest RAM. The default has no access: MMIO emulation then ends the
+    /// run with `Verdict::MmioUnsupported` unless the processor saved the
+    /// instruction bytes (decode assists).
+    fn read_guest_phys(&mut self, _gpa: u64, _out: &mut [u8]) -> bool {
+        false
+    }
 }
 
 /// Monotonic time in microseconds for VMM budgets.

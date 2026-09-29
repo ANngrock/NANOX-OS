@@ -57,6 +57,8 @@ const GUEST_CR3: u64 = 0x2000;
 const GUEST_STACK: u64 = 0x8000;
 const RO_PAGE: usize = 6;
 const REMAP_PAGE: usize = 9;
+/// Page directory for 3..4 GiB, mapping the local APIC's 2 MiB page.
+const APIC_PD_PAGE: usize = 11;
 
 const MSR_EFER: u32 = 0xC000_0080;
 const MSR_VM_CR: u32 = 0xC001_0114;
@@ -202,11 +204,44 @@ impl FrameAlloc for Frames {
     }
 }
 
+/// Where the current guest's RAM lives, for `read_guest_phys`.
+#[derive(Clone, Copy)]
+enum GuestMap {
+    None,
+    /// Small guests: one frame per guest page.
+    Pages([u64; RAM_PAGES]),
+    /// The kernel guest: `size` bytes from `base`.
+    Contig {
+        base: u64,
+        size: u64,
+    },
+}
+
 struct Cpu {
     host_save: u64,
+    ram: GuestMap,
 }
 
 impl SvmCpu for Cpu {
+    fn read_guest_phys(&mut self, gpa: u64, out: &mut [u8]) -> bool {
+        for (i, b) in out.iter_mut().enumerate() {
+            let a = gpa + i as u64;
+            let hpa = match self.ram {
+                GuestMap::Pages(p) => match p.get((a >> 12) as usize) {
+                    Some(f) => f + (a & 0xFFF),
+                    None => return false,
+                },
+                GuestMap::Contig { base, size } if a < size => base + a,
+                _ => return false,
+            };
+            // SAFETY: `hpa` is in a frame of the probe's pool that backs
+            // this guest's RAM; memory is identity-mapped and a byte read
+            // has no alignment requirement.
+            *b = unsafe { (hpa as *const u8).read_volatile() };
+        }
+        true
+    }
+
     fn vmrun(&mut self, vmcb: &mut Vmcb<'_>, g: &mut Gprs) {
         let mut r = [
             g.rbx, g.rcx, g.rdx, g.rsi, g.rdi, g.rbp, g.r8, g.r9, g.r10, g.r11, g.r12, g.r13,
@@ -297,7 +332,14 @@ impl Env {
         self.phys.write_u64(ram[2], 0x3000 | 3);
         self.phys.write_u64(ram[3], 0x4000 | 3);
         self.phys.write_u64(ram[4], 0x83);
+        // PDPT[3] -> PD at page 11 with the 2 MiB page holding the local
+        // APIC (0xFEE00000), which the nested tables leave unmapped.
+        self.phys
+            .write_u64(ram[3] + 8 * 3, (APIC_PD_PAGE * PAGE) as u64 | 3);
+        self.phys
+            .write_u64(ram[APIC_PD_PAGE] + 8 * 0x1F7, 0xFEE0_0000 | 0x83);
         self.phys.copy(ram[1], code);
+        self.cpu.ram = GuestMap::Pages(ram);
         let mut cfg = VmConfig::new(1, self.msrpm, self.iopm, npt.root(), self.nrips);
         cfg.flush_by_asid = self.flush_by_asid;
         cfg.max_exits = 10_000;
@@ -324,11 +366,14 @@ fn enter(page: &mut [u8; 4096], vcpu: &Vcpu<'_>) {
 
 fn print_outcome(o: &Outcome, serial: &[u8]) {
     out!(
-        " verdict={:?} exits={} msr_faults={} ud={} serial=\"",
+        " verdict={:?} exits={} msr_faults={} ud={} irqs={} mmio={} virtual_us={} serial=\"",
         o.verdict,
         o.exits,
         o.msr_faults,
-        o.ud_injected
+        o.ud_injected,
+        o.irqs,
+        o.mmio,
+        o.virtual_ns / 1000
     );
     for &b in serial {
         match b {
@@ -353,6 +398,26 @@ fn case(env: &mut Env, page: &mut [u8; 4096], name: &str, code: &[u8], expect: E
     let ok = expect(&o, vcpu.serial(), &mut env.phys, &guest);
     env.report("CASE", name, ok);
     print_outcome(&o, vcpu.serial());
+    if !ok {
+        let v = Vmcb::wrap(page);
+        let scratch = env.phys.read_u64(guest.ram[5]);
+        out!(
+            "NANOX:SVM-PROBE:STATE {name} rip={:#x} rflags={:#x} shadow={:#x} exit={:#x} info1={:#x} info2={:#x} exitintinfo={:#x} eventinj={:#x} vintr={:#x} rbx={:#x} rcx={:#x} rdx={:#x} scratch={:#x}\n",
+            v.rip(),
+            v.rflags(),
+            v.read_u64(ctl::INTERRUPT_SHADOW),
+            v.exit_code(),
+            v.exit_info1(),
+            v.exit_info2(),
+            v.read_u64(ctl::EXIT_INT_INFO),
+            v.event_inj(),
+            v.read_u64(ctl::VINTR),
+            gprs.rbx,
+            gprs.rcx,
+            gprs.rdx,
+            scratch
+        );
+    }
 }
 
 fn cases(env: &mut Env, page: &mut [u8; 4096]) {
@@ -409,6 +474,12 @@ fn cases(env: &mut Env, page: &mut [u8; 4096]) {
     );
     case(env, page, "vmmcall", guest::vmmcall(), |o, _, _, _| {
         o.verdict == Verdict::Shutdown && o.ud_injected == 1
+    });
+    // APIC MMIO (no decode assists in TCG: fetched through the guest page
+    // tables), five periodic timer interrupts from HLT on virtual time,
+    // the timer measured against PIT channel 2.
+    case(env, page, "apic-timer", guest::timer(), |o, _, _, _| {
+        o.verdict == PASS && o.irqs == 5 && o.mmio >= 12
     });
     remap(env, page);
 }
@@ -490,6 +561,10 @@ fn kernel_case(
         base,
     };
     let entry = guest_boot::load(elf, &mut ram, &cfg).expect("guest-boot");
+    env.cpu.ram = GuestMap::Contig {
+        base,
+        size: KERNEL_RAM,
+    };
     if let Some(c) = corrupt {
         c(&mut ram, &entry);
     }
@@ -815,7 +890,10 @@ pub extern "efiapi" fn efi_main(_image: *mut u8, _system: *mut u8) -> usize {
             free: [0; FRAME_PAGES],
             nfree: 0,
         },
-        cpu: Cpu { host_save: pa(1) },
+        cpu: Cpu {
+            host_save: pa(1),
+            ram: GuestMap::None,
+        },
         msrpm: pa(3),
         iopm: pa(5),
         nrips: caps.nrips,

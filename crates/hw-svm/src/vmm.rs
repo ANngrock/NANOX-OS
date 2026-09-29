@@ -1,22 +1,37 @@
 //! A limited VMM for testing candidate builds: one vCPU, nested paging,
 //! every I/O port and every MSR outside a small allowlist intercepted, and
-//! just enough devices for the M0 test protocol:
+//! the devices a NANOX kernel test run needs:
 //!
 //! * a 16550 transmit path at `serial_base` (THR writes are captured unless
 //!   LCR.DLAB selects the divisor latch, LSR reads report an empty
 //!   transmitter, other registers read 0);
 //! * the `isa-debug-exit` port: a write of `v` ends the run with exit
 //!   status `(v << 1) | 1`, exactly as QEMU reports it to the M0 harness,
-//!   so a candidate's test mode behaves the same under this VMM.
+//!   so a candidate's test mode behaves the same under this VMM;
+//! * a local APIC (xAPIC MMIO page, IA32_APIC_BASE) and PIT channel 2 with
+//!   port 0x61, from `vmm-devices`; the 8259 PICs only accept their masks.
+//!
+//! Time is virtual and deterministic: every exit advances it by
+//! `exit_quantum_ns`, and a HLT with interrupts enabled skips to the next
+//! APIC timer deadline. APIC interrupts are injected through EVENTINJ when
+//! the guest can take them, otherwise a virtual-interrupt window (V_IRQ +
+//! VINTR intercept) brings the VMM back as soon as it can. APIC MMIO is
+//! emulated from the faulting instruction (decode assists if present,
+//! otherwise fetched through the guest's page tables).
 //!
 //! The run ends with a [`Verdict`]; the host's timer interrupt (intercepted
-//! INTR) lets the loop enforce a time budget even for a guest that spins.
+//! INTR) lets the loop enforce a wall-time budget even for a guest that
+//! spins without exits.
 
 use crate::exit::{Exit, IoExit};
+use crate::guest;
 use crate::npt::NeedsFlush;
 use crate::perm::MsrPermissionMap;
-use crate::vmcb::{ctl, misc1, misc2, tlb, Gprs, StateError, Vmcb};
+use crate::vmcb::{bits, ctl, misc1, misc2, save, tlb, vintr, Gprs, StateError, Vmcb};
 use crate::{Clock, Error, SvmCpu};
+use vmm_devices::decode::{self, Operation, Source};
+use vmm_devices::lapic::{self, Lapic};
+use vmm_devices::pit::Pit2;
 
 /// Hypervisor vendor signature returned in CPUID 4000_0000h (EBX, ECX,
 /// EDX).
@@ -54,14 +69,21 @@ pub struct VmConfig {
     pub flush_by_asid: bool,
     pub serial_base: u16,
     pub debug_exit_port: u16,
+    /// Input clock of the emulated local APIC timer.
+    pub lapic_bus_hz: u64,
+    /// Virtual time charged per exit.
+    pub exit_quantum_ns: u64,
     /// Exits handled before the run is stopped.
     pub max_exits: u64,
     /// Wall time before the run is stopped.
     pub max_time_us: u64,
+    /// Virtual time before the run is stopped (deterministic).
+    pub max_virtual_ns: u64,
 }
 
 impl VmConfig {
-    /// COM1 and the M0 harness debug-exit port.
+    /// COM1, the M0 harness debug-exit port, a 1 GHz APIC bus and 1 us of
+    /// virtual time per exit.
     pub fn new(asid: u32, msrpm_pa: u64, iopm_pa: u64, npt_root: u64, nrips: bool) -> Self {
         Self {
             asid,
@@ -72,8 +94,11 @@ impl VmConfig {
             flush_by_asid: false,
             serial_base: 0x3F8,
             debug_exit_port: 0xF4,
+            lapic_bus_hz: 1_000_000_000,
+            exit_quantum_ns: 1_000,
             max_exits: 1_000_000,
             max_time_us: 30_000_000,
+            max_virtual_ns: 60_000_000_000,
         }
     }
 }
@@ -90,10 +115,15 @@ pub enum Verdict {
     Halted,
     /// Wall-time budget exhausted.
     Timeout,
+    /// Virtual-time budget exhausted.
+    VirtualTimeout,
     /// Exit budget exhausted.
     ExitBudget,
     /// Access to guest-physical memory with no or insufficient mapping.
     NestedPageFault { gpa: u64, error: u64 },
+    /// An APIC access the VMM cannot emulate: the instruction could not be
+    /// fetched or is not one of the decoded MOV forms.
+    MmioUnsupported { gpa: u64, rip: u64 },
     /// String or REP I/O, which this VMM does not emulate.
     UnsupportedIo { port: u16 },
     /// An exit this VMM does not handle.
@@ -116,6 +146,12 @@ pub struct Outcome {
     pub msr_faults: u32,
     /// #UD injected for VMMCALL and SVM instructions.
     pub ud_injected: u32,
+    /// APIC interrupts injected.
+    pub irqs: u64,
+    /// APIC MMIO accesses emulated.
+    pub mmio: u64,
+    /// Virtual time at the end of the run.
+    pub virtual_ns: u64,
 }
 
 /// One vCPU.
@@ -131,15 +167,71 @@ pub struct Vcpu<'s> {
     exits: u64,
     msr_faults: u32,
     ud: u32,
+    lapic: Lapic,
+    pit: Pit2,
+    now: u64,
+    irqs: u64,
+    mmio: u64,
 }
 
 const GP: u64 = 13;
 const UD: u64 = 6;
+const EVENT_VALID: u64 = 1 << 31;
 
 /// EVENTINJ for a hardware exception (type 3), with error code 0 when
 /// `with_error`.
 fn exception(vector: u64, with_error: bool) -> u64 {
-    vector | 3 << 8 | u64::from(with_error) << 11 | 1 << 31
+    vector | 3 << 8 | u64::from(with_error) << 11 | EVENT_VALID
+}
+
+fn get_reg(vmcb: &Vmcb<'_>, g: &Gprs, index: u8) -> u64 {
+    match index {
+        0 => vmcb.rax(),
+        1 => g.rcx,
+        2 => g.rdx,
+        3 => g.rbx,
+        4 => vmcb.read_u64(save::RSP),
+        5 => g.rbp,
+        6 => g.rsi,
+        7 => g.rdi,
+        8 => g.r8,
+        9 => g.r9,
+        10 => g.r10,
+        11 => g.r11,
+        12 => g.r12,
+        13 => g.r13,
+        14 => g.r14,
+        _ => g.r15,
+    }
+}
+
+fn set_reg(vmcb: &mut Vmcb<'_>, g: &mut Gprs, index: u8, v: u64) {
+    match index {
+        0 => vmcb.set_rax(v),
+        1 => g.rcx = v,
+        2 => g.rdx = v,
+        3 => g.rbx = v,
+        4 => vmcb.write_u64(save::RSP, v),
+        5 => g.rbp = v,
+        6 => g.rsi = v,
+        7 => g.rdi = v,
+        8 => g.r8 = v,
+        9 => g.r9 = v,
+        10 => g.r10 = v,
+        11 => g.r11 = v,
+        12 => g.r12 = v,
+        13 => g.r13 = v,
+        14 => g.r14 = v,
+        _ => g.r15 = v,
+    }
+}
+
+/// Moves RIP past an emulated instruction; the interrupt shadow of a
+/// preceding STI/MOV SS covered only that instruction.
+fn skip_to(vmcb: &mut Vmcb<'_>, rip: u64) {
+    vmcb.set_rip(rip);
+    let shadow = vmcb.read_u64(ctl::INTERRUPT_SHADOW);
+    vmcb.write_u64(ctl::INTERRUPT_SHADOW, shadow & !1);
 }
 
 impl<'s> Vcpu<'s> {
@@ -155,6 +247,11 @@ impl<'s> Vcpu<'s> {
             exits: 0,
             msr_faults: 0,
             ud: 0,
+            lapic: Lapic::new(cfg.lapic_bus_hz.max(1)),
+            pit: Pit2::new(),
+            now: 0,
+            irqs: 0,
+            mmio: 0,
         }
     }
 
@@ -189,6 +286,7 @@ impl<'s> Vcpu<'s> {
         vmcb.write_u64(ctl::N_CR3, self.cfg.npt_root);
         vmcb.write_u64(ctl::IOPM_BASE, self.cfg.iopm_pa);
         vmcb.write_u64(ctl::MSRPM_BASE, self.cfg.msrpm_pa);
+        vmcb.write_u64(ctl::VINTR, vintr::V_INTR_MASKING);
         vmcb.set_event_inj(0);
     }
 
@@ -216,6 +314,16 @@ impl<'s> Vcpu<'s> {
         &self.serial[..self.serial_len]
     }
 
+    /// The emulated local APIC.
+    pub fn lapic(&self) -> &Lapic {
+        &self.lapic
+    }
+
+    /// Virtual time in nanoseconds.
+    pub fn now_ns(&self) -> u64 {
+        self.now
+    }
+
     fn outcome(&self, verdict: Verdict) -> Outcome {
         Outcome {
             verdict,
@@ -224,6 +332,9 @@ impl<'s> Vcpu<'s> {
             serial_truncated: self.truncated,
             msr_faults: self.msr_faults,
             ud_injected: self.ud,
+            irqs: self.irqs,
+            mmio: self.mmio,
+            virtual_ns: self.now,
         }
     }
 
@@ -237,6 +348,8 @@ impl<'s> Vcpu<'s> {
     ) -> Outcome {
         let start = clock.now_us();
         loop {
+            self.lapic.update(self.now);
+            self.deliver(vmcb);
             vmcb.set_tlb_control(self.flush);
             if let Err(Error::InvalidState(e)) = vmcb.check() {
                 return self.outcome(Verdict::Invalid(e));
@@ -245,15 +358,53 @@ impl<'s> Vcpu<'s> {
             vmcb.set_tlb_control(tlb::NOTHING);
             self.flush = tlb::NOTHING;
             self.exits += 1;
+            self.now = self.now.saturating_add(self.cfg.exit_quantum_ns);
             if let Some(v) = self.handle(cpu, vmcb, gprs) {
                 return self.outcome(v);
             }
             if self.exits >= self.cfg.max_exits {
                 return self.outcome(Verdict::ExitBudget);
             }
+            if self.now >= self.cfg.max_virtual_ns {
+                return self.outcome(Verdict::VirtualTimeout);
+            }
             if clock.now_us().saturating_sub(start) >= self.cfg.max_time_us {
                 return self.outcome(Verdict::Timeout);
             }
+        }
+    }
+
+    /// Injects the highest pending APIC interrupt if the guest can take it
+    /// now, else asks for an exit when it can (virtual interrupt window).
+    fn deliver(&mut self, vmcb: &mut Vmcb<'_>) {
+        let Some(v) = self.lapic.pending() else {
+            self.window(vmcb, false);
+            return;
+        };
+        let ready = vmcb.rflags() & bits::RFLAGS_IF != 0
+            && vmcb.read_u64(ctl::INTERRUPT_SHADOW) & 1 == 0
+            && vmcb.event_inj() & EVENT_VALID == 0;
+        if ready {
+            // Type 0 (external interrupt).
+            vmcb.set_event_inj(u64::from(v) | EVENT_VALID);
+            self.lapic.accept(v);
+            self.irqs += 1;
+            self.window(vmcb, false);
+        } else {
+            self.window(vmcb, true);
+        }
+    }
+
+    fn window(&self, vmcb: &mut Vmcb<'_>, open: bool) {
+        let v = vmcb.read_u64(ctl::VINTR);
+        let m = vmcb.read_u32(ctl::INTERCEPT_MISC1);
+        let bits = vintr::V_IRQ | vintr::V_INTR_PRIO_MAX | vintr::V_IGN_TPR;
+        if open {
+            vmcb.write_u64(ctl::VINTR, v | bits);
+            vmcb.write_u32(ctl::INTERCEPT_MISC1, m | misc1::VINTR);
+        } else {
+            vmcb.write_u64(ctl::VINTR, v & !bits);
+            vmcb.write_u32(ctl::INTERCEPT_MISC1, m & !misc1::VINTR);
         }
     }
 
@@ -263,7 +414,7 @@ impl<'s> Vcpu<'s> {
         } else {
             vmcb.rip().wrapping_add(len)
         };
-        vmcb.set_rip(next);
+        skip_to(vmcb, next);
     }
 
     fn inject(&mut self, vmcb: &mut Vmcb<'_>, vector: u64, with_error: bool) {
@@ -278,6 +429,8 @@ impl<'s> Vcpu<'s> {
     ) -> Option<Verdict> {
         match Exit::decode(vmcb) {
             Exit::Intr | Exit::Nmi | Exit::Smi => None,
+            // Delivered before the next VMRUN.
+            Exit::Vintr => None,
             Exit::Init => Some(Verdict::Shutdown),
             Exit::Cpuid => {
                 let leaf = vmcb.rax() as u32;
@@ -290,21 +443,57 @@ impl<'s> Vcpu<'s> {
                 self.advance(vmcb, 2);
                 None
             }
-            Exit::Msr { .. } => {
-                // Everything that reaches here is outside the allowlist.
+            Exit::Msr { write } => {
+                if gprs.rcx as u32 == lapic::MSR_APIC_BASE {
+                    if !write {
+                        let v = self.lapic.read_msr();
+                        vmcb.set_rax(v & 0xFFFF_FFFF);
+                        gprs.rdx = v >> 32;
+                        self.advance(vmcb, 2);
+                        return None;
+                    }
+                    let v = (gprs.rdx << 32) | (vmcb.rax() & 0xFFFF_FFFF);
+                    if self.lapic.write_msr(v).is_ok() {
+                        self.advance(vmcb, 2);
+                        return None;
+                    }
+                }
+                // Outside the allowlist and not emulated.
                 self.msr_faults += 1;
                 self.inject(vmcb, GP, true);
                 None
             }
             Exit::Io(io) => self.io(vmcb, io),
-            Exit::Hlt => Some(Verdict::Halted),
+            Exit::Hlt => {
+                // A HLT with interrupts enabled waits for the APIC timer:
+                // skip virtual time to its deadline. Anything else would
+                // never wake up.
+                let can_wake = vmcb.rflags() & bits::RFLAGS_IF != 0;
+                let deadline = self.lapic.next_deadline();
+                if can_wake && (self.lapic.pending().is_some() || deadline.is_some()) {
+                    if self.lapic.pending().is_none() {
+                        self.now = self.now.max(deadline.unwrap_or(self.now));
+                    }
+                    self.advance(vmcb, 1);
+                    None
+                } else {
+                    Some(Verdict::Halted)
+                }
+            }
             Exit::Shutdown => Some(Verdict::Shutdown),
             Exit::Vmmcall | Exit::SvmInstruction(_) => {
                 self.ud += 1;
                 self.inject(vmcb, UD, false);
                 None
             }
-            Exit::NestedPageFault { gpa, error } => Some(Verdict::NestedPageFault { gpa, error }),
+            Exit::NestedPageFault { gpa, error } => {
+                let base = self.lapic.base();
+                let enabled = self.lapic.read_msr() & lapic::MSR_ENABLE != 0;
+                if enabled && (base..base + 0x1000).contains(&gpa) {
+                    return self.mmio(cpu, vmcb, gprs, gpa);
+                }
+                Some(Verdict::NestedPageFault { gpa, error })
+            }
             // VMRUN refused a state our checks accepted: report the
             // failing check if there is one now, else the raw exit code.
             Exit::Invalid => Some(match vmcb.check() {
@@ -316,6 +505,49 @@ impl<'s> Vcpu<'s> {
             }
             Exit::Other(c) => Some(Verdict::UnhandledExit(c)),
         }
+    }
+
+    /// Emulates one access to the APIC page. Only aligned 32-bit accesses
+    /// reach registers; others read 0 and are dropped, like reserved
+    /// fields.
+    fn mmio<C: SvmCpu + ?Sized>(
+        &mut self,
+        cpu: &mut C,
+        vmcb: &mut Vmcb<'_>,
+        gprs: &mut Gprs,
+        gpa: u64,
+    ) -> Option<Verdict> {
+        let rip = vmcb.rip();
+        let mut bytes = [0u8; guest::MAX_INSN];
+        let n = guest::fetch(cpu, vmcb, &mut bytes);
+        let Ok(insn) = decode::decode(&bytes[..n]) else {
+            return Some(Verdict::MmioUnsupported { gpa, rip });
+        };
+        let offset = (gpa & 0xFFF) as u32;
+        let register = offset.is_multiple_of(16);
+        match insn.op {
+            Operation::Load { reg, size, dest } => {
+                let v = if size == 4 && register {
+                    u64::from(self.lapic.read(offset, self.now))
+                } else {
+                    0
+                };
+                let old = get_reg(vmcb, gprs, reg.index);
+                set_reg(vmcb, gprs, reg.index, decode::merge(old, reg, dest, v));
+            }
+            Operation::Store { src, size } => {
+                let v = match src {
+                    Source::Reg(r) => decode::source_value(get_reg(vmcb, gprs, r.index), r),
+                    Source::Imm(i) => i,
+                };
+                if size == 4 && register {
+                    self.lapic.write(offset, v as u32, self.now);
+                }
+            }
+        }
+        self.mmio += 1;
+        skip_to(vmcb, rip.wrapping_add(u64::from(insn.len)));
+        None
     }
 
     fn cpuid<C: SvmCpu + ?Sized>(&self, cpu: &mut C, leaf: u32, sub: u32) -> [u32; 4] {
@@ -341,7 +573,8 @@ impl<'s> Vcpu<'s> {
         let mut r = cpu.host_cpuid(leaf, sub);
         match leaf {
             // Hypervisor present; no VMX; no x2APIC, MONITOR/MWAIT or
-            // TSC-deadline without an emulated APIC.
+            // TSC-deadline: the emulated APIC is xAPIC with the classic
+            // timer only.
             1 => {
                 r[2] |= 1 << 31;
                 r[2] &= !((1 << 5) | (1 << 21) | (1 << 3) | (1 << 24));
@@ -367,7 +600,7 @@ impl<'s> Vcpu<'s> {
         if !io.input && io.port == self.cfg.debug_exit_port {
             let value = (vmcb.rax() & mask) as u32;
             // Past the OUT, so a caller may resume the guest.
-            vmcb.set_rip(io.next_rip);
+            skip_to(vmcb, io.next_rip);
             return Some(Verdict::DebugExit {
                 value,
                 status: value.wrapping_shl(1) | 1,
@@ -377,6 +610,12 @@ impl<'s> Vcpu<'s> {
             let v: u64 = if io.port == base + 5 {
                 0x60 // LSR: THRE | TEMT
             } else if (base..base + 8).contains(&io.port) {
+                0
+            } else if let Some(b) = self.pit.read(io.port, self.now) {
+                u64::from(b)
+            } else if matches!(io.port, 0x21 | 0xA1) {
+                0xFF // PIC masks: everything masked
+            } else if matches!(io.port, 0x20 | 0xA0) {
                 0
             } else {
                 mask // nothing decodes the port
@@ -401,8 +640,11 @@ impl<'s> Vcpu<'s> {
             } else {
                 self.truncated = true;
             }
+        } else {
+            // PIT channel 2 and port 0x61; other ports ignore writes.
+            let _ = self.pit.write(io.port, vmcb.rax() as u8, self.now);
         }
-        vmcb.set_rip(io.next_rip);
+        skip_to(vmcb, io.next_rip);
         None
     }
 }

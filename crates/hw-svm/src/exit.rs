@@ -10,6 +10,8 @@ pub mod code {
     pub const NMI: u64 = 0x61;
     pub const SMI: u64 = 0x62;
     pub const INIT: u64 = 0x63;
+    /// Virtual interrupt window (V_IRQ became deliverable).
+    pub const VINTR: u64 = 0x64;
     pub const CPUID: u64 = 0x72;
     pub const HLT: u64 = 0x78;
     pub const IOIO: u64 = 0x7B;
@@ -53,6 +55,8 @@ pub enum Exit {
     Nmi,
     Smi,
     Init,
+    /// The guest can take an interrupt now (window requested by the VMM).
+    Vintr,
     Cpuid,
     Hlt,
     Io(IoExit),
@@ -88,6 +92,7 @@ impl Exit {
             code::NMI => Exit::Nmi,
             code::SMI => Exit::Smi,
             code::INIT => Exit::Init,
+            code::VINTR => Exit::Vintr,
             code::CPUID => Exit::Cpuid,
             code::HLT => Exit::Hlt,
             code::IOIO => {

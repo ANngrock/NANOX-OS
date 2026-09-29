@@ -73,6 +73,7 @@ pub mod misc1 {
     pub const NMI: u32 = 1 << 1;
     pub const SMI: u32 = 1 << 2;
     pub const INIT: u32 = 1 << 3;
+    pub const VINTR: u32 = 1 << 4;
     pub const CPUID: u32 = 1 << 18;
     pub const HLT: u32 = 1 << 24;
     pub const IOIO_PROT: u32 = 1 << 27;
@@ -90,6 +91,21 @@ pub mod misc2 {
     pub const CLGI: u32 = 1 << 5;
     pub const SKINIT: u32 = 1 << 6;
     pub const XSETBV: u32 = 1 << 13;
+}
+
+/// Virtual interrupt control (offset 060h) bits (verify).
+pub mod vintr {
+    /// A virtual interrupt is pending.
+    pub const V_IRQ: u64 = 1 << 8;
+    /// Priority of the pending virtual interrupt (bits 19:16).
+    pub const V_INTR_PRIO_MAX: u64 = 0xF << 16;
+    /// Ignore the virtual TPR for the pending virtual interrupt.
+    pub const V_IGN_TPR: u64 = 1 << 20;
+    /// Physical interrupts are masked by the host's RFLAGS.IF, the guest's
+    /// IF only masks virtual interrupts. Without it a guest with IF=1
+    /// makes pending host interrupts exit every VMRUN (found by
+    /// svm-probe's apic-timer guest under QEMU).
+    pub const V_INTR_MASKING: u64 = 1 << 24;
 }
 
 /// TLB_CONTROL values (APM 15.16.2).
