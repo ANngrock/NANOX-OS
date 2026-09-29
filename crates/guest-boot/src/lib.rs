@@ -41,6 +41,23 @@ const EFI_LOADER_DATA: u32 = 2;
 const EFI_MEMORY_WB: u64 = 8;
 const MAX_RANGES: usize = bp::MAX_LOAD_SEGMENTS as usize + 4;
 
+/// The loader contract the kernel was built for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    /// `codex/m0`: page tables in a pool of exactly the pages they need.
+    M0,
+    /// `codex/m1-m8-continuation`: a pool of [`M1_PAGE_TABLES_POOL_PAGES`]
+    /// starting with the PML4, also mapped RW/NX at
+    /// [`M1_PAGE_TABLES_BASE`], where the kernel's VMM adopts it.
+    M1,
+}
+
+/// `boot_protocol::PAGE_TABLES_BASE` on `codex/m1-m8-continuation`
+/// (duplicated until that branch is merged).
+pub const M1_PAGE_TABLES_BASE: u64 = 0xffff_ffff_9100_0000;
+/// `boot_protocol::PAGE_TABLES_POOL_PAGES` on the same branch.
+pub const M1_PAGE_TABLES_POOL_PAGES: u64 = 128;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Guest RAM: guest-physical 0..ram_bytes.
@@ -49,6 +66,7 @@ pub struct Config {
     pub test_profile: bool,
     /// BootInfo boot_epoch (M0 test scenarios select on it).
     pub boot_epoch: u64,
+    pub protocol: Protocol,
 }
 
 /// Initial vCPU state and where things went.
@@ -72,6 +90,8 @@ pub enum LoadError {
     /// A virtual address outside the one page directory the M0 windows
     /// share (never for inputs `elf::parse` accepts).
     Window,
+    /// The page tables need more than the M1 pool holds.
+    TablePool,
 }
 
 /// What goes where, computed before any write.
@@ -114,10 +134,18 @@ fn layout(elf_bytes: &[u8], cfg: &Config) -> Result<Layout, LoadError> {
     }
     touch(bp::HANDOFF_BASE, bp::HANDOFF_MAPPED_SIZE / PAGE)?;
     touch(bp::STACK_TOP - bp::STACK_SIZE, bp::STACK_SIZE / PAGE)?;
-    let table_pages = 3 + touched
+    if cfg.protocol == Protocol::M1 {
+        touch(M1_PAGE_TABLES_BASE, M1_PAGE_TABLES_POOL_PAGES)?;
+    }
+    let needed = 3 + touched
         .iter()
         .map(|w| u64::from(w.count_ones()))
         .sum::<u64>();
+    let table_pages = match cfg.protocol {
+        Protocol::M0 => needed,
+        Protocol::M1 if needed <= M1_PAGE_TABLES_POOL_PAGES => M1_PAGE_TABLES_POOL_PAGES,
+        Protocol::M1 => return Err(LoadError::TablePool),
+    };
     let arena = cursor;
     let stack = arena + bp::HANDOFF_MAPPED_SIZE;
     let tables = stack + bp::STACK_SIZE;
@@ -310,6 +338,16 @@ pub fn load<M: GuestMemory + ?Sized>(
         true,
         false,
     );
+    if cfg.protocol == Protocol::M1 {
+        tables.map(
+            mem,
+            M1_PAGE_TABLES_BASE,
+            l.tables,
+            l.table_pages,
+            true,
+            false,
+        );
+    }
     add(range(l.arena, bp::HANDOFF_MAPPED_SIZE, bp::KIND_BOOT_INFO));
     add(range(l.stack, bp::STACK_SIZE, bp::KIND_STACK));
     add(range(l.tables, l.table_pages * PAGE, bp::KIND_PAGE_TABLES));

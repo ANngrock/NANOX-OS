@@ -75,6 +75,7 @@ pub mod misc1 {
     pub const INIT: u32 = 1 << 3;
     pub const VINTR: u32 = 1 << 4;
     pub const CPUID: u32 = 1 << 18;
+    pub const PAUSE: u32 = 1 << 23;
     pub const HLT: u32 = 1 << 24;
     pub const IOIO_PROT: u32 = 1 << 27;
     pub const MSR_PROT: u32 = 1 << 28;

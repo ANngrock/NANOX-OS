@@ -3,7 +3,10 @@
 //! of the guest page tables the loader built.
 
 use boot_protocol::{self as bp, BootInfo};
-use guest_boot::{encode_boot_info, load, Config, GuestMemory, LoadError, LOAD_BASE};
+use guest_boot::{
+    encode_boot_info, load, Config, GuestMemory, LoadError, Protocol, LOAD_BASE,
+    M1_PAGE_TABLES_BASE, M1_PAGE_TABLES_POOL_PAGES,
+};
 
 const VALID: &[u8] = include_bytes!("../../../tests/fixtures/valid-minimal.elf");
 const TRUNCATED: &[u8] = include_bytes!("../../../tests/fixtures/truncated-header.elf");
@@ -98,7 +101,73 @@ fn cfg() -> Config {
         ram_bytes: RAM,
         test_profile: true,
         boot_epoch: 7,
+        protocol: Protocol::M0,
     }
+}
+
+/// The M1 loader contract (codex/m1-m8-continuation boot/uefi and
+/// kernel_main): a 128-page table pool that starts with the PML4, is
+/// reserved as one KIND_PAGE_TABLES range and is mapped in order, RW/NX, at
+/// PAGE_TABLES_BASE, so the kernel can read PML4[511] through the window.
+#[test]
+fn m1_table_pool_is_reserved_whole_and_mapped_at_its_window() {
+    let mut ram = Ram::new(0xA5);
+    let c = Config {
+        protocol: Protocol::M1,
+        ..cfg()
+    };
+    let e = load(VALID, &mut ram, &c).unwrap();
+    let info = decode(&read_virt(&ram, e.cr3, bp::HANDOFF_BASE, 160));
+    let ranges = read_virt(
+        &ram,
+        e.cr3,
+        info.reserved_ranges_virt,
+        u64::from(info.reserved_ranges_count) * 24,
+    );
+    let map = read_virt(&ram, e.cr3, info.memory_map_virt, info.memory_map_len);
+    let segments = read_virt(
+        &ram,
+        e.cr3,
+        info.load_segments_virt,
+        u64::from(info.load_segments_count) * 32,
+    );
+    assert_eq!(info.validate_buffers(&map, &ranges, &segments), Ok(()));
+    let pools: Vec<_> = ranges
+        .chunks_exact(24)
+        .map(|r| bp::ReservedRange::decode(r).unwrap())
+        .filter(|r| r.kind == bp::KIND_PAGE_TABLES)
+        .collect();
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0].phys_start, info.pml4_phys);
+    assert_eq!(pools[0].page_count, M1_PAGE_TABLES_POOL_PAGES);
+    for i in 0..M1_PAGE_TABLES_POOL_PAGES {
+        let (pa, w, nx) = walk(&ram, e.cr3, M1_PAGE_TABLES_BASE + i * 4096).unwrap();
+        assert_eq!(pa, info.pml4_phys + i * 4096, "window page {i}");
+        assert!(w && nx);
+    }
+    assert!(walk(
+        &ram,
+        e.cr3,
+        M1_PAGE_TABLES_BASE + M1_PAGE_TABLES_POOL_PAGES * 4096
+    )
+    .is_none());
+    // PML4[511] through the window is present (the kernel checks it).
+    let pml4_511 = read_virt(&ram, e.cr3, M1_PAGE_TABLES_BASE + 511 * 8, 8);
+    assert_eq!(pml4_511[0] & 1, 1);
+    // Pool pages the tables do not use are zero.
+    let used = (0..M1_PAGE_TABLES_POOL_PAGES)
+        .filter(|&i| {
+            let p = (info.pml4_phys + i * 4096) as usize;
+            ram.0[p..p + 4096].iter().any(|&b| b != 0)
+        })
+        .count();
+    assert!(used < 8, "{used} table pages in use");
+    let last = (info.pml4_phys + (M1_PAGE_TABLES_POOL_PAGES - 1) * 4096) as usize;
+    assert!(ram.0[last..last + 4096].iter().all(|&b| b == 0));
+    // The M0 layout of the same kernel has no window.
+    let mut ram0 = Ram::new(0);
+    let e0 = load(VALID, &mut ram0, &cfg()).unwrap();
+    assert!(walk(&ram0, e0.cr3, M1_PAGE_TABLES_BASE).is_none());
 }
 
 #[test]

@@ -85,7 +85,9 @@ pub fn exit(value: u32) -> ! {
 
 // VMSAVE host state, VMLOAD+VMRUN+VMSAVE the guest, restore the host.
 // sysv64: RDI = 14 guest GPRs (rbx, rcx, rdx, rsi, rdi, rbp, r8..r15),
-// RSI = VMCB physical address, RDX = host save area physical address.
+// RSI = VMCB physical address, RDX = host save area physical address,
+// RCX != 0: run with host IF=1 (a host interrupt then exits the guest,
+// and is taken by the host IDT between STGI and CLI).
 // VMRUN restores RSP and RAX on #VMEXIT; the VMCB address is reloaded from
 // the stack anyway. SVM instructions are emitted as bytes.
 global_asm!(
@@ -101,6 +103,10 @@ global_asm!(
     "push rdx",
     "push rsi",
     ".byte 0x0f, 0x01, 0xdd", // CLGI
+    "test rcx, rcx",
+    "jz .Lprobe_no_irq",
+    "sti", // GIF=0: nothing is taken before VMRUN
+    ".Lprobe_no_irq:",
     "mov rax, rdx",
     ".byte 0x0f, 0x01, 0xdb", // VMSAVE (host)
     "mov rax, rsi",
@@ -142,7 +148,8 @@ global_asm!(
     "pop rax",
     "pop rax",
     ".byte 0x0f, 0x01, 0xda", // VMLOAD (host)
-    ".byte 0x0f, 0x01, 0xdc", // STGI
+    ".byte 0x0f, 0x01, 0xdc", // STGI: a pending host interrupt is taken here
+    "cli",
     "pop rdi",
     "pop r15",
     "pop r14",
@@ -154,7 +161,7 @@ global_asm!(
 );
 
 unsafe extern "sysv64" {
-    fn nanox_svm_probe_vmrun(gprs: *mut u64, vmcb: u64, host_save: u64);
+    fn nanox_svm_probe_vmrun(gprs: *mut u64, vmcb: u64, host_save: u64, host_irq: u64);
 }
 
 /// # Safety
@@ -162,12 +169,118 @@ unsafe extern "sysv64" {
 /// passed the consistency checks or is deliberately invalid (the processor
 /// then exits with VMEXIT_INVALID without entering the guest), EFER.SVME
 /// and VM_HSAVE_PA are set, and the nested page tables map only probe-owned
-/// frames, so the guest cannot reach host memory.
-pub unsafe fn vmrun(gprs: &mut [u64; 14], vmcb: *mut [u8; 4096], host_save: u64) {
+/// frames, so the guest cannot reach host memory. With `host_irq`, the
+/// probe's host IDT ([`HostTick::start`]) must be loaded.
+pub unsafe fn vmrun(gprs: &mut [u64; 14], vmcb: *mut [u8; 4096], host_save: u64, host_irq: bool) {
     // SAFETY: per the contract above; the routine restores every register
     // the sysv64 ABI requires and writes only `gprs`, the VMCB and the two
     // save areas.
-    unsafe { nanox_svm_probe_vmrun(gprs.as_mut_ptr(), vmcb as u64, host_save) }
+    unsafe {
+        nanox_svm_probe_vmrun(
+            gprs.as_mut_ptr(),
+            vmcb as u64,
+            host_save,
+            u64::from(host_irq),
+        )
+    }
+}
+
+// Host interrupt handler for every vector: EOI to the local APIC (address
+// patched in by HostTick::start) and return. Only interrupts are expected;
+// the probe raises no exceptions.
+global_asm!(
+    ".global nanox_probe_host_irq",
+    "nanox_probe_host_irq:",
+    "push rax",
+    "mov rax, [rip + nanox_probe_host_eoi]",
+    "mov dword ptr [rax], 0",
+    "pop rax",
+    "iretq",
+    ".data",
+    ".balign 8",
+    ".global nanox_probe_host_eoi",
+    "nanox_probe_host_eoi:",
+    ".quad 0",
+    ".text",
+);
+
+unsafe extern "C" {
+    static nanox_probe_host_irq: u8;
+    static mut nanox_probe_host_eoi: u64;
+}
+
+const HOST_TICK_VECTOR: u32 = 0xF0;
+
+/// A periodic host timer so a guest spinning without exits still leaves
+/// the guest (INTR exit) about every `period` of host time: the probe's
+/// own IDT (all vectors: EOI and return), the host local APIC timer, the
+/// 8259s masked.
+pub struct HostTick {
+    idt: [u64; 512],
+    apic: u64,
+}
+
+fn apic_write(base: u64, off: u64, v: u32) {
+    // SAFETY: the host local APIC page (IA32_APIC_BASE), identity-mapped
+    // uncached by OVMF; 32-bit aligned register access.
+    unsafe { ((base + off) as *mut u32).write_volatile(v) }
+}
+
+impl Default for HostTick {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HostTick {
+    pub const fn new() -> Self {
+        Self {
+            idt: [0; 512],
+            apic: 0,
+        }
+    }
+
+    /// Loads the probe IDT and starts the host APIC timer with `count`
+    /// ticks at bus/16.
+    pub fn start(&mut self, count: u32) {
+        self.apic = rdmsr(0x1B) & 0x000F_FFFF_FFFF_F000;
+        // SAFETY: a plain store to the probe's own handler data, before any
+        // interrupt can use it (IF=0).
+        unsafe { (&raw mut nanox_probe_host_eoi).write_volatile(self.apic + 0xB0) };
+        let handler = (&raw const nanox_probe_host_irq) as u64;
+        let cs: u16;
+        // SAFETY: reads the current code selector.
+        unsafe { asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack)) };
+        for v in 0..256 {
+            // 64-bit interrupt gate, present, DPL 0.
+            self.idt[2 * v] = (handler & 0xFFFF)
+                | u64::from(cs) << 16
+                | 0x8E00u64 << 32
+                | (handler >> 16 & 0xFFFF) << 48;
+            self.idt[2 * v + 1] = handler >> 32;
+        }
+        let mut idtr = [0u8; 10];
+        idtr[..2].copy_from_slice(&(4095u16).to_le_bytes());
+        idtr[2..].copy_from_slice(&(self.idt.as_ptr() as u64).to_le_bytes());
+        // SAFETY: the IDT lives in `self`, which the caller keeps alive and
+        // in place while host interrupts may occur; interrupts are off.
+        unsafe { asm!("lidt [{}]", in(reg) idtr.as_ptr(), options(nostack)) };
+        outb(0x21, 0xFF);
+        outb(0xA1, 0xFF);
+        apic_write(self.apic, 0xF0, 0x1FF); // SVR: enabled, spurious 0xFF
+        apic_write(self.apic, 0x3E0, 3); // divide by 16
+        apic_write(self.apic, 0x320, HOST_TICK_VECTOR | 1 << 17); // periodic
+        apic_write(self.apic, 0x380, count);
+    }
+
+    /// Stops the host timer; the probe IDT stays loaded (harmless with
+    /// IF=0).
+    pub fn stop(&mut self) {
+        if self.apic != 0 {
+            apic_write(self.apic, 0x320, HOST_TICK_VECTOR | 1 << 16);
+            apic_write(self.apic, 0x380, 0);
+        }
+    }
 }
 
 /// COM1, polled.

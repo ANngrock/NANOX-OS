@@ -188,6 +188,8 @@ pub enum Step {
     /// Sets RFLAGS.IF; the next step is in the interrupt shadow.
     Sti,
     Cli,
+    /// PAUSE; must be intercepted.
+    Pause,
 }
 
 impl Step {
@@ -200,6 +202,7 @@ impl Step {
             | Step::MsrEmulated { .. } => 2,
             Step::Vmmcall => 3,
             Step::Hlt | Step::Sti | Step::Cli => 1,
+            Step::Pause => 2,
             Step::Load { .. } | Step::Store { .. } => 3,
             Step::Tick | Step::SpinForever | Step::TripleFault => 2,
             Step::Mmio { len, .. } => u64::from(len),
@@ -538,6 +541,15 @@ impl SvmCpu for FakeCpu {
                     };
                     vmcb.write_u64(hw_svm::vmcb::save::RFLAGS, f);
                     self.pos += 1;
+                }
+                Step::Pause => {
+                    let m = vmcb.read_u32(ctl::INTERCEPT_MISC1);
+                    if m & hw_svm::vmcb::misc1::PAUSE == 0 {
+                        self.violations.push("PAUSE not intercepted".into());
+                    }
+                    Self::exit(vmcb, code::PAUSE, 0, 0, next);
+                    self.pending = pend(true, false);
+                    return;
                 }
                 Step::MsrEmulated { msr, write, value } => {
                     gprs.rcx = u64::from(msr);

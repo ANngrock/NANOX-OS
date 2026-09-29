@@ -29,6 +29,98 @@ pub enum Operation {
     Load { reg: Reg, size: u8, dest: u8 },
     /// Write the low `size` bytes of `src`.
     Store { src: Source, size: u8 },
+    /// Read `size` bytes, combine with `src`, write back: what a compiler
+    /// may emit for a volatile read followed by a dependent volatile write
+    /// (found booting NANOX M1: `or dword [apic+0xF0], 0x1FF`).
+    Rmw { alu: Alu, src: Source, size: u8 },
+    /// CMP or TEST: read `size` bytes and set flags only. With `mem_first`
+    /// the memory operand is the left one (CMP m, x computes m - x);
+    /// otherwise CMP r, m computes r - m.
+    Flags {
+        op: FlagOp,
+        src: Source,
+        size: u8,
+        mem_first: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlagOp {
+    Cmp,
+    Test,
+}
+
+const CF: u64 = 1;
+const PF: u64 = 1 << 2;
+const AF: u64 = 1 << 4;
+const ZF: u64 = 1 << 6;
+const SF: u64 = 1 << 7;
+const OF: u64 = 1 << 11;
+
+fn mask(size: u8) -> u64 {
+    if size >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * size)) - 1
+    }
+}
+
+/// Merges the arithmetic flags of a `size`-byte `result` into `rflags`.
+fn arith_flags(result: u64, size: u8, rflags: u64, cf: bool, of: bool, af: bool) -> u64 {
+    let mut f = rflags & !(CF | PF | AF | ZF | SF | OF);
+    let top = 8 * u32::from(size.min(8)) - 1;
+    f |= (u64::from(cf) * CF) | (u64::from(of) * OF) | (u64::from(af) * AF);
+    if result == 0 {
+        f |= ZF;
+    }
+    if result >> top & 1 != 0 {
+        f |= SF;
+    }
+    if (result as u8).count_ones().is_multiple_of(2) {
+        f |= PF;
+    }
+    f
+}
+
+impl FlagOp {
+    /// RFLAGS after `a OP b` on `size` bytes (a - b for CMP, a & b for TEST).
+    pub fn flags(self, a: u64, b: u64, size: u8, rflags: u64) -> u64 {
+        let m = mask(size);
+        let (a, b) = (a & m, b & m);
+        match self {
+            FlagOp::Test => arith_flags(a & b, size, rflags, false, false, false),
+            FlagOp::Cmp => {
+                let r = a.wrapping_sub(b) & m;
+                let top = 8 * u32::from(size.min(8)) - 1;
+                let of = ((a ^ b) & (a ^ r)) >> top & 1 != 0;
+                let af = (a ^ b ^ r) & 0x10 != 0;
+                arith_flags(r, size, rflags, a < b, of, af)
+            }
+        }
+    }
+}
+
+/// The logical operations of a read-modify-write. ADD/SUB are refused: their
+/// flags would need a full ALU model and nothing observed uses them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alu {
+    Or,
+    And,
+    Xor,
+}
+
+impl Alu {
+    /// Result masked to `size` bytes, and the RFLAGS bits a logical
+    /// operation defines (CF = OF = 0, AF cleared, ZF/SF/PF from the result)
+    /// merged into `rflags`.
+    pub fn apply(self, a: u64, b: u64, size: u8, rflags: u64) -> (u64, u64) {
+        let r = match self {
+            Alu::Or => a | b,
+            Alu::And => a & b,
+            Alu::Xor => a ^ b,
+        } & mask(size);
+        (r, arith_flags(r, size, rflags, false, false, false))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +252,92 @@ pub fn decode(bytes: &[u8]) -> Result<Insn, DecodeError> {
             size: wide,
             dest: wide,
         },
+        // OR/AND/XOR r/m, reg.
+        0x08 | 0x09 | 0x20 | 0x21 | 0x30 | 0x31 => {
+            let size = if opcode & 1 == 0 { 1 } else { wide };
+            let alu = match opcode & 0xF8 {
+                0x08 => Alu::Or,
+                0x20 => Alu::And,
+                _ => Alu::Xor,
+            };
+            Operation::Rmw {
+                alu,
+                src: Source::Reg(reg(size)),
+                size,
+            }
+        }
+        // CMP r/m, reg (38/39) and CMP reg, r/m (3A/3B); TEST r/m, reg.
+        0x38 | 0x39 | 0x3A | 0x3B | 0x84 | 0x85 => {
+            let size = if opcode & 1 == 0 { 1 } else { wide };
+            Operation::Flags {
+                op: if opcode >= 0x84 {
+                    FlagOp::Test
+                } else {
+                    FlagOp::Cmp
+                },
+                src: Source::Reg(reg(size)),
+                size,
+                mem_first: opcode & 2 == 0,
+            }
+        }
+        // TEST r/m, imm (F6 /0, F7 /0).
+        0xF6 | 0xF7 if reg_field == 0 => {
+            let (size, n) = match (opcode, wide) {
+                (0xF6, _) => (1, 1),
+                (_, 2) => (2, 2),
+                _ => (wide, 4),
+            };
+            let raw = le(bytes, i, n)?;
+            i += n;
+            let imm = if n == 4 {
+                raw as u32 as i32 as i64 as u64
+            } else {
+                raw
+            };
+            Operation::Flags {
+                op: FlagOp::Test,
+                src: Source::Imm(imm),
+                size,
+                mem_first: true,
+            }
+        }
+        // Group 1 with an immediate: /1 OR, /4 AND, /6 XOR, /7 CMP.
+        0x80 | 0x81 | 0x83 => {
+            let alu = match reg_field {
+                1 => Some(Alu::Or),
+                4 => Some(Alu::And),
+                6 => Some(Alu::Xor),
+                7 => None,
+                _ => return Err(DecodeError::Unsupported),
+            };
+            let (size, n) = match opcode {
+                0x80 => (1, 1),
+                0x83 => (wide, 1),
+                _ if wide == 2 => (2, 2),
+                _ => (wide, 4),
+            };
+            let raw = le(bytes, i, n)?;
+            i += n;
+            // imm8 (83) and imm32 (81 with REX.W) are sign-extended.
+            let imm = match n {
+                1 if opcode == 0x83 => raw as u8 as i8 as i64 as u64,
+                4 => raw as u32 as i32 as i64 as u64,
+                _ => raw,
+            };
+            match alu {
+                Some(alu) => Operation::Rmw {
+                    alu,
+                    src: Source::Imm(imm),
+                    size,
+                },
+                None => Operation::Flags {
+                    op: FlagOp::Cmp,
+                    src: Source::Imm(imm),
+                    size,
+                    mem_first: true,
+                },
+            }
+        }
         0xC6 | 0xC7 if reg_field != 0 => return Err(DecodeError::Unsupported),
         0xC6 => {
             let imm = le(bytes, i, 1)?;

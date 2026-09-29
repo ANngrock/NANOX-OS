@@ -136,6 +136,175 @@ fn decodes_the_mmio_forms() {
 }
 
 #[test]
+fn decodes_logical_read_modify_write() {
+    use vmm_devices::decode::{Alu, Insn};
+    let rmw = |alu, src, size| Operation::Rmw { alu, src, size };
+    let cases: &[(&[u8], Operation, u8)] = &[
+        // or dword [0xffffffff930010f0], 0x1ff — emitted in NANOX M1 for
+        // `write_apic(SVR, (read_apic(SVR) & !0x1ff) | 0x1ff)`.
+        (
+            &[0x81, 0x0C, 0x25, 0xF0, 0x10, 0x00, 0x93, 0xFF, 0x01, 0, 0],
+            rmw(Alu::Or, Source::Imm(0x1FF), 4),
+            11,
+        ),
+        // or dword [rax+0x10], 1
+        (
+            &[0x83, 0x48, 0x10, 0x01],
+            rmw(Alu::Or, Source::Imm(1), 4),
+            4,
+        ),
+        // and dword [rax+0x10], -2  (imm8 sign-extended)
+        (
+            &[0x83, 0x60, 0x10, 0xFE],
+            rmw(Alu::And, Source::Imm(0xFFFF_FFFF_FFFF_FFFE), 4),
+            4,
+        ),
+        // or [rax], ecx
+        (&[0x09, 0x08], rmw(Alu::Or, Source::Reg(r(1)), 4), 2),
+        // and [rax], dl
+        (&[0x20, 0x10], rmw(Alu::And, Source::Reg(r(2)), 1), 2),
+        // xor word [rax], 0x1234
+        (
+            &[0x66, 0x81, 0x30, 0x34, 0x12],
+            rmw(Alu::Xor, Source::Imm(0x1234), 2),
+            5,
+        ),
+        // or byte [rax], 1
+        (&[0x80, 0x08, 0x01], rmw(Alu::Or, Source::Imm(1), 1), 3),
+    ];
+    for (bytes, op, len) in cases {
+        assert_eq!(
+            decode(bytes),
+            Ok(Insn { op: *op, len: *len }),
+            "{bytes:02x?}"
+        );
+        assert_eq!(
+            decode(&bytes[..bytes.len() - 1]),
+            Err(DecodeError::Truncated),
+            "{bytes:02x?}"
+        );
+    }
+    // ADD (/0) and SUB (/5) are refused.
+    assert_eq!(
+        decode(&[0x81, 0x00, 1, 0, 0, 0]),
+        Err(DecodeError::Unsupported)
+    );
+    assert_eq!(decode(&[0x83, 0x28, 0x01]), Err(DecodeError::Unsupported));
+}
+
+#[test]
+fn logical_operations_set_flags_like_the_processor() {
+    use vmm_devices::decode::Alu;
+    const CF: u64 = 1;
+    const PF: u64 = 1 << 2;
+    const ZF: u64 = 1 << 6;
+    const SF: u64 = 1 << 7;
+    const OF: u64 = 1 << 11;
+    let all = CF | PF | ZF | SF | OF | 1 << 9 | 2; // IF and bit 1 survive
+    assert_eq!(Alu::Or.apply(0xFF, 0x100, 4, all), (0x1FF, PF | 1 << 9 | 2));
+    assert_eq!(Alu::And.apply(1, 2, 4, 2), (0, ZF | PF | 2));
+    assert_eq!(Alu::Xor.apply(0x80, 0, 1, 2), (0x80, SF | 2));
+    assert_eq!(
+        Alu::Or.apply(0x1_0000_0001, 0, 4, 2),
+        (1, 2),
+        "masked to 32 bits"
+    );
+    assert_eq!(
+        Alu::Or.apply(1 << 63, 0, 8, 2),
+        (1 << 63, SF | PF | 2),
+        "64-bit sign"
+    );
+}
+
+#[test]
+fn decodes_compare_and_test() {
+    use vmm_devices::decode::{FlagOp, Insn};
+    let f = |op, src, size, mem_first| Operation::Flags {
+        op,
+        src,
+        size,
+        mem_first,
+    };
+    let cases: &[(&[u8], Operation, u8)] = &[
+        // cmp dword [rbp+0x390], 0 — NANOX M1 polling the APIC current count.
+        (
+            &[0x83, 0xBD, 0x90, 0x03, 0, 0, 0x00],
+            f(FlagOp::Cmp, Source::Imm(0), 4, true),
+            7,
+        ),
+        // cmp [rax], ecx / cmp ecx, [rax]
+        (&[0x39, 0x08], f(FlagOp::Cmp, Source::Reg(r(1)), 4, true), 2),
+        (
+            &[0x3B, 0x08],
+            f(FlagOp::Cmp, Source::Reg(r(1)), 4, false),
+            2,
+        ),
+        // cmp dword [rax], 0x12345678
+        (
+            &[0x81, 0x38, 0x78, 0x56, 0x34, 0x12],
+            f(FlagOp::Cmp, Source::Imm(0x1234_5678), 4, true),
+            6,
+        ),
+        // test [rax], ecx ; test byte [rax], 1 ; test dword [rax], 0x10000
+        (
+            &[0x85, 0x08],
+            f(FlagOp::Test, Source::Reg(r(1)), 4, true),
+            2,
+        ),
+        (
+            &[0xF6, 0x00, 0x01],
+            f(FlagOp::Test, Source::Imm(1), 1, true),
+            3,
+        ),
+        (
+            &[0xF7, 0x00, 0, 0, 1, 0],
+            f(FlagOp::Test, Source::Imm(0x1_0000), 4, true),
+            6,
+        ),
+    ];
+    for (bytes, op, len) in cases {
+        assert_eq!(
+            decode(bytes),
+            Ok(Insn { op: *op, len: *len }),
+            "{bytes:02x?}"
+        );
+        assert_eq!(
+            decode(&bytes[..bytes.len() - 1]),
+            Err(DecodeError::Truncated),
+            "{bytes:02x?}"
+        );
+    }
+    // NOT/NEG (F7 /2, /3) are not tests.
+    assert_eq!(decode(&[0xF7, 0x10]), Err(DecodeError::Unsupported));
+}
+
+#[test]
+fn compare_flags_follow_subtraction() {
+    use vmm_devices::decode::FlagOp;
+    const CF: u64 = 1;
+    const PF: u64 = 1 << 2;
+    const AF: u64 = 1 << 4;
+    const ZF: u64 = 1 << 6;
+    const SF: u64 = 1 << 7;
+    const OF: u64 = 1 << 11;
+    let base = 2 | 1 << 9;
+    // 7 - 7 = 0
+    assert_eq!(FlagOp::Cmp.flags(7, 7, 4, base), base | ZF | PF);
+    // 5 - 7 = -2: borrow, negative, AF from bit 3
+    assert_eq!(FlagOp::Cmp.flags(5, 7, 4, base), base | CF | SF | AF);
+    // 0x8000_0000 - 1: signed overflow in 32 bits
+    assert_eq!(
+        FlagOp::Cmp.flags(0x8000_0000, 1, 4, base),
+        base | OF | PF | AF
+    );
+    // Upper bits beyond the operand size are ignored.
+    assert_eq!(FlagOp::Cmp.flags(0x1_0000_0003, 3, 4, base), base | ZF | PF);
+    // TEST clears CF/OF even if set before.
+    assert_eq!(FlagOp::Test.flags(0x10, 0x10, 4, base | CF | OF), base);
+    assert_eq!(FlagOp::Test.flags(0x10, 0x01, 4, base), base | ZF | PF);
+}
+
+#[test]
 fn refuses_what_it_does_not_emulate() {
     assert_eq!(decode(&[0x8B, 0xC0]), Err(DecodeError::RegisterOperand));
     assert_eq!(decode(&[0x0F, 0x10, 0x00]), Err(DecodeError::Unsupported)); // movups
@@ -145,7 +314,7 @@ fn refuses_what_it_does_not_emulate() {
         decode(&[0xC7, 0x08, 0, 0, 0, 0]),
         Err(DecodeError::Unsupported)
     ); // C7 /1
-    assert_eq!(decode(&[0x01, 0x08]), Err(DecodeError::Unsupported)); // add
+    assert_eq!(decode(&[0x01, 0x08]), Err(DecodeError::Unsupported)); // add r/m, reg
     assert_eq!(decode(&[0x66; 16]), Err(DecodeError::TooLong));
     assert_eq!(decode(&[]), Err(DecodeError::Truncated));
 }

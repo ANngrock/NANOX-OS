@@ -108,6 +108,30 @@ fn apic_mmio_is_emulated_from_guest_memory_and_from_decode_assists() {
     }
 }
 
+/// A read-modify-write of an APIC register (what NANOX M1's compiled SVR
+/// update is): the register is read, combined, written back, and the
+/// guest's flags follow the result.
+#[test]
+fn apic_read_modify_write_is_emulated() {
+    let mut rig = Rig::new(&[
+        // or dword [0xffffffff930010f0], 0x100  (SVR: 0xFF -> 0x1FF)
+        mmio(
+            APIC + 0xF0,
+            &[0x81, 0x0C, 0x25, 0xF0, 0x10, 0x00, 0x93, 0x00, 0x01, 0, 0],
+            true,
+        ),
+        load(3, 0xF0, true),
+        debug_exit(),
+    ]);
+    let mut serial = [0u8; 4];
+    let mut v = Vcpu::new(rig.cfg, &mut serial);
+    assert_eq!(run(&mut rig, &mut v).verdict, PASS);
+    assert_eq!(rig.gprs.rbx, 0x1FF);
+    let zf = 1 << 6;
+    assert_eq!(rig.vmcb().rflags() & zf, 0, "non-zero result");
+    rig.cpu.assert_clean();
+}
+
 #[test]
 fn mmio_the_vmm_cannot_decode_is_reported() {
     // No decode assists and the code is not in guest memory.
@@ -200,6 +224,54 @@ fn no_interrupt_is_injected_in_the_sti_shadow() {
     let mut v = Vcpu::new(rig.cfg, &mut serial);
     assert_eq!(run(&mut rig, &mut v).verdict, PASS);
     assert_eq!(rig.cpu.interrupts, vec![(0x40, rig.cpu.rip_of(6))]);
+    rig.cpu.assert_clean();
+}
+
+/// A guest spinning on PAUSE (no I/O, no HLT) still advances virtual time
+/// and takes its timer interrupt.
+#[test]
+fn pause_spin_advances_time_and_takes_the_timer() {
+    let mut script = vec![
+        store(0xF0, 0x1FF, true),
+        store(0x320, 0x40, true),
+        store(0x380, 1500, true), // 3 us at bus/2
+        Step::Sti,
+    ];
+    script.extend([Step::Pause; 6]);
+    script.push(store(0xB0, 0, true));
+    script.push(debug_exit());
+    let mut rig = Rig::new(&script);
+    let mut serial = [0u8; 4];
+    let mut v = Vcpu::new(rig.cfg, &mut serial);
+    let o = run(&mut rig, &mut v);
+    assert_eq!(o.verdict, PASS);
+    assert_eq!(o.irqs, 1);
+    // Set at 3 us, due at 6 us: after the third PAUSE exit.
+    assert_eq!(rig.cpu.interrupts, vec![(0x40, rig.cpu.rip_of(7))]);
+    rig.cpu.assert_clean();
+}
+
+/// A guest spinning without exits only leaves on host interrupts; each is
+/// charged `intr_exit_ns`, so its timer still fires.
+#[test]
+fn host_interrupt_exits_carry_their_own_time_charge() {
+    let mut rig = Rig::new(&[
+        store(0xF0, 0x1FF, true),
+        store(0x320, 0x40, true),
+        store(0x380, 500_000, true), // 1 ms at bus/2
+        Step::Sti,
+        Step::Tick, // host interrupts while the guest spins
+        Step::Tick,
+        store(0xB0, 0, true),
+        debug_exit(),
+    ]);
+    rig.cfg.intr_exit_ns = 600_000;
+    let mut serial = [0u8; 4];
+    let mut v = Vcpu::new(rig.cfg, &mut serial);
+    let o = run(&mut rig, &mut v);
+    assert_eq!(o.verdict, PASS);
+    assert_eq!(o.irqs, 1, "1.2 ms of host ticks cover the 1 ms timer");
+    assert_eq!(o.virtual_ns, 5 * 1_000 + 2 * 600_000);
     rig.cpu.assert_clean();
 }
 

@@ -13,6 +13,7 @@ pub mod code {
     /// Virtual interrupt window (V_IRQ became deliverable).
     pub const VINTR: u64 = 0x64;
     pub const CPUID: u64 = 0x72;
+    pub const PAUSE: u64 = 0x77;
     pub const HLT: u64 = 0x78;
     pub const IOIO: u64 = 0x7B;
     pub const MSR: u64 = 0x7C;
@@ -58,6 +59,9 @@ pub enum Exit {
     /// The guest can take an interrupt now (window requested by the VMM).
     Vintr,
     Cpuid,
+    /// PAUSE (spin-wait hint): intercepted so busy-waiting guests advance
+    /// virtual time.
+    Pause,
     Hlt,
     Io(IoExit),
     /// RDMSR/WRMSR; the MSR is in ECX.
@@ -94,6 +98,7 @@ impl Exit {
             code::INIT => Exit::Init,
             code::VINTR => Exit::Vintr,
             code::CPUID => Exit::Cpuid,
+            code::PAUSE => Exit::Pause,
             code::HLT => Exit::Hlt,
             code::IOIO => {
                 let size = match (i1 >> 4) & 7 {

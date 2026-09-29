@@ -3,7 +3,11 @@
 
 Run inside `nix develop` (pinned QEMU, NANOX_OVMF_CODE/NANOX_OVMF_VARS):
 
-    python3 tools/svm-probe/run.py [--no-build]
+    python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH]
+
+With --m1-kernel, an M1 kernel ELF (built from codex/m1-m8-continuation)
+is also handed over (fw_cfg opt/nanox/kernel-m1.elf) and booted with the M1
+handoff in its nine test scenarios.
 
 Profiles:
   svm     qemu64 with SVM, nested paging, NRIP save: every case must pass
@@ -54,11 +58,23 @@ PROFILES = [
     ("milan", f"EPYC-Milan,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PASS"),
     ("no-svm", "qemu64,-svm", 35, "NANOX:SVM-PROBE:UNAVAILABLE NotSupported"),
 ]
-TIMEOUT_S = 300
+TIMEOUT_S = 900
 
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def option(name):
+    """Value of `--name VALUE` on the command line, or None."""
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
+M1_KERNEL = option("--m1-kernel")
 
 
 def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path):
@@ -88,6 +104,9 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path):
         "-drive", f"format=raw,file=fat:rw:{d / 'esp'}",
         "-fw_cfg", f"name=opt/nanox/kernel.elf,file={KERNEL}",
     ]
+    # The M1 scenarios are long under TCG: run them in one SVM profile.
+    if M1_KERNEL and name == "svm":
+        argv += ["-fw_cfg", f"name=opt/nanox/kernel-m1.elf,file={M1_KERNEL}"]
     (d / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
     started = time.monotonic()
     try:
@@ -169,6 +188,8 @@ def main() -> int:
     summary = {
         "efi_sha256": sha256(EFI),
         "kernel_elf_sha256": kernel_sha,
+        "m1_kernel": M1_KERNEL,
+        "m1_kernel_sha256": sha256(Path(M1_KERNEL)) if M1_KERNEL else None,
         "ovmf_code_sha256": sha256(code),
         "ovmf_vars_sha256": sha256(vars_src),
         "qemu": qemu,

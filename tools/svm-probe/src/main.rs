@@ -48,6 +48,8 @@ const POOL_PAGES: usize = FIXED_PAGES + FRAME_PAGES;
 static mut POOL: [u8; (POOL_PAGES + 1) * PAGE] = [0; (POOL_PAGES + 1) * PAGE];
 /// The candidate kernel ELF from fw_cfg.
 static mut ELF: [u8; 1 << 20] = [0; 1 << 20];
+/// Serial output of a kernel guest (M1 trace scenarios print ~20 KiB).
+static mut KERNEL_SERIAL: [u8; 64 * 1024] = [0; 64 * 1024];
 const KERNEL_RAM: u64 = 4 << 20;
 const KERNEL_RAM_PAGES: usize = (KERNEL_RAM / PAGE_SIZE) as usize;
 
@@ -220,6 +222,8 @@ enum GuestMap {
 struct Cpu {
     host_save: u64,
     ram: GuestMap,
+    /// Run the guest with host IF=1 (the host tick is running).
+    host_irq: bool,
 }
 
 impl SvmCpu for Cpu {
@@ -250,7 +254,7 @@ impl SvmCpu for Cpu {
         // SAFETY: the VMCB and host save area are probe-owned pages, SVM
         // and VM_HSAVE_PA were enabled in `efi_main`, and every guest's
         // nested tables map only frames of the probe's frame region.
-        unsafe { hw::vmrun(&mut r, vmcb.as_mut_ptr(), self.host_save) };
+        unsafe { hw::vmrun(&mut r, vmcb.as_mut_ptr(), self.host_save, self.host_irq) };
         *g = Gprs {
             rbx: r[0],
             rcx: r[1],
@@ -299,6 +303,7 @@ struct Env {
     nrips: bool,
     flush_by_asid: bool,
     failures: u32,
+    host_tick: hw::HostTick,
 }
 
 impl Env {
@@ -522,13 +527,59 @@ fn has(haystack: &[u8], needle: &[u8]) -> bool {
 type KernelExpect = fn(&Outcome, &[u8]) -> bool;
 type Corrupt = fn(&mut GuestRam<'_>, &guest_boot::Entry);
 
-/// Boots `elf` as a guest with the M0 handoff built by `guest-boot`.
+/// How a kernel guest is booted.
+#[derive(Clone, Copy)]
+struct Boot {
+    test: bool,
+    epoch: u64,
+    protocol: guest_boot::Protocol,
+    /// Virtual time per exit.
+    quantum_ns: u64,
+    max_exits: u64,
+    /// Run a ~1 ms host timer so a guest spinning without exits still
+    /// sees time pass (each host interrupt exit counts as 1 ms). Makes the
+    /// run depend on host timing.
+    host_tick: bool,
+}
+
+/// Host APIC timer count at bus/16 for ~1 ms under QEMU (1 GHz APIC bus).
+const HOST_TICK_COUNT: u32 = 62_500;
+const HOST_TICK_NS: u64 = 1_000_000;
+
+const fn m0(test: bool, epoch: u64) -> Boot {
+    Boot {
+        test,
+        epoch,
+        protocol: guest_boot::Protocol::M0,
+        quantum_ns: 1_000,
+        max_exits: 100_000,
+        host_tick: false,
+    }
+}
+
+/// M1 calibrates against 10 ms and verifies over ten 50 ms PIT windows,
+/// polled with one exit per read, and its preemption threads spin on
+/// PAUSE: 50 us per exit keeps a run to ~15k exits under TCG while the
+/// calibration still resolves the APIC rate to ~0.5%.
+const fn m1(test: bool, epoch: u64) -> Boot {
+    Boot {
+        test,
+        epoch,
+        protocol: guest_boot::Protocol::M1,
+        quantum_ns: 50_000,
+        max_exits: 3_000_000,
+        // The preemption test's observer thread spins on plain loads.
+        host_tick: true,
+    }
+}
+
+/// Boots `elf` as a guest with the handoff built by `guest-boot`.
 fn kernel_case(
     env: &mut Env,
     page: &mut [u8; 4096],
     name: &str,
     elf: &[u8],
-    boot: (bool, u64),
+    boot: Boot,
     corrupt: Option<Corrupt>,
     expect: KernelExpect,
 ) {
@@ -553,8 +604,9 @@ fn kernel_case(
     .expect("map guest RAM");
     let cfg = guest_boot::Config {
         ram_bytes: KERNEL_RAM,
-        test_profile: boot.0,
-        boot_epoch: boot.1,
+        test_profile: boot.test,
+        boot_epoch: boot.epoch,
+        protocol: boot.protocol,
     };
     let mut ram = GuestRam {
         phys: &mut env.phys,
@@ -570,10 +622,19 @@ fn kernel_case(
     }
     let mut vcfg = VmConfig::new(1, env.msrpm, env.iopm, npt.root(), env.nrips);
     vcfg.flush_by_asid = env.flush_by_asid;
-    vcfg.max_exits = 100_000;
+    vcfg.max_exits = boot.max_exits;
+    vcfg.exit_quantum_ns = boot.quantum_ns;
+    vcfg.intr_exit_ns = if boot.host_tick {
+        HOST_TICK_NS
+    } else {
+        boot.quantum_ns
+    };
     vcfg.max_time_us = u64::MAX;
-    let mut serial = [0u8; 1024];
-    let mut vcpu = Vcpu::new(vcfg, &mut serial);
+    let serial_buf: *mut [u8; 64 * 1024] = &raw mut KERNEL_SERIAL;
+    // SAFETY: a static of the probe; each kernel case borrows it once and
+    // the borrow ends with the case (cases run one after another).
+    let serial = unsafe { &mut *serial_buf };
+    let mut vcpu = Vcpu::new(vcfg, serial);
     {
         let mut v = Vmcb::new(page);
         v.setup_long_mode(entry.rip, entry.cr3, entry.rsp);
@@ -583,10 +644,32 @@ fn kernel_case(
         rdi: entry.rdi,
         ..Gprs::default()
     };
+    if boot.host_tick {
+        env.host_tick.start(HOST_TICK_COUNT);
+        env.cpu.host_irq = true;
+    }
     let o = vcpu.run(&mut env.cpu, &mut NoClock, &mut Vmcb::wrap(page), &mut gprs);
+    env.cpu.host_irq = false;
+    env.host_tick.stop();
     let ok = expect(&o, vcpu.serial());
     env.report("CASE", name, ok);
     print_outcome(&o, vcpu.serial());
+    if !ok {
+        let v = Vmcb::wrap(page);
+        let mut insn = [0u8; hw_svm::guest::MAX_INSN];
+        let n = hw_svm::guest::fetch(&mut env.cpu, &v, &mut insn);
+        out!(
+            "NANOX:SVM-PROBE:STATE {name} rip={:#x} exit={:#x} info1={:#x} info2={:#x} insn=",
+            v.rip(),
+            v.exit_code(),
+            v.exit_info1(),
+            v.exit_info2()
+        );
+        for b in &insn[..n] {
+            out!("{b:02x}");
+        }
+        out!("\n");
+    }
 }
 
 /// Marks the transition reservation as kernel memory: the kernel's
@@ -610,18 +693,30 @@ fn kernel_cases(env: &mut Env, page: &mut [u8; 4096], elf: &[u8]) {
         value: 0x11,
         status: 35,
     };
-    kernel_case(env, page, "m0-pass", elf, (true, M0_EPOCH), None, |o, s| {
-        o.verdict == PASS && has(s, VALIDATED) && has(s, b"NANOX:TEST:PASS\n")
-    });
-    kernel_case(env, page, "m0-fail", elf, (true, u64::MAX), None, |o, s| {
-        o.verdict == FAIL35 && has(s, VALIDATED) && has(s, b"NANOX:TEST:FAIL:injected\n")
-    });
+    kernel_case(
+        env,
+        page,
+        "m0-pass",
+        elf,
+        m0(true, M0_EPOCH),
+        None,
+        |o, s| o.verdict == PASS && has(s, VALIDATED) && has(s, b"NANOX:TEST:PASS\n"),
+    );
+    kernel_case(
+        env,
+        page,
+        "m0-fail",
+        elf,
+        m0(true, u64::MAX),
+        None,
+        |o, s| o.verdict == FAIL35 && has(s, VALIDATED) && has(s, b"NANOX:TEST:FAIL:injected\n"),
+    );
     kernel_case(
         env,
         page,
         "m0-panic",
         elf,
-        (true, u64::MAX - 2),
+        m0(true, u64::MAX - 2),
         None,
         |o, s| o.verdict == FAIL35 && has(s, b"NANOX:KERNEL:PANIC:"),
     );
@@ -630,7 +725,7 @@ fn kernel_cases(env: &mut Env, page: &mut [u8; 4096], elf: &[u8]) {
         page,
         "m0-hang",
         elf,
-        (true, u64::MAX - 1),
+        m0(true, u64::MAX - 1),
         None,
         |o, s| o.verdict == Verdict::Halted && has(s, b"NANOX:TEST:HANG:injected\n"),
     );
@@ -639,7 +734,7 @@ fn kernel_cases(env: &mut Env, page: &mut [u8; 4096], elf: &[u8]) {
         page,
         "m0-normal-profile",
         elf,
-        (false, M0_EPOCH),
+        m0(false, M0_EPOCH),
         None,
         |o, s| {
             o.verdict == Verdict::Halted && has(s, b"NANOX:KERNEL:IDLE\n") && !has(s, b"NANOX:TEST")
@@ -650,9 +745,145 @@ fn kernel_cases(env: &mut Env, page: &mut [u8; 4096], elf: &[u8]) {
         page,
         "m0-bad-handoff",
         elf,
-        (true, M0_EPOCH),
+        m0(true, M0_EPOCH),
         Some(drop_transition),
         |o, s| o.verdict == FAIL35 && has(s, b"NANOX:KERNEL:BOOTINFO_ERROR:Ownership\n"),
+    );
+}
+
+/// Markers every M1 run that reaches the timer prints before its verdict
+/// (tools/xtask/src/runner.rs `expected` on codex/m1-m8-continuation).
+fn m1_foundations(s: &[u8]) -> bool {
+    [
+        &b"NANOX:KERNEL:TABLES_PASS"[..],
+        b"NANOX:KERNEL:PMM_PASS",
+        b"NANOX:KERNEL:VMM_PASS",
+        b"NANOX:KERNEL:VMM_PF_PASS",
+        b"NANOX:KERNEL:HEAP_GUARDS_PASS",
+        b"NANOX:KERNEL:HEAP_PASS",
+        b"NANOX:KERNEL:APIC_MMIO_MAP_PASS",
+    ]
+    .iter()
+    .all(|m| has(s, m))
+}
+
+fn m1_timer(s: &[u8]) -> bool {
+    m1_foundations(s) && has(s, b"NANOX:KERNEL:TIMER_PASS")
+}
+
+/// The M1 kernel's scenarios (epochs as in its xtask `Scenario::epoch`).
+fn m1_cases(env: &mut Env, page: &mut [u8; 4096], elf: &[u8]) {
+    const FAIL35: Verdict = Verdict::DebugExit {
+        value: 0x11,
+        status: 35,
+    };
+    kernel_case(
+        env,
+        page,
+        "m1-pass",
+        elf,
+        m1(true, M0_EPOCH),
+        None,
+        |o, s| {
+            o.verdict == PASS
+                && m1_timer(s)
+                && has(s, b"NANOX:KERNEL:VMM_IRQ_PASS")
+                && has(s, b"NANOX:TEST:PASS\n")
+        },
+    );
+    kernel_case(
+        env,
+        page,
+        "m1-fail",
+        elf,
+        m1(true, u64::MAX),
+        None,
+        |o, s| o.verdict == FAIL35 && m1_timer(s) && has(s, b"NANOX:TEST:FAIL:injected"),
+    );
+    kernel_case(
+        env,
+        page,
+        "m1-panic",
+        elf,
+        m1(true, u64::MAX - 2),
+        None,
+        |o, s| o.verdict == FAIL35 && m1_timer(s) && has(s, b"NANOX:KERNEL:PANIC:"),
+    );
+    kernel_case(
+        env,
+        page,
+        "m1-hang",
+        elf,
+        m1(true, u64::MAX - 1),
+        None,
+        |o, s| o.verdict == Verdict::Halted && m1_timer(s) && has(s, b"NANOX:TEST:HANG"),
+    );
+    kernel_case(
+        env,
+        page,
+        "m1-fault",
+        elf,
+        m1(true, u64::MAX - 3),
+        None,
+        |o, s| {
+            o.verdict == FAIL35
+                && m1_timer(s)
+                && has(s, b"NANOX:TEST:FAULT:inject-unexpected-page-fault")
+                && has(s, b"NANOX:KERNEL:PF_ERROR")
+        },
+    );
+    kernel_case(
+        env,
+        page,
+        "m1-timer-fail",
+        elf,
+        m1(true, u64::MAX - 4),
+        None,
+        |o, s| {
+            o.verdict == FAIL35
+                && m1_foundations(s)
+                && has(s, b"NANOX:KERNEL:TIMER_ERROR:IrqNotDelivered")
+                && !has(s, b"NANOX:KERNEL:TIMER_PASS")
+        },
+    );
+    kernel_case(
+        env,
+        page,
+        "m1-double-fault-ist",
+        elf,
+        m1(true, u64::MAX - 5),
+        None,
+        |o, s| {
+            o.verdict == PASS
+                && m1_timer(s)
+                && has(s, b"NANOX:TEST:DF:INJECT_DELIVERY_STACK_FAULT")
+                && has(s, b"NANOX:KERNEL:DOUBLE_FAULT_IST_PASS")
+        },
+    );
+    kernel_case(
+        env,
+        page,
+        "m1-trace-overflow",
+        elf,
+        m1(true, u64::MAX - 7),
+        None,
+        |o, s| {
+            o.verdict == FAIL35
+                && m1_timer(s)
+                && has(s, b"NANOX:KERNEL:TRACE_OVERFLOW count=128 queue_full=1")
+                && has(s, b"NANOX:TEST:FAIL:event-trace-overflow")
+        },
+    );
+    // Last: its observer thread spins on plain loads, so it depends on the
+    // host tick for time to pass.
+    kernel_case(
+        env,
+        page,
+        "m1-preemption",
+        elf,
+        m1(true, u64::MAX - 6),
+        None,
+        |o, s| o.verdict == PASS && m1_timer(s) && has(s, b"NANOX:KERNEL:PREEMPT_PASS"),
     );
 }
 
@@ -893,7 +1124,9 @@ pub extern "efiapi" fn efi_main(_image: *mut u8, _system: *mut u8) -> usize {
         cpu: Cpu {
             host_save: pa(1),
             ram: GuestMap::None,
+            host_irq: false,
         },
+        host_tick: hw::HostTick::new(),
         msrpm: pa(3),
         iopm: pa(5),
         nrips: caps.nrips,
@@ -914,6 +1147,14 @@ pub extern "efiapi" fn efi_main(_image: *mut u8, _system: *mut u8) -> usize {
             env.report("CASE", "m0-kernel-elf", false);
             out!(" fw_cfg={e}\n");
         }
+    }
+    // An M1 kernel is optional: the runner passes one when it has it.
+    match fwcfg::read_file("opt/nanox/kernel-m1.elf", buf) {
+        Ok(elf) => {
+            out!("NANOX:SVM-PROBE:KERNEL-M1 bytes={}\n", elf.len());
+            m1_cases(&mut env, vmcb, elf);
+        }
+        Err(e) => out!("NANOX:SVM-PROBE:KERNEL-M1 absent fw_cfg={e}\n"),
     }
     if env.failures == 0 {
         out!("NANOX:SVM-PROBE:RESULT PASS\n");

@@ -12,8 +12,8 @@
 //!   port 0x61, from `vmm-devices`; the 8259 PICs only accept their masks.
 //!
 //! Time is virtual and deterministic: every exit advances it by
-//! `exit_quantum_ns`, and a HLT with interrupts enabled skips to the next
-//! APIC timer deadline. APIC interrupts are injected through EVENTINJ when
+//! `exit_quantum_ns`, PAUSE is intercepted so spin-waits exit too, and a
+//! HLT with interrupts enabled skips to the next APIC timer deadline. APIC interrupts are injected through EVENTINJ when
 //! the guest can take them, otherwise a virtual-interrupt window (V_IRQ +
 //! VINTR intercept) brings the VMM back as soon as it can. APIC MMIO is
 //! emulated from the faulting instruction (decode assists if present,
@@ -73,6 +73,11 @@ pub struct VmConfig {
     pub lapic_bus_hz: u64,
     /// Virtual time charged per exit.
     pub exit_quantum_ns: u64,
+    /// Virtual time charged for an exit caused by a host interrupt. A host
+    /// that ticks a timer while the guest runs (IF=1 at VMRUN) lets a guest
+    /// that spins without exits still see time pass: set this to the
+    /// host's tick period. Such runs depend on host timing.
+    pub intr_exit_ns: u64,
     /// Exits handled before the run is stopped.
     pub max_exits: u64,
     /// Wall time before the run is stopped.
@@ -96,6 +101,7 @@ impl VmConfig {
             debug_exit_port: 0xF4,
             lapic_bus_hz: 1_000_000_000,
             exit_quantum_ns: 1_000,
+            intr_exit_ns: 1_000,
             max_exits: 1_000_000,
             max_time_us: 30_000_000,
             max_virtual_ns: 60_000_000_000,
@@ -266,6 +272,7 @@ impl<'s> Vcpu<'s> {
                 | misc1::SMI
                 | misc1::INIT
                 | misc1::CPUID
+                | misc1::PAUSE
                 | misc1::HLT
                 | misc1::IOIO_PROT
                 | misc1::MSR_PROT
@@ -358,7 +365,12 @@ impl<'s> Vcpu<'s> {
             vmcb.set_tlb_control(tlb::NOTHING);
             self.flush = tlb::NOTHING;
             self.exits += 1;
-            self.now = self.now.saturating_add(self.cfg.exit_quantum_ns);
+            let charge = if vmcb.exit_code() == crate::exit::code::INTR {
+                self.cfg.intr_exit_ns
+            } else {
+                self.cfg.exit_quantum_ns
+            };
+            self.now = self.now.saturating_add(charge);
             if let Some(v) = self.handle(cpu, vmcb, gprs) {
                 return self.outcome(v);
             }
@@ -464,6 +476,12 @@ impl<'s> Vcpu<'s> {
                 None
             }
             Exit::Io(io) => self.io(vmcb, io),
+            // A spin-wait: the exit itself charged the time quantum, so a
+            // guest polling memory (no I/O) still sees its timer fire.
+            Exit::Pause => {
+                self.advance(vmcb, 2);
+                None
+            }
             Exit::Hlt => {
                 // A HLT with interrupts enabled waits for the APIC timer:
                 // skip virtual time to its deadline. Anything else would
@@ -543,6 +561,40 @@ impl<'s> Vcpu<'s> {
                 if size == 4 && register {
                     self.lapic.write(offset, v as u32, self.now);
                 }
+            }
+            Operation::Rmw { alu, src, size } => {
+                let old = if size == 4 && register {
+                    u64::from(self.lapic.read(offset, self.now))
+                } else {
+                    0
+                };
+                let b = match src {
+                    Source::Reg(r) => decode::source_value(get_reg(vmcb, gprs, r.index), r),
+                    Source::Imm(i) => i,
+                };
+                let (new, flags) = alu.apply(old, b, size, vmcb.rflags());
+                vmcb.write_u64(save::RFLAGS, flags);
+                if size == 4 && register {
+                    self.lapic.write(offset, new as u32, self.now);
+                }
+            }
+            Operation::Flags {
+                op,
+                src,
+                size,
+                mem_first,
+            } => {
+                let m = if size == 4 && register {
+                    u64::from(self.lapic.read(offset, self.now))
+                } else {
+                    0
+                };
+                let x = match src {
+                    Source::Reg(r) => decode::source_value(get_reg(vmcb, gprs, r.index), r),
+                    Source::Imm(i) => i,
+                };
+                let (a, b) = if mem_first { (m, x) } else { (x, m) };
+                vmcb.write_u64(save::RFLAGS, op.flags(a, b, size, vmcb.rflags()));
             }
         }
         self.mmio += 1;
