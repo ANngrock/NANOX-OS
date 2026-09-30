@@ -202,6 +202,22 @@ fn rewrite(i: Insn, st: &St, w: u32) -> Option<Insn> {
     }
 }
 
+/// [`rewrite`] for a caller-supplied description of the registers (`known[r]`
+/// is the value register `r` holds, if it is known). For the proofs crate,
+/// which checks the rewrite rules against every state in a bounded domain.
+#[doc(hidden)]
+pub fn simplify(i: Insn, known: &[Option<u64>; REGS], w: u32) -> Option<Insn> {
+    let mut st = St {
+        reached: true,
+        known: 0,
+        v: [0; REGS],
+    };
+    for (r, k) in known.iter().enumerate() {
+        st.set(r as u8, *k);
+    }
+    rewrite(i, &st, w)
+}
+
 fn transfer(st: &mut St, i: &Insn) {
     match i.op {
         Op::Const => st.set(i.d, Some(i.imm)),
