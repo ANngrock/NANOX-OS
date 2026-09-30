@@ -151,6 +151,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qga"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -214,6 +221,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "svc"
+version = "0.1.0"
+
+[[package]]
 name = "svm-probe"
 version = "0.1.0"
 dependencies = [
@@ -253,6 +264,10 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vmm-devices"
+version = "0.1.0"
+
+[[package]]
+name = "vswitch"
 version = "0.1.0"
 
 [[package]]
