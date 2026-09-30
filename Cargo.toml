@@ -1,5 +1,5 @@
 [workspace]
-members = ["boot/uefi", "kernel", "crates/boot-protocol", "crates/hw-acpi", "crates/hw-pci", "crates/hw-smp", "crates/hw-iommu", "crates/hw-nvme", "crates/hw-xhci", "crates/fb-console", "crates/hid-keyboard", "crates/hw-svm", "crates/guest-boot", "crates/vmm-devices", "tools/svm-probe", "tools/xtask"]
+members = ["boot/uefi", "kernel", "crates/boot-protocol", "crates/hw-acpi", "crates/hw-pci", "crates/hw-smp", "crates/hw-iommu", "crates/hw-nvme", "crates/hw-xhci", "crates/fb-console", "crates/hid-keyboard", "crates/hw-svm", "crates/guest-boot", "crates/vmm-devices", "crates/qga", "crates/svc", "crates/vswitch", "tools/svm-probe", "tools/xtask"]
 default-members = ["tools/xtask", "crates/boot-protocol"]
 resolver = "2"
 

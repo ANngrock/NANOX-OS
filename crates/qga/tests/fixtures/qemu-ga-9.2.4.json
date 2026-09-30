@@ -1,0 +1,390 @@
+{
+ "agent": "QEMU Guest Agent 9.2.4",
+ "blocked": [
+  "guest-shutdown",
+  "guest-suspend-disk",
+  "guest-suspend-ram",
+  "guest-suspend-hybrid",
+  "guest-fsfreeze-freeze",
+  "guest-fsfreeze-freeze-list",
+  "guest-fsfreeze-thaw",
+  "guest-exec",
+  "guest-exec-status",
+  "guest-file-open",
+  "guest-file-close",
+  "guest-file-read",
+  "guest-file-write",
+  "guest-file-seek",
+  "guest-file-flush",
+  "guest-set-user-password",
+  "guest-ssh-add-authorized-keys",
+  "guest-ssh-remove-authorized-keys",
+  "guest-set-vcpus",
+  "guest-set-memory-blocks",
+  "guest-set-time",
+  "guest-fstrim"
+ ],
+ "records": [
+  {
+   "name": "sync-delimited",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e632d64656c696d69746564222c22617267756d656e7473223a7b226964223a3331343135393236357d7d0a",
+   "mode": "exact",
+   "response_hex": "ff7b2272657475726e223a203331343135393236357d0a",
+   "exact": "{\"return\": 314159265}"
+  },
+  {
+   "name": "sync",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b226964223a3132333435363738397d7d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a203132333435363738397d0a",
+   "exact": "{\"return\": 123456789}"
+  },
+  {
+   "name": "sync-negative-id",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b226964223a2d357d7d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a202d357d0a",
+   "exact": "{\"return\": -5}"
+  },
+  {
+   "name": "ping",
+   "request_hex": "7b2265786563757465223a2267756573742d70696e67227d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a207b7d7d0a",
+   "exact": "{\"return\": {}}"
+  },
+  {
+   "name": "ping-with-id",
+   "request_hex": "7b2265786563757465223a2267756573742d70696e67222c226964223a227265712d37227d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a207b7d2c20226964223a20227265712d37227d0a",
+   "exact": "{\"return\": {}, \"id\": \"req-7\"}"
+  },
+  {
+   "name": "info",
+   "request_hex": "7b2265786563757465223a2267756573742d696e666f227d0a",
+   "mode": "shape",
+   "shape": {
+    "return": {
+     "version": "string",
+     "supported_commands": [
+      {
+       "enabled": "bool",
+       "name": "string",
+       "success-response": "bool"
+      }
+     ]
+    }
+   },
+   "response_len": 3246
+  },
+  {
+   "name": "get-time",
+   "request_hex": "7b2265786563757465223a2267756573742d6765742d74696d65227d0a",
+   "mode": "shape",
+   "shape": {
+    "return": "int"
+   },
+   "response_len": 32
+  },
+  {
+   "name": "get-host-name",
+   "request_hex": "7b2265786563757465223a2267756573742d6765742d686f73742d6e616d65227d0a",
+   "mode": "shape",
+   "shape": {
+    "return": {
+     "host-name": "string"
+    }
+   },
+   "response_len": 45
+  },
+  {
+   "name": "get-osinfo",
+   "request_hex": "7b2265786563757465223a2267756573742d6765742d6f73696e666f227d0a",
+   "mode": "shape",
+   "shape": {
+    "return": {
+     "name": "string",
+     "kernel-release": "string",
+     "version": "string",
+     "pretty-name": "string",
+     "version-id": "string",
+     "kernel-version": "string",
+     "machine": "string",
+     "id": "string"
+    }
+   },
+   "response_len": 293
+  },
+  {
+   "name": "network-get-interfaces",
+   "request_hex": "7b2265786563757465223a2267756573742d6e6574776f726b2d6765742d696e7465726661636573227d0a",
+   "mode": "shape",
+   "shape": {
+    "return": [
+     {
+      "name": "string",
+      "ip-addresses": [
+       {
+        "ip-address-type": "string",
+        "ip-address": "string",
+        "prefix": "int"
+       }
+      ],
+      "statistics": {
+       "tx-packets": "int",
+       "tx-errs": "int",
+       "rx-bytes": "int",
+       "rx-dropped": "int",
+       "rx-packets": "int",
+       "rx-errs": "int",
+       "tx-bytes": "int",
+       "tx-dropped": "int"
+      },
+      "hardware-address": "string"
+     }
+    ]
+   },
+   "response_len": 1432
+  },
+  {
+   "name": "fsfreeze-status",
+   "request_hex": "7b2265786563757465223a2267756573742d6673667265657a652d737461747573227d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a2022746861776564227d0a",
+   "exact": "{\"return\": \"thawed\"}"
+  },
+  {
+   "name": "unknown-command",
+   "request_hex": "7b2265786563757465223a2267756573742d6e6f2d737563682d636f6d6d616e64227d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a2022436f6d6d616e644e6f74466f756e64222c202264657363223a202254686520636f6d6d616e642067756573742d6e6f2d737563682d636f6d6d616e6420686173206e6f74206265656e20666f756e64227d7d0a",
+   "exact": "{\"error\": {\"class\": \"CommandNotFound\", \"desc\": \"The command guest-no-such-command has not been found\"}}"
+  },
+  {
+   "name": "missing-execute",
+   "request_hex": "7b22666f6f223a317d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022514d5020696e707574206d656d6265722027666f6f2720697320756e6578706563746564227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"QMP input member 'foo' is unexpected\"}}"
+  },
+  {
+   "name": "sync-missing-arguments",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63227d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022506172616d657465722027696427206973206d697373696e67227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"Parameter 'id' is missing\"}}"
+  },
+  {
+   "name": "sync-id-string",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b226964223a2278227d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022496e76616c696420706172616d65746572207479706520666f7220276964272c2065787065637465643a20696e7465676572227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"Invalid parameter type for 'id', expected: integer\"}}"
+  },
+  {
+   "name": "ping-unknown-argument",
+   "request_hex": "7b2265786563757465223a2267756573742d70696e67222c22617267756d656e7473223a7b2278223a317d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022506172616d657465722027782720697320756e6578706563746564227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"Parameter 'x' is unexpected\"}}"
+  },
+  {
+   "name": "bad-json",
+   "request_hex": "7b226578656375746522202267756573742d70696e67227d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a20224a534f4e207061727365206572726f722c206d697373696e67203a20696e206f626a6563742070616972227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"JSON parse error, missing : in object pair\"}}"
+  },
+  {
+   "name": "empty-object",
+   "request_hex": "7b7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022514d5020696e707574206c61636b73206d656d62657220276578656375746527227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"QMP input lacks member 'execute'\"}}"
+  },
+  {
+   "name": "arguments-only",
+   "request_hex": "7b22617267756d656e7473223a7b7d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022514d5020696e707574206c61636b73206d656d62657220276578656375746527227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"QMP input lacks member 'execute'\"}}"
+  },
+  {
+   "name": "arguments-not-object",
+   "request_hex": "7b2265786563757465223a2267756573742d70696e67222c22617267756d656e7473223a357d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022514d5020696e707574206d656d6265722027617267756d656e747327206d75737420626520616e206f626a656374227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"QMP input member 'arguments' must be an object\"}}"
+  },
+  {
+   "name": "sync-id-float",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b226964223a312e357d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022496e76616c696420706172616d65746572207479706520666f7220276964272c2065787065637465643a20696e7465676572227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"Invalid parameter type for 'id', expected: integer\"}}"
+  },
+  {
+   "name": "sync-id-max",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b226964223a393232333337323033363835343737353830377d7d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a20393232333337323033363835343737353830377d0a",
+   "exact": "{\"return\": 9223372036854775807}"
+  },
+  {
+   "name": "sync-id-huge",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b226964223a393232333337323033363835343737353830387d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022496e76616c696420706172616d65746572207479706520666f7220276964272c2065787065637465643a20696e7465676572227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"Invalid parameter type for 'id', expected: integer\"}}"
+  },
+  {
+   "name": "sync-id-null",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b226964223a6e756c6c7d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022496e76616c696420706172616d65746572207479706520666f7220276964272c2065787065637465643a20696e7465676572227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"Invalid parameter type for 'id', expected: integer\"}}"
+  },
+  {
+   "name": "array-top-level",
+   "request_hex": "5b312c325d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022514d5020696e707574206d7573742062652061204a534f4e206f626a656374227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"QMP input must be a JSON object\"}}"
+  },
+  {
+   "name": "missing-value",
+   "request_hex": "7b2265786563757465223a7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a20224a534f4e207061727365206572726f722c20657870656374696e672076616c7565227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"JSON parse error, expecting value\"}}"
+  },
+  {
+   "name": "trailing-comma",
+   "request_hex": "7b2265786563757465223a2267756573742d70696e67222c7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a20224a534f4e207061727365206572726f722c20657870656374696e672076616c7565227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"JSON parse error, expecting value\"}}"
+  },
+  {
+   "name": "missing-comma",
+   "request_hex": "7b2265786563757465223a2267756573742d70696e672220226964223a317d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a20224a534f4e207061727365206572726f722c20657870656374656420736570617261746f7220696e2064696374227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"JSON parse error, expected separator in dict\"}}"
+  },
+  {
+   "name": "id-object",
+   "request_hex": "7b2265786563757465223a2267756573742d70696e67222c226964223a7b2261223a5b312c325d7d7d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a207b7d2c20226964223a207b2261223a205b312c20325d7d7d0a",
+   "exact": "{\"return\": {}, \"id\": {\"a\": [1, 2]}}"
+  },
+  {
+   "name": "escaped-execute",
+   "request_hex": "7b2265786563757465223a2267756573742d5c7530303730696e67227d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a207b7d7d0a",
+   "exact": "{\"return\": {}}"
+  },
+  {
+   "name": "duplicate-execute",
+   "request_hex": "7b2265786563757465223a2267756573742d70696e67222c2265786563757465223a2267756573742d73796e63227d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a20224a534f4e207061727365206572726f722c206475706c6963617465206b6579227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"JSON parse error, duplicate key\"}}"
+  },
+  {
+   "name": "unexpected-member-with-id",
+   "request_hex": "7b226964223a392c22666f6f223a317d0a",
+   "mode": "exact",
+   "response_hex": "7b226964223a20392c20226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022514d5020696e707574206d656d6265722027666f6f2720697320756e6578706563746564227d7d0a",
+   "exact": "{\"id\": 9, \"error\": {\"class\": \"GenericError\", \"desc\": \"QMP input member 'foo' is unexpected\"}}"
+  },
+  {
+   "name": "unexpected-member-id-last",
+   "request_hex": "7b22666f6f223a312c226964223a397d0a",
+   "mode": "exact",
+   "response_hex": "7b226964223a20392c20226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022514d5020696e707574206d656d6265722027666f6f2720697320756e6578706563746564227d7d0a",
+   "exact": "{\"id\": 9, \"error\": {\"class\": \"GenericError\", \"desc\": \"QMP input member 'foo' is unexpected\"}}"
+  },
+  {
+   "name": "unknown-command-with-id",
+   "request_hex": "7b2265786563757465223a2267756573742d6e6f7065222c226964223a2261227d0a",
+   "mode": "exact",
+   "response_hex": "7b226964223a202261222c20226572726f72223a207b22636c617373223a2022436f6d6d616e644e6f74466f756e64222c202264657363223a202254686520636f6d6d616e642067756573742d6e6f706520686173206e6f74206265656e20666f756e64227d7d0a",
+   "exact": "{\"id\": \"a\", \"error\": {\"class\": \"CommandNotFound\", \"desc\": \"The command guest-nope has not been found\"}}"
+  },
+  {
+   "name": "sync-missing-with-id",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b7d2c226964223a337d0a",
+   "mode": "exact",
+   "response_hex": "7b226964223a20332c20226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022506172616d657465722027696427206973206d697373696e67227d7d0a",
+   "exact": "{\"id\": 3, \"error\": {\"class\": \"GenericError\", \"desc\": \"Parameter 'id' is missing\"}}"
+  },
+  {
+   "name": "sync-unexpected-extra",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b226964223a312c2278223a327d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022506172616d657465722027782720697320756e6578706563746564227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"Parameter 'x' is unexpected\"}}"
+  },
+  {
+   "name": "sync-only-unexpected",
+   "request_hex": "7b2265786563757465223a2267756573742d73796e63222c22617267756d656e7473223a7b2278223a327d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022506172616d657465722027696427206973206d697373696e67227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"Parameter 'id' is missing\"}}"
+  },
+  {
+   "name": "disabled-with-id",
+   "request_hex": "7b2265786563757465223a2267756573742d73687574646f776e222c226964223a347d0a",
+   "mode": "exact",
+   "response_hex": "7b226964223a20342c20226572726f72223a207b22636c617373223a2022436f6d6d616e644e6f74466f756e64222c202264657363223a2022436f6d6d616e642067756573742d73687574646f776e20686173206265656e2064697361626c65643a2074686520636f6d6d616e64206973206e6f7420616c6c6f776564227d7d0a",
+   "exact": "{\"id\": 4, \"error\": {\"class\": \"CommandNotFound\", \"desc\": \"Command guest-shutdown has been disabled: the command is not allowed\"}}"
+  },
+  {
+   "name": "arguments-before-execute",
+   "request_hex": "7b22617267756d656e7473223a7b7d2c2265786563757465223a2267756573742d70696e67227d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a207b7d7d0a",
+   "exact": "{\"return\": {}}"
+  },
+  {
+   "name": "string-escapes-in-id",
+   "request_hex": "7b2265786563757465223a2267756573742d70696e67222c226964223a22615c22625c5c635c6e5c7530306539227d0a",
+   "mode": "exact",
+   "response_hex": "7b2272657475726e223a207b7d2c20226964223a2022615c22625c5c635c6e5c7530304539227d0a",
+   "exact": "{\"return\": {}, \"id\": \"a\\\"b\\\\c\\n\\u00E9\"}"
+  },
+  {
+   "name": "execute-not-string",
+   "request_hex": "7b2265786563757465223a357d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a202247656e657269634572726f72222c202264657363223a2022514d5020696e707574206d656d62657220276578656375746527206d757374206265206120737472696e67227d7d0a",
+   "exact": "{\"error\": {\"class\": \"GenericError\", \"desc\": \"QMP input member 'execute' must be a string\"}}"
+  },
+  {
+   "name": "shutdown-disabled",
+   "request_hex": "7b2265786563757465223a2267756573742d73687574646f776e222c22617267756d656e7473223a7b226d6f6465223a22706f776572646f776e227d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a2022436f6d6d616e644e6f74466f756e64222c202264657363223a2022436f6d6d616e642067756573742d73687574646f776e20686173206265656e2064697361626c65643a2074686520636f6d6d616e64206973206e6f7420616c6c6f776564227d7d0a",
+   "exact": "{\"error\": {\"class\": \"CommandNotFound\", \"desc\": \"Command guest-shutdown has been disabled: the command is not allowed\"}}"
+  },
+  {
+   "name": "fsfreeze-freeze-disabled",
+   "request_hex": "7b2265786563757465223a2267756573742d6673667265657a652d667265657a65227d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a2022436f6d6d616e644e6f74466f756e64222c202264657363223a2022436f6d6d616e642067756573742d6673667265657a652d667265657a6520686173206265656e2064697361626c65643a2074686520636f6d6d616e64206973206e6f7420616c6c6f776564227d7d0a",
+   "exact": "{\"error\": {\"class\": \"CommandNotFound\", \"desc\": \"Command guest-fsfreeze-freeze has been disabled: the command is not allowed\"}}"
+  },
+  {
+   "name": "exec-disabled",
+   "request_hex": "7b2265786563757465223a2267756573742d65786563222c22617267756d656e7473223a7b2270617468223a222f62696e2f74727565227d7d0a",
+   "mode": "exact",
+   "response_hex": "7b226572726f72223a207b22636c617373223a2022436f6d6d616e644e6f74466f756e64222c202264657363223a2022436f6d6d616e642067756573742d6578656320686173206265656e2064697361626c65643a2074686520636f6d6d616e64206973206e6f7420616c6c6f776564227d7d0a",
+   "exact": "{\"error\": {\"class\": \"CommandNotFound\", \"desc\": \"Command guest-exec has been disabled: the command is not allowed\"}}"
+  }
+ ],
+ "recovers_after_bad_json": "{\"return\": {}}"
+}
