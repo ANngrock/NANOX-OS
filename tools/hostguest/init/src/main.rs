@@ -179,7 +179,9 @@ extern "C" fn init_main() -> ! {
     unsafe { syscall(SYS_REBOOT, 0xfee1dead, 672274793, 0x4321fedc, 0, 0) };
     // SAFETY: leaving the process.
     unsafe { syscall(SYS_EXIT_GROUP, 0, 0, 0, 0, 0) };
-    loop {}
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 global_asm!(
@@ -194,5 +196,7 @@ global_asm!(
 
 #[panic_handler]
 fn panic(_: &PanicInfo<'_>) -> ! {
-    loop {}
+    loop {
+        core::hint::spin_loop();
+    }
 }
