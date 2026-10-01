@@ -1,0 +1,21 @@
+[package]
+name = "nanox-hello"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The smallest native program: it exists to show that the runtime links into a
+# static ELF that satisfies the contract of docs/specs/M10-NATIVE.md. It is
+# built for x86_64-unknown-none with the user flags (tools/native/build.py),
+# never run on the host.
+
+[dependencies]
+nanox-runtime = { path = "../../crates/runtime", features = ["entry", "mem-symbols"] }
+
+[[bin]]
+name = "nanox-hello"
+path = "src/main.rs"
+test = false
+bench = false

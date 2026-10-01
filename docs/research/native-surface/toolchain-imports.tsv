@@ -1,0 +1,7 @@
+# binary<TAB>file<TAB>imported dynamic symbols (nm -D --undefined-only)
+cargo	cargo	286
+librustc_driver	librustc_driver-890dfd19c9b338c0.so	934
+libLLVM	libLLVM.so.20.1-rust-1.90.0-stable	285
+rust-lld	rust-lld	829
+gcc driver	gcc	164
+collect2	collect2	151
