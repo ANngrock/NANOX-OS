@@ -369,16 +369,48 @@ fn enter(page: &mut [u8; 4096], vcpu: &Vcpu<'_>) {
     vcpu.prepare(&mut v);
 }
 
+/// FNV-1a over everything a deterministic run must reproduce: the verdict
+/// and every counter, then the serial bytes. Printed per case so two runs
+/// (or two machines) can be compared line by line.
+struct Fnv(u64);
+
+impl Fnv {
+    fn bytes(&mut self, data: &[u8]) {
+        for &b in data {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+}
+
+impl core::fmt::Write for Fnv {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.bytes(s.as_bytes());
+        Ok(())
+    }
+}
+
+fn digest(o: &Outcome, serial: &[u8]) -> u64 {
+    let mut h = Fnv(0xCBF2_9CE4_8422_2325);
+    let _ = write!(
+        h,
+        "{:?}|{}|{}|{}|{}|{}|{}|",
+        o.verdict, o.exits, o.msr_faults, o.ud_injected, o.irqs, o.mmio, o.virtual_ns
+    );
+    h.bytes(serial);
+    h.0
+}
+
 fn print_outcome(o: &Outcome, serial: &[u8]) {
     out!(
-        " verdict={:?} exits={} msr_faults={} ud={} irqs={} mmio={} virtual_us={} serial=\"",
+        " verdict={:?} exits={} msr_faults={} ud={} irqs={} mmio={} virtual_us={} digest={:016x} serial=\"",
         o.verdict,
         o.exits,
         o.msr_faults,
         o.ud_injected,
         o.irqs,
         o.mmio,
-        o.virtual_ns / 1000
+        o.virtual_ns / 1000,
+        digest(o, serial)
     );
     for &b in serial {
         match b {
@@ -568,8 +600,18 @@ const fn m1(test: bool, epoch: u64) -> Boot {
         protocol: guest_boot::Protocol::M1,
         quantum_ns: 50_000,
         max_exits: 3_000_000,
-        // The preemption test's observer thread spins on plain loads.
+        // Runs on virtual time alone, hence reproducible bit for bit.
+        host_tick: false,
+    }
+}
+
+/// The preemption test's observer thread spins on plain loads without any
+/// exit, so time only passes with the host tick: this one case depends on
+/// host timing and is not reproducible (docs/research/REPRODUCIBILITY.md).
+const fn m1_host_timed(test: bool, epoch: u64) -> Boot {
+    Boot {
         host_tick: true,
+        ..m1(test, epoch)
     }
 }
 
@@ -881,7 +923,7 @@ fn m1_cases(env: &mut Env, page: &mut [u8; 4096], elf: &[u8]) {
         page,
         "m1-preemption",
         elf,
-        m1(true, u64::MAX - 6),
+        m1_host_timed(true, u64::MAX - 6),
         None,
         |o, s| o.verdict == PASS && m1_timer(s) && has(s, b"NANOX:KERNEL:PREEMPT_PASS"),
     );

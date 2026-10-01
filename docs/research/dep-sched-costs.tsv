@@ -1,0 +1,23 @@
+# name<TAB>ms: wall-clock time to compile the crate alone with its dependencies built (dev profile), median of 3
+nanox-uefi	302
+nanox-kernel	135
+boot-protocol	157
+hw-acpi	340
+hw-pci	191
+hw-smp	250
+hw-iommu	236
+hw-nvme	324
+hw-xhci	514
+fb-console	203
+hid-keyboard	119
+hw-svm	238
+guest-boot	121
+vmm-devices	149
+qga	229
+svc	204
+vswitch	129
+nanox-ir	182
+proofs	850
+dep-sched	110
+svm-probe	432
+xtask	1186

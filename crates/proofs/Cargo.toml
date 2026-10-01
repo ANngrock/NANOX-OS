@@ -1,0 +1,18 @@
+[package]
+name = "proofs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# A host tool: bounded exhaustive checks of properties of concrete
+# components, and attestations that bind each result to the sources checked
+# (docs/research/PROOFS.md). Not part of the shipped system.
+
+[dependencies]
+nanox-ir = { path = "../nanox-ir" }
+svc = { path = "../svc" }
+qga = { path = "../qga" }
+vswitch = { path = "../vswitch" }
+dep-sched = { path = "../dep-sched" }

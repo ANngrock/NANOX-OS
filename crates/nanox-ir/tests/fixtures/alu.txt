@@ -1,0 +1,50 @@
+# NIR ALU digests: FNV-1a 64 over the results of alu(op, x, y).
+# width 8: x = 0..255 (outer), y = 0..255 (inner), 1 byte each.
+# width 64: EDGES x EDGES, then 4096 pairs (x, y) from xorshift64*
+# seeded with 0x9E3779B97F4A7C15, 8 bytes little-endian each.
+8 mov 9e731e58b77ca325
+8 add 32b88b31b12bcb25
+8 sub 2a24ee88277a7325
+8 mul 7dcffbe644c11b25
+8 udiv 1d2aea1ab35ae409
+8 urem 9244f039fa1f04af
+8 and 47645ae4f00f9425
+8 or 58f1a02a8df71c25
+8 xor 5387f81d4fe7b325
+8 shl a4eafadc1297c725
+8 shr bc82ce385c873d25
+8 sar ebe9621182c90925
+8 eq 2bc070b89da7c425
+8 ne 90e6e75bfabc8225
+8 ltu 74ce2f77f1bb7825
+8 leu a6a0d0f97cf31925
+8 lts aada253ad2bb7825
+8 les 5fb6787a5df31925
+8 not 29e72dcf697ca325
+8 neg 9846bc35cf7ca325
+8 minu 0ed7c3baf1e36d25
+8 maxu e169e63a8f900c25
+8 popcnt 7b5089e0e3528b25
+64 mov 716baf600e213255
+64 add b86abbd9d582464b
+64 sub 71eb5f8a9cf3ec1b
+64 mul 41c0b810ec4ac9c4
+64 udiv fc92ee080923e2e7
+64 urem c8a5585538937f7e
+64 and df62f24940e48f41
+64 or 171fc20b8fb9995f
+64 xor c1eb76fa2927b10b
+64 shl 99b731013eeb940d
+64 shr cb893d3b168dd8ce
+64 sar d5c161f504b14980
+64 eq c0bff90145f53805
+64 ne 27abc804c45e46c5
+64 ltu 650b2af75debc325
+64 leu 5671395ed8a4f985
+64 lts a6cce51a9c23ece5
+64 les 4794aa4466e92bc5
+64 not 93605117c9c1bb3d
+64 neg d864b276ad2325f5
+64 minu 6d0a9250d99b3d82
+64 maxu b1ca29eaec054114
+64 popcnt 24fa96887d2e0b8c

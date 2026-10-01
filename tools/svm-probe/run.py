@@ -3,7 +3,12 @@
 
 Run inside `nix develop` (pinned QEMU, NANOX_OVMF_CODE/NANOX_OVMF_VARS):
 
-    python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH]
+    python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH] [--repro [--runs N]]
+
+With --repro the svm profile runs N times (default 2) with identical inputs
+and the per-case digest (verdict, every counter and the serial bytes) of each
+run is compared: every case except the host-timed ones must be identical
+(docs/research/REPRODUCIBILITY.md); records go to out/svm-repro-<utc>/.
 
 With --m1-kernel, an M1 kernel ELF (built from codex/m1-m8-continuation)
 is also handed over (fw_cfg opt/nanox/kernel-m1.elf) and booted with the M1
@@ -170,6 +175,63 @@ def compare_m0(lines, kernel_sha):
     return result
 
 
+# Cases whose result depends on host timing (a host interrupt tick keeps
+# virtual time moving for a guest that never exits); every other case runs
+# on virtual time alone and must reproduce exactly.
+NONDETERMINISTIC = {"m1-preemption"}
+DIGEST = re.compile(r"NANOX:SVM-PROBE:CASE (\S+) (?:PASS|FAIL) .*? digest=([0-9a-f]{16})")
+
+
+def digests(lines):
+    return {m.group(1): m.group(2) for l in lines if (m := DIGEST.match(l))}
+
+
+def repro(runs=2) -> int:
+    """Runs the svm profile `runs` times with identical inputs and compares
+    the per-case digest (verdict, counters and serial bytes)."""
+    code = Path(os.environ["NANOX_OVMF_CODE"])
+    vars_src = Path(os.environ["NANOX_OVMF_VARS"])
+    out = ROOT / "out" / time.strftime("svm-repro-%Y%m%dT%H%M%SZ", time.gmtime())
+    out.mkdir(parents=True)
+    qemu = subprocess.run(["qemu-system-x86_64", "--version"],
+                          capture_output=True, text=True).stdout.splitlines()[0]
+    name, cpu, _, _ = PROFILES[0]
+    inputs = {
+        "efi_sha256": sha256(EFI),
+        "kernel_elf_sha256": sha256(KERNEL),
+        "m1_kernel_sha256": sha256(Path(M1_KERNEL)) if M1_KERNEL else None,
+        "ovmf_code_sha256": sha256(code),
+        "ovmf_vars_sha256": sha256(vars_src),
+        "qemu": qemu,
+        "cpu": cpu,
+    }
+    results = []
+    for i in range(runs):
+        r = run_profile(out / f"run{i}", name, cpu, code, vars_src)
+        r["digests"] = digests(r["serial_lines"])
+        del r["serial_lines"]
+        results.append(r)
+        print(f"run {i}: status={r['status']} cases={len(r['digests'])} ({r['seconds']} s)")
+    cases = sorted(results[0]["digests"])
+    table, ok = {}, True
+    for c in cases:
+        seen = [r["digests"].get(c) for r in results]
+        same = len(set(seen)) == 1 and seen[0] is not None
+        by_design = c in NONDETERMINISTIC
+        table[c] = {"digests": seen, "identical": same, "host_timed": by_design}
+        good = same or by_design
+        ok &= good
+        tag = "identical" if same else ("differs (host-timed by design)" if by_design else "DIFFERS")
+        print(f"  {c:20} {tag}")
+    ok &= all(r["status"] == 33 for r in results) and cases == sorted(results[-1]["digests"])
+    rec = {"inputs": inputs, "runs": results, "cases": table, "ok": ok,
+           "deterministic": sum(t["identical"] for c, t in table.items() if not t["host_timed"]),
+           "deterministic_expected": sum(1 for c in table if c not in NONDETERMINISTIC)}
+    (out / "repro.json").write_text(json.dumps(rec, indent=1) + "\n")
+    print(f"reproduced {rec['deterministic']} of {rec['deterministic_expected']} deterministic cases; records: {out}")
+    return 0 if ok else 1
+
+
 def main() -> int:
     if "--no-build" not in sys.argv:
         subprocess.run(["cargo", "xtask", "build"], cwd=ROOT, check=True)
@@ -178,6 +240,8 @@ def main() -> int:
              "-p", "svm-probe", "--target", "x86_64-unknown-uefi"],
             cwd=ROOT, check=True,
         )
+    if "--repro" in sys.argv:
+        return repro(int(option("--runs") or 2))
     code = Path(os.environ["NANOX_OVMF_CODE"])
     vars_src = Path(os.environ["NANOX_OVMF_VARS"])
     out = ROOT / "out" / time.strftime("svm-probe-%Y%m%dT%H%M%SZ", time.gmtime())
