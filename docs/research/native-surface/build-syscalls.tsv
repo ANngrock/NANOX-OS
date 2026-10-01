@@ -1,0 +1,68 @@
+# syscall<TAB>calls<TAB>group: cargo test --no-run -p dep-sched under strace -f
+futex	15210	synchronization
+readlink	8338	files
+rt_sigprocmask	2847	signals
+mprotect	2253	memory
+openat	2053	files
+mmap	1882	memory
+madvise	1866	memory
+newfstatat	1864	files
+close	1544	files
+access	1461	files
+statx	1257	files
+fstat	1213	files
+read	1182	files
+write	917	files
+sigaltstack	772	signals
+rt_sigaction	725	signals
+munmap	536	memory
+lseek	456	files
+set_robust_list	383	processes and threads
+rseq	346	processes and threads
+clone3	320	processes and threads
+getdents64	318	files
+brk	286	memory
+sched_getaffinity	284	processes and threads
+pread64	267	files
+unlink	241	files
+prctl	236	processes and threads
+linkat	207	files
+ioctl	129	files
+fcntl	119	files
+prlimit64	96	processes and threads
+wait4	76	processes and threads
+getpid	72	processes and threads
+getrandom	71	other
+dup2	64	files
+pipe2	58	files
+execve	49	processes and threads
+mkdir	47	files
+poll	43	synchronization
+arch_prctl	37	processes and threads
+clone	37	processes and threads
+set_tid_address	37	processes and threads
+rt_sigreturn	34	signals
+flock	26	files
+getppid	24	processes and threads
+unlinkat	24	files
+stat	21	files
+geteuid	19	processes and threads
+getuid	19	processes and threads
+rename	17	files
+getegid	16	processes and threads
+getgid	16	processes and threads
+open	16	files
+getcwd	12	files
+socketpair	11	other
+recvfrom	9	other
+ftruncate	8	files
+getpgrp	8	processes and threads
+lstat	8	files
+statfs	8	files
+uname	8	processes and threads
+sched_yield	6	processes and threads
+tgkill	6	processes and threads
+chdir	5	files
+restart_syscall	5	synchronization
+utimensat	5	files
+faccessat2	4	files

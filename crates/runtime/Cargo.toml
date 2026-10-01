@@ -1,0 +1,17 @@
+[package]
+name = "nanox-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# C-ABI memcpy/memmove/memset/memcmp/bcmp symbols for freestanding binaries.
+# Never enabled for host tests: they would replace libc's own.
+mem-symbols = []
+# The _start entry point and the nanox_entry! macro (x86_64 only).
+entry = []
+
+[dependencies]
