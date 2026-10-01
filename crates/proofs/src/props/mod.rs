@@ -7,6 +7,7 @@ pub mod qga;
 pub mod sched;
 pub mod svc;
 pub mod vswitch;
+pub mod window;
 
 pub fn all() -> Vec<Property> {
     let mut v = Vec::new();
@@ -15,5 +16,6 @@ pub fn all() -> Vec<Property> {
     v.extend(qga::properties());
     v.extend(vswitch::properties());
     v.extend(sched::properties());
+    v.extend(window::properties());
     v
 }

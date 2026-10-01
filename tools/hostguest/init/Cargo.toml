@@ -1,0 +1,18 @@
+[package]
+name = "linux-probe-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# A static Linux init program written without libc: it reports what the guest
+# kernel sees (tools/hostguest/linux_surface.py) and powers the machine off.
+# Built for x86_64-unknown-none with the user flags (tools/native/build.py);
+# it only makes sense inside a Linux initramfs.
+
+[[bin]]
+name = "linux-probe-init"
+path = "src/main.rs"
+test = false
+bench = false
