@@ -1,5 +1,9 @@
 //! The table of measured regions against the measurement and against the devices.
 
+use vmm_devices::acpi_pm::AcpiPm;
+use vmm_devices::hpet::{self, Hpet};
+use vmm_devices::i8042::I8042;
+use vmm_devices::ioapic::{self, IoApic};
 use vmm_devices::lapic;
 use vmm_devices::legacy::Legacy;
 use vmm_devices::map::*;
@@ -59,9 +63,28 @@ fn claimed(module: &str, port: u64) -> bool {
         "rtc" => Rtc::owns(p),
         "pic" => Pic::owns(p),
         "legacy" => Legacy::owns(p),
+        "i8042" => I8042::owns(p),
+        "acpi-pm" => AcpiPm::owns(p),
         "pit" => Pit2::new().read(p, 0).is_some(),
         m => panic!("unknown module {m}"),
     }
+}
+
+/// For devices on memory addresses: do the end points fall on registers of the module? None for port devices.
+fn mmio_claimed(module: &str, lo: u64, hi: u64) -> Option<bool> {
+    Some(match module {
+        "lapic" => lo >= lapic::DEFAULT_BASE && hi < lapic::DEFAULT_BASE + 0x1000,
+        "ioapic" => {
+            let (a, b) = (lo - ioapic::DEFAULT_BASE, hi - ioapic::DEFAULT_BASE);
+            lo >= ioapic::DEFAULT_BASE && IoApic::owns(a) && IoApic::owns(b)
+        }
+        "hpet" => {
+            lo >= hpet::DEFAULT_BASE
+                && Hpet::owns(lo - hpet::DEFAULT_BASE)
+                && Hpet::owns(hi - hpet::DEFAULT_BASE)
+        }
+        _ => return None,
+    })
 }
 
 #[test]
@@ -71,12 +94,8 @@ fn every_done_region_is_claimed_by_its_module() {
             continue;
         };
         for &(lo, hi) in r.ranges {
-            if module == "lapic" {
-                assert!(
-                    lo >= lapic::DEFAULT_BASE && hi < lapic::DEFAULT_BASE + 0x1000,
-                    "{}",
-                    r.name
-                );
+            if let Some(ok) = mmio_claimed(module, lo, hi) {
+                assert!(ok, "{}: {lo:#x}..{hi:#x} not claimed by {module}", r.name);
                 continue;
             }
             for port in [lo, hi] {
@@ -104,7 +123,7 @@ fn the_partial_region_says_what_is_missing_and_is_really_missing() {
 
 #[test]
 fn pending_regions_name_a_planned_step() {
-    let steps = ["display", "pci", "hpet", "ioapic", "acpi-pm", "i8042"];
+    let steps = ["display", "pci"];
     for r in MEASURED {
         if let Status::Pending(step) = r.status {
             assert!(steps.contains(&step), "{}: {step}", r.name);
@@ -114,7 +133,7 @@ fn pending_regions_name_a_planned_step() {
     for r in MEASURED {
         if let Status::Pending(_) = r.status {
             for &(lo, _) in r.ranges {
-                for m in ["uart", "rtc", "pic", "legacy"] {
+                for m in ["uart", "rtc", "pic", "legacy", "i8042", "acpi-pm"] {
                     assert!(
                         !claimed(m, lo) || lo >= 0x1_0000,
                         "{} port {lo:#x} is already claimed by {m}",
@@ -128,7 +147,7 @@ fn pending_regions_name_a_planned_step() {
 
 #[test]
 fn the_tally() {
-    assert_eq!(tally(), (13, 1, 14, 9));
+    assert_eq!(tally(), (22, 1, 5, 9));
     let (a, b, c, d) = tally();
     assert_eq!(a + b + c + d, MEASURED.len());
 }

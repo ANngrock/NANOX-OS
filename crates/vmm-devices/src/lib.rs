@@ -11,7 +11,9 @@
 //!   calibration reference;
 //! * for a Linux guest (docs/specs/M11-WINDOW.md §5, step 2): [`uart`] (16550A
 //!   console), [`pic`] (the two 8259A and the ELCR), [`rtc`] (MC146818 and
-//!   CMOS), [`legacy`] (port 0x92, POST, DMA registers, parallel probe) and
+//!   CMOS), [`legacy`] (port 0x92, POST, DMA registers, parallel probe),
+//!   [`ioapic`], [`hpet`], [`i8042`] (PS/2 controller and keyboard),
+//!   [`acpi_pm`] (PM1 events, timer, GPE0, SMI command, soft-off) and
 //!   [`map`], the table of the 37 regions a Linux kernel was measured to touch
 //!   and which of them these modules provide.
 //!
@@ -22,7 +24,11 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod acpi_pm;
 pub mod decode;
+pub mod hpet;
+pub mod i8042;
+pub mod ioapic;
 pub mod lapic;
 pub mod legacy;
 pub mod map;
