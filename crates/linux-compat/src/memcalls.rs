@@ -9,7 +9,7 @@ use crate::fdtable::Kind;
 use crate::handlers::fd_of;
 use crate::mem::PAGE;
 use crate::personality::Personality;
-use crate::vma::{Backing, PROT_WRITE};
+use crate::vma::{round_up, Backing, PROT_WRITE};
 
 /// Flags that only matter to a kernel with a page cache or a fork: accepted, no effect.
 const MAP_IGNORED: u64 = 0x800 | 0x1000 | 0x4000 | 0x8000 | 0x1_0000 | 0x2_0000;
@@ -96,10 +96,9 @@ impl<B: Backend> Personality<B> {
         if !known {
             return Err(EINVAL);
         }
-        if len == 0 {
-            return Ok(0);
-        }
-        let end = addr.checked_add(len.next_multiple_of(PAGE)).ok_or(ENOMEM)?;
+        let end = round_up(len)
+            .and_then(|l| addr.checked_add(l))
+            .ok_or(ENOMEM)?;
         if !self.space.covers(addr, end - addr, 0) {
             return Err(ENOMEM);
         }

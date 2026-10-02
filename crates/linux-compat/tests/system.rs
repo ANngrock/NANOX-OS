@@ -444,7 +444,8 @@ fn identity_and_limits() {
     assert_eq!(p.call(SYS_GETTID, &[]), 4242);
     assert_eq!(p.call(SYS_GETUID, &[]), 1000);
     assert_eq!(p.call(SYS_GETEUID, &[]), 1000);
-    assert_eq!(p.call(SYS_GETGID, &[]), 1000);
+    assert_eq!(p.call(SYS_GETGID, &[]), 1001);
+    assert_eq!(p.call(SYS_GETEGID, &[]), 1001);
     assert_eq!(p.call(SYS_GETPPID, &[]), 1);
     let u = p.buf(390);
     assert_eq!(p.call(SYS_UNAME, &[u]), 0);
@@ -1006,4 +1007,240 @@ fn no_call_with_zero_arguments_crashes_the_service() {
         assert_eq!(p.p.fds().check(), Ok(()), "syscall {n}");
         assert_eq!(p.p.space().check(), Ok(()), "syscall {n}");
     }
+}
+
+#[test]
+fn gettimeofday_accepts_missing_arguments() {
+    let mut p = Proc::new();
+    let tz = p.buf(8);
+    assert_eq!(p.call(SYS_GETTIMEOFDAY, &[0, tz]), 0, "only the zone");
+    let tv = p.buf(16);
+    assert_eq!(p.call(SYS_GETTIMEOFDAY, &[tv, 0]), 0, "only the time");
+    assert_eq!(p.call(SYS_GETTIMEOFDAY, &[0, 0]), 0);
+    assert_eq!(p.call(SYS_GETTIMEOFDAY, &[0xdead_0000, 0]), neg(EFAULT));
+    assert_eq!(p.call(SYS_GETTIMEOFDAY, &[0, 0xdead_0000]), neg(EFAULT));
+}
+
+#[test]
+fn futex_deadline_follows_the_chosen_clock() {
+    let mut p = Proc::new();
+    let w = p.put(&1u32.to_le_bytes());
+    // realtime is the monotonic clock plus 1.7e9 s in the test backend
+    let abs = p.put(&[1_700_000_009u64.to_le_bytes(), 0u64.to_le_bytes()].concat());
+    let op = (9 | FUTEX_PRIVATE_FLAG | 256) as u64;
+    assert_eq!(
+        p.call(SYS_FUTEX, &[w, op, 1, abs, 0, 0xffff_ffff]),
+        neg(ETIMEDOUT)
+    );
+    assert_eq!(
+        p.be().futex_calls.last().unwrap().2,
+        Some(4_000_000_000),
+        "9 s deadline, 5 s now"
+    );
+    // the same number against the monotonic clock is long past: no wait
+    let past = p.put(&[1u64.to_le_bytes(), 0u64.to_le_bytes()].concat());
+    assert_eq!(p.call(SYS_FUTEX, &[w, 9, 1, past, 0, 1]), neg(ETIMEDOUT));
+    assert_eq!(p.be().futex_calls.last().unwrap().2, Some(0));
+}
+
+#[test]
+fn umask_keeps_permission_bits_only() {
+    let mut p = Proc::new();
+    p.call(SYS_UMASK, &[0o7077]);
+    assert_eq!(p.call(SYS_UMASK, &[0]), 0o077);
+}
+
+#[test]
+fn clone3_and_clone_read_the_right_flag_words() {
+    let mut p = Proc::new();
+    // clone: the flags are argument 0; a stack pointer that looks like a namespace flag is not one
+    let thread = 0x1_0000u64;
+    assert!(matches!(
+        p.outcome(SYS_CLONE, &[thread, 0x2000_0000, 0, 0, 0]),
+        Outcome::Defer { .. }
+    ));
+    // clone3: the flags are the first word of the block, not the block address
+    let mut args = vec![0u8; 88];
+    args[..8].copy_from_slice(&thread.to_le_bytes());
+    let a = p.put(&args);
+    assert!(
+        a & 0x1000_0000 != 0,
+        "the block address itself looks like CLONE_NEWUSER"
+    );
+    assert!(matches!(
+        p.outcome(SYS_CLONE3, &[a, 88]),
+        Outcome::Defer { .. }
+    ));
+    assert!(
+        matches!(p.outcome(SYS_CLONE3, &[a, 64]), Outcome::Defer { .. }),
+        "the smallest accepted size"
+    );
+    assert_eq!(p.call(SYS_CLONE3, &[a, 63]), neg(EINVAL));
+}
+
+#[test]
+fn tgkill_signal_range() {
+    let mut p = Proc::new();
+    assert!(
+        matches!(
+            p.outcome(SYS_TGKILL, &[4242, 4242, 64]),
+            Outcome::Defer { .. }
+        ),
+        "the last real-time signal"
+    );
+    assert_eq!(p.call(SYS_TGKILL, &[4242, 4242, 65]), neg(EINVAL));
+    assert_eq!(
+        p.call(SYS_TGKILL, &[4242, 1, 0]),
+        neg(ESRCH),
+        "right process, wrong thread"
+    );
+    assert_eq!(
+        p.call(SYS_TGKILL, &[1, 4242, 0]),
+        neg(ESRCH),
+        "wrong process, right thread"
+    );
+}
+
+#[test]
+fn positioned_io_needs_a_seekable_file() {
+    let mut p = Proc::new();
+    let b = p.buf(16);
+    assert_eq!(p.call(SYS_PREAD64, &[0, b, 4, 0]), neg(ESPIPE), "terminal");
+    let fds = p.buf(8);
+    p.call(SYS_PIPE, &[fds]);
+    let (r, w) = (p.u32_at(fds) as u64, p.u32_at(fds + 4) as u64);
+    assert_eq!(p.call(SYS_PREAD64, &[r, b, 4, 0]), neg(ESPIPE), "pipe");
+    assert_eq!(p.call(SYS_PWRITE64, &[w, b, 4, 0]), neg(ESPIPE), "pipe");
+}
+
+#[test]
+fn a_pipe_read_gives_what_one_call_has_and_never_waits_for_more() {
+    let mut p = Proc::new();
+    let fds = p.buf(8);
+    p.call(SYS_PIPE, &[fds]);
+    let (r, w) = (p.u32_at(fds) as i64, p.u32_at(fds + 4) as i64);
+    let data = vec![b'x'; 4096];
+    let src = p.put(&data);
+    assert_eq!(p.call(SYS_WRITE, &[w as u64, src, 4096]), 4096);
+    p.be().panic_on_block = true;
+    let dst = p.buf(8192);
+    // the pipe held exactly one chunk; asking for two must not issue a second (blocking) read
+    assert_eq!(p.call(SYS_READ, &[r as u64, dst, 8192]), 4096);
+}
+
+#[test]
+fn socket_calls_check_their_flags_and_do_not_block_when_told_not_to() {
+    let mut p = Proc::new();
+    let sv = p.buf(8);
+    p.call(SYS_SOCKETPAIR, &[1, 1, 0, sv]);
+    let (a, b) = (p.u32_at(sv) as u64, p.u32_at(sv + 4) as u64);
+    let data = p.put(b"x");
+    let out = p.buf(8);
+    assert_eq!(
+        p.call(SYS_SENDTO, &[a, data, 1, 0x2, 0, 0]),
+        neg(EINVAL),
+        "unknown send flag"
+    );
+    assert_eq!(
+        p.call(SYS_RECVFROM, &[b, out, 8, 0x2, 0, 0]),
+        neg(EINVAL),
+        "unknown receive flag"
+    );
+    // MSG_DONTWAIT: nothing to read -> EAGAIN without asking the backend to block
+    p.be().panic_on_block = true;
+    assert_eq!(p.call(SYS_RECVFROM, &[b, out, 8, 0x40, 0, 0]), neg(EAGAIN));
+    // full: EAGAIN without asking the backend to write
+    p.be().stall_writes = true;
+    assert_eq!(p.call(SYS_SENDTO, &[a, data, 1, 0x40, 0, 0]), neg(EAGAIN));
+    p.be().stall_writes = false;
+    assert_eq!(p.call(SYS_SENDTO, &[a, data, 1, 0x40, 0, 0]), 1);
+    assert_eq!(p.call(SYS_RECVFROM, &[b, out, 8, 0x40, 0, 0]), 1);
+}
+
+#[test]
+fn a_string_that_ends_at_the_end_of_mapped_memory_is_readable() {
+    let mut p = Proc::new();
+    // the NUL is the last mapped byte: reading the rest of the page must not go on into the next one
+    let at = SCRATCH + SCRATCH_LEN - 12;
+    p.mem.poke(at, b"/etc/passwd ");
+    let fd = p.call(SYS_OPEN, &[at, 0, 0]);
+    assert!(fd >= 0, "{fd}");
+    // and one that crosses a page boundary inside mapped memory
+    let across = SCRATCH + 4096 - 5;
+    p.mem.poke(across, b"/etc/passwd ");
+    assert!(p.call(SYS_OPEN, &[across, 0, 0]) >= 0);
+}
+
+#[test]
+fn clock_nanosleep_reports_nothing_left_for_relative_sleeps_only() {
+    let mut p = Proc::new();
+    let req = p.put(&[1u64.to_le_bytes(), 0u64.to_le_bytes()].concat());
+    let rem = p.put(&[0xffu8; 16]);
+    assert_eq!(p.call(SYS_CLOCK_NANOSLEEP, &[1, 0, req, rem]), 0);
+    assert_eq!(
+        p.bytes(rem, 16),
+        [0u8; 16],
+        "relative: the time left is written"
+    );
+    let rem2 = p.put(&[0xffu8; 16]);
+    let abs = p.put(&[100u64.to_le_bytes(), 0u64.to_le_bytes()].concat());
+    assert_eq!(p.call(SYS_CLOCK_NANOSLEEP, &[1, 1, abs, rem2]), 0);
+    assert_eq!(
+        p.bytes(rem2, 16),
+        [0xffu8; 16],
+        "absolute: nothing is written"
+    );
+    // nanosleep too
+    let rem3 = p.put(&[0xffu8; 16]);
+    assert_eq!(p.call(SYS_NANOSLEEP, &[req, rem3]), 0);
+    assert_eq!(p.bytes(rem3, 16), [0u8; 16]);
+}
+
+#[test]
+fn futex_wake_bitset_needs_a_bitset() {
+    let mut p = Proc::new();
+    let w = p.put(&1u32.to_le_bytes());
+    assert_eq!(
+        p.call(SYS_FUTEX, &[w, 10, 1, 0, 0, 0]),
+        neg(EINVAL),
+        "an empty bitset wakes nobody and is refused"
+    );
+    p.be().futex_waiters = 2;
+    assert_eq!(
+        p.call(
+            SYS_FUTEX,
+            &[w, 10 | FUTEX_PRIVATE_FLAG as u64, 5, 0, 0, 0xffff_ffff]
+        ),
+        2
+    );
+}
+
+#[test]
+fn madvise_and_friends_survive_enormous_lengths() {
+    let mut p = Proc::new();
+    let a = mmap(&mut p, 0, 4096, RW, PRIV_ANON, -1, 0) as u64;
+    assert_eq!(p.call(SYS_MADVISE, &[a, u64::MAX, 4]), neg(ENOMEM));
+    assert_eq!(p.call(SYS_MADVISE, &[a, u64::MAX - 100, 0]), neg(ENOMEM));
+    assert_eq!(p.call(SYS_MUNMAP, &[a, u64::MAX]), neg(EINVAL));
+    assert_eq!(p.call(SYS_MPROTECT, &[a, u64::MAX, 1]), neg(ENOMEM));
+    assert_eq!(p.call(SYS_MADVISE, &[a, 0, 4]), 0, "an empty range is fine");
+    assert_eq!(
+        p.call(SYS_MADVISE, &[a, 0, 999]),
+        neg(EINVAL),
+        "but the advice is still checked"
+    );
+}
+
+#[test]
+fn getrandom_stops_at_the_limit_linux_has() {
+    let mut p = Proc::new();
+    let len = 40 << 20;
+    let a = mmap(&mut p, 0, len, RW, PRIV_ANON, -1, 0) as u64;
+    // a request for everything gets 2^25 - 1 bytes, as on Linux, though the buffer is larger
+    assert_eq!(p.call(SYS_GETRANDOM, &[a, u64::MAX, 0]), (1 << 25) - 1);
+    assert_eq!(
+        p.bytes(a + (1 << 25), 16),
+        [0u8; 16],
+        "nothing beyond the limit was written"
+    );
 }

@@ -13,7 +13,10 @@
 
 pub mod heap;
 pub mod mem;
+pub mod pkg;
+pub mod sha256;
 pub mod start;
 
 pub use heap::{Heap, HeapError, LockedHeap};
+pub use pkg::{Archive, PkgError};
 pub use start::{StartError, StartInfo};

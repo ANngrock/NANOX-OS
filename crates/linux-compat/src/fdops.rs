@@ -285,9 +285,9 @@ impl<B: Backend> Personality<B> {
             if ready > 0 || limit.is_some_and(|l| waited >= l) {
                 return Ok(ready);
             }
-            let slice = limit.map_or(POLL_SLICE_NS, |l| POLL_SLICE_NS.min(l - waited));
-            self.backend.sleep(slice)?;
-            waited += slice;
+            // The timeout is in whole milliseconds, as is the slice.
+            self.backend.sleep(POLL_SLICE_NS)?;
+            waited += POLL_SLICE_NS;
         }
     }
 }

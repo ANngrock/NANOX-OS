@@ -235,7 +235,7 @@ fn directory_slots_are_released_with_the_descriptor() {
 #[test]
 fn getdents_lists_and_resumes() {
     let mut p = Proc::new();
-    for n in ["a", "b", "c"] {
+    for n in ["a", "b", "c", "hello"] {
         p.open(&format!("/home/{n}"), O_CREAT | O_WRONLY);
     }
     let d = p.open("/home", O_RDONLY | O_DIRECTORY);
@@ -252,9 +252,13 @@ fn getdents_lists_and_resumes() {
         names.push(String::from_utf8(raw[at + 19..at + 19 + end].to_vec()).unwrap());
         let dot = names.last().unwrap().starts_with('.');
         assert_eq!(raw[at + 18], if dot { DT_DIR } else { DT_REG });
+        assert!(
+            19 + end < reclen,
+            "the name is NUL-terminated inside its record"
+        );
         at += reclen;
     }
-    assert_eq!(names, [".", "..", "a", "b", "c"]);
+    assert_eq!(names, [".", "..", "a", "b", "c", "hello"]);
     assert_eq!(
         p.call(SYS_GETDENTS64, &[d as u64, buf, 4096]),
         0,
@@ -271,7 +275,7 @@ fn getdents_lists_and_resumes() {
         }
         count += 1;
     }
-    assert_eq!(count, 5);
+    assert_eq!(count, 6);
     assert_eq!(p.call(SYS_LSEEK, &[d as u64, 0, 0]), 0);
     assert_eq!(
         p.call(SYS_GETDENTS64, &[d as u64, buf, 8]),
@@ -609,4 +613,253 @@ fn ftruncate_and_fd_noops() {
     assert_eq!(p.u64_at(sb + 8), 4096, "f_bsize");
     assert_eq!(p.call(SYS_FSTATFS, &[fd as u64, sb]), 0);
     assert_eq!(p.call(SYS_FSTATFS, &[90, sb]), neg(EBADF));
+}
+
+#[test]
+fn stat_fields_beyond_the_basics() {
+    let mut p = Proc::new();
+    let path = p.cstr("/etc/passwd");
+    let b = p.buf(144);
+    assert_eq!(p.call(SYS_STAT, &[path, b]), 0);
+    assert_eq!(p.u64_at(b + 56), 4096, "st_blksize");
+    assert_eq!(
+        p.u64_at(b + 64),
+        1,
+        "st_blocks (512-byte units, rounded up)"
+    );
+    for at in [72, 88, 104] {
+        assert_eq!(p.u64_at(b + at), 1_700_000_000, "time at {at}");
+        assert_eq!(p.u64_at(b + at + 8), 0);
+    }
+    assert_eq!(p.u32_at(b + 32), 1001, "st_gid");
+    let x = p.buf(256);
+    assert_eq!(p.call(SYS_STATX, &[FD, path, 0, 0x7ff, x]), 0);
+    assert_eq!(p.u32_at(x), 0x7ff, "stx_mask");
+    assert_eq!(p.u32_at(x + 4), 4096, "stx_blksize");
+    assert_eq!(p.u32_at(x + 16), 1, "stx_nlink");
+    assert_eq!((p.u32_at(x + 20), p.u32_at(x + 24)), (1000, 1001));
+    assert_eq!(p.u64_at(x + 32), p.u64_at(b + 8), "inode numbers agree");
+    assert_eq!(p.u64_at(x + 48), 1, "stx_blocks");
+    for at in [64, 80, 96, 112] {
+        assert_eq!(p.u64_at(x + at), 1_700_000_000, "statx time at {at}");
+    }
+}
+
+#[test]
+fn getdents_offsets_count_entries() {
+    let mut p = Proc::new();
+    p.open("/home/a", O_CREAT | O_WRONLY);
+    let d = p.open("/home", O_RDONLY | O_DIRECTORY);
+    let buf = p.buf(1024);
+    let n = p.call(SYS_GETDENTS64, &[d as u64, buf, 1024]) as usize;
+    let raw = p.bytes(buf, n);
+    let (mut at, mut i) = (0, 1u64);
+    while at < n {
+        assert_eq!(
+            u64::from_le_bytes(raw[at + 8..at + 16].try_into().unwrap()),
+            i,
+            "d_off of entry {i}"
+        );
+        assert_ne!(
+            u64::from_le_bytes(raw[at..at + 8].try_into().unwrap()),
+            0,
+            "d_ino"
+        );
+        at += u16::from_le_bytes([raw[at + 16], raw[at + 17]]) as usize;
+        i += 1;
+    }
+    assert_eq!(i, 4, "three entries: . .. a");
+}
+
+#[test]
+fn a_directory_too_deep_to_remember_is_refused() {
+    let mut p = Proc::new();
+    let mut path = String::new();
+    while path.len() < 1100 {
+        path.push_str("/dddddddddddddddddddddddddddddddddddddddddddddddd");
+        let c = p.cstr(&path);
+        assert_eq!(p.call(SYS_MKDIR, &[c, 0o755]), 0);
+    }
+    let live = p.be().live();
+    assert_eq!(p.open(&path, O_RDONLY | O_DIRECTORY), neg(ENAMETOOLONG));
+    assert_eq!(p.be().live(), live, "and nothing was left open");
+    // one that fits still works
+    assert!(p.open(&path[..path.len() - 49 * 8], O_RDONLY | O_DIRECTORY) >= 0);
+}
+
+#[test]
+fn only_status_flags_are_kept_on_a_descriptor() {
+    let mut p = Proc::new();
+    let fd = p.open(
+        "/tmp/s",
+        O_CREAT | O_EXCL | O_TRUNC | O_RDWR | O_APPEND | O_CLOEXEC,
+    );
+    assert_eq!(
+        p.call(SYS_FCNTL, &[fd as u64, F_GETFL, 0]) as u32,
+        O_RDWR | O_APPEND
+    );
+    assert_eq!(p.call(SYS_FCNTL, &[fd as u64, F_GETFD, 0]), 1);
+}
+
+#[test]
+fn an_absolute_path_ignores_the_directory_descriptor_even_when_it_is_bad() {
+    let mut p = Proc::new();
+    let abs = p.cstr("/etc/passwd");
+    let rel = p.cstr("etc/passwd");
+    for bad in [99u64, 0xffff_ffff, 1, 63] {
+        // 1 is the terminal: open but not a directory; the others are not open at all
+        let f = p.call(SYS_OPENAT, &[bad, abs, 0, 0]);
+        assert!(f >= 0, "descriptor {bad}: {f}");
+        p.call(SYS_CLOSE, &[f as u64]);
+        assert!(
+            p.call(SYS_OPENAT, &[bad, rel, 0, 0]) < 0,
+            "a relative path needs a directory"
+        );
+    }
+}
+
+#[test]
+fn creating_with_a_trailing_slash_creates_nothing() {
+    let mut p = Proc::new();
+    assert_eq!(p.open("/tmp/newdir/", O_CREAT | O_RDWR), neg(EISDIR));
+    assert!(
+        !p.be().exists("/tmp/newdir"),
+        "no file appeared under the name"
+    );
+    assert_eq!(
+        p.open("/tmp/newdir2/", O_CREAT | O_RDONLY | O_DIRECTORY),
+        neg(EISDIR)
+    );
+    assert!(!p.be().exists("/tmp/newdir2"));
+}
+
+#[test]
+fn a_trailing_slash_stops_unlink_from_removing_a_file() {
+    let mut p = Proc::new();
+    p.open("/tmp/keep", O_CREAT | O_WRONLY);
+    let (file, dir, none) = (
+        p.cstr("/tmp/keep/"),
+        p.cstr("/home/"),
+        p.cstr("/tmp/nothing/"),
+    );
+    assert_eq!(p.call(SYS_UNLINK, &[file]), neg(ENOTDIR));
+    assert!(p.be().exists("/tmp/keep"), "the file is still there");
+    assert_eq!(p.call(SYS_UNLINK, &[dir]), neg(EISDIR));
+    assert_eq!(p.call(SYS_UNLINK, &[none]), neg(ENOENT));
+}
+
+#[test]
+fn linkat_flags_are_not_provided() {
+    let mut p = Proc::new();
+    let (a, b) = (p.cstr("/etc/passwd"), p.cstr("/tmp/hard"));
+    assert_eq!(
+        p.call(SYS_LINKAT, &[FD, a, FD, b, 0x400]),
+        neg(EINVAL),
+        "AT_SYMLINK_FOLLOW"
+    );
+    assert_eq!(
+        p.call(SYS_LINKAT, &[FD, a, FD, b, 0x1000]),
+        neg(EINVAL),
+        "AT_EMPTY_PATH"
+    );
+    assert!(!p.be().exists("/tmp/hard"));
+    assert_eq!(p.call(SYS_LINKAT, &[FD, a, FD, b, 0]), 0);
+}
+
+#[test]
+fn offsets_that_no_file_can_have_never_reach_the_backend() {
+    let mut p = Proc::new();
+    let fd = p.open("/tmp/o", O_CREAT | O_RDWR);
+    p.write_str(fd, "0123456789");
+    let before = p.be().file_writes.len();
+    let b = p.put(b"0123456789");
+    let neg_off = u64::MAX - 5; // a negative offset as a program passes it
+    assert_eq!(
+        p.call(SYS_PWRITE64, &[fd as u64, b, 4, neg_off]),
+        neg(EINVAL)
+    );
+    assert_eq!(
+        p.call(SYS_PREAD64, &[fd as u64, b, 4, neg_off]),
+        neg(EINVAL)
+    );
+    assert_eq!(
+        p.call(SYS_PWRITE64, &[fd as u64, b, 10, i64::MAX as u64 - 2]),
+        neg(EFBIG),
+        "would end past the largest offset"
+    );
+    assert_eq!(
+        p.be().file_writes.len(),
+        before,
+        "none of the three reached the backend"
+    );
+    // ending exactly at the largest offset is the personality's to allow; the in-memory backend then
+    // refuses for its own reasons
+    assert_eq!(
+        p.call(SYS_PWRITE64, &[fd as u64, b, 3, i64::MAX as u64 - 3]),
+        neg(EFBIG)
+    );
+    assert_eq!(p.be().file_writes.len(), before + 1);
+}
+
+#[test]
+fn the_working_directory_is_the_target_of_an_empty_path_with_at_fdcwd() {
+    let mut p = Proc::new();
+    let tmp = p.cstr("/tmp");
+    p.call(SYS_CHDIR, &[tmp]);
+    let (empty, x) = (p.cstr(""), p.buf(256));
+    assert_eq!(
+        p.call(SYS_STATX, &[FD, empty, u64::from(AT_EMPTY_PATH), 0x7ff, x]),
+        0
+    );
+    let root = p.cstr("/tmp");
+    let y = p.buf(256);
+    assert_eq!(p.call(SYS_STATX, &[FD, root, 0, 0x7ff, y]), 0);
+    assert_eq!(p.bytes(x, 256), p.bytes(y, 256), "the same directory");
+    assert_eq!(
+        p.call(SYS_STATX, &[FD, empty, 0, 0x7ff, x]),
+        neg(ENOENT),
+        "without AT_EMPTY_PATH an empty path is an error"
+    );
+}
+
+#[test]
+fn mkdir_applies_the_umask() {
+    let mut p = Proc::new();
+    let d = p.cstr("/tmp/m");
+    assert_eq!(p.call(SYS_MKDIR, &[d, 0o777]), 0);
+    let b = p.buf(144);
+    p.call(SYS_STAT, &[d, b]);
+    assert_eq!(p.u32_at(b + 24), S_IFDIR | 0o755);
+}
+
+#[test]
+fn utimensat_without_a_path_means_the_descriptor() {
+    let mut p = Proc::new();
+    let fd = p.open("/etc/passwd", O_RDONLY);
+    assert_eq!(p.call(SYS_UTIMENSAT, &[fd as u64, 0, 0, 0]), 0);
+    assert_eq!(p.call(SYS_UTIMENSAT, &[77, 0, 0, 0]), neg(EBADF));
+}
+
+#[test]
+fn nothing_is_asked_of_the_backend_that_it_cannot_do() {
+    // The backend panics on reads or writes of a directory object and on listing a file;
+    // the personality must refuse these first.
+    let mut p = Proc::new();
+    let d = p.open("/tmp", O_RDONLY | O_DIRECTORY);
+    let f = p.open("/etc/passwd", O_RDONLY);
+    let b = p.buf(64);
+    assert_eq!(p.call(SYS_READ, &[d as u64, b, 8]), neg(EISDIR));
+    assert_eq!(p.call(SYS_PREAD64, &[d as u64, b, 8, 0]), neg(EISDIR));
+    assert_eq!(p.call(SYS_WRITE, &[d as u64, b, 8]), neg(EBADF));
+    assert_eq!(p.call(SYS_GETDENTS64, &[f as u64, b, 64]), neg(ENOTDIR));
+    let (root, tmp) = (p.cstr("/"), p.cstr("/tmp"));
+    // operations on the root stop in the personality
+    assert_eq!(p.call(SYS_MKDIR, &[root, 0o755]), neg(EEXIST));
+    assert_eq!(p.call(SYS_RMDIR, &[root]), neg(EBUSY));
+    assert_eq!(p.call(SYS_UNLINK, &[root]), neg(EBUSY));
+    assert_eq!(p.call(SYS_SYMLINK, &[tmp, root]), neg(EEXIST));
+    assert_eq!(p.call(SYS_RENAME, &[root, tmp]), neg(EBUSY));
+    assert_eq!(p.call(SYS_RENAME, &[tmp, root]), neg(EBUSY));
+    assert_eq!(p.call(SYS_LINKAT, &[FD, root, FD, tmp, 0]), neg(EPERM));
+    assert_eq!(p.call(SYS_LINKAT, &[FD, tmp, FD, root, 0]), neg(EPERM));
 }

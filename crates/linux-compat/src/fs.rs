@@ -551,8 +551,14 @@ impl<B: Backend> Personality<B> {
         if flags & AT_REMOVEDIR != 0 {
             self.backend.rmdir(p.path())?;
         } else {
+            // `unlink("name/")` never removes anything: a directory is `EISDIR`, a file `ENOTDIR`.
             if p.dir_only {
-                return Err(EISDIR);
+                let kind = self.backend.stat(p.path(), false)?.kind;
+                return Err(if kind == FileKind::Dir {
+                    EISDIR
+                } else {
+                    ENOTDIR
+                });
             }
             self.backend.unlink(p.path())?;
         }

@@ -447,7 +447,7 @@ fn run_random(seed: u64, calls: usize) -> std::collections::BTreeMap<u32, (u32, 
             ],
             SYS_MUNMAP | SYS_MPROTECT | SYS_MADVISE => [
                 r.pick(&mapped_or(&mapped)) + r.pick(&[0, 0, 4096, 1]),
-                r.pick(&[0, 1, 4096, 8192, 1 << 20]),
+                r.pick(&[0, 1, 4096, 8192, 1 << 20, u64::MAX]),
                 r.pick(&[0, 1, 3, 4, 5, 7, 8, 16]),
                 0,
                 0,

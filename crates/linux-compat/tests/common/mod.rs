@@ -91,16 +91,26 @@ impl Mem {
     /// Reads ignoring protection (the test looking at memory, not the program).
     pub fn peek(&self, addr: u64, n: usize) -> Vec<u8> {
         let m = self.0.borrow();
-        (0..n as u64)
-            .map(|i| m.pages[&((addr + i) & !(PG - 1))].data[((addr + i) % PG) as usize])
-            .collect()
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let at = addr + out.len() as u64;
+            let off = (at % PG) as usize;
+            let take = (PG as usize - off).min(n - out.len());
+            out.extend_from_slice(&m.pages[&(at & !(PG - 1))].data[off..off + take]);
+        }
+        out
     }
 
     pub fn poke(&self, addr: u64, data: &[u8]) {
         let mut m = self.0.borrow_mut();
-        for (i, b) in data.iter().enumerate() {
-            let at = addr + i as u64;
-            m.pages.get_mut(&(at & !(PG - 1))).unwrap().data[(at % PG) as usize] = *b;
+        let mut done = 0;
+        while done < data.len() {
+            let at = addr + done as u64;
+            let off = (at % PG) as usize;
+            let take = (PG as usize - off).min(data.len() - done);
+            m.pages.get_mut(&(at & !(PG - 1))).unwrap().data[off..off + take]
+                .copy_from_slice(&data[done..done + take]);
+            done += take;
         }
     }
 
@@ -170,6 +180,12 @@ pub struct Mock {
     pub fs_base: u64,
     pub fail_map: bool,
     pub fail_heap: bool,
+    /// A read on an empty pipe or socket whose writer is open would block: the test says so by panicking.
+    pub panic_on_block: bool,
+    /// Pipes and sockets are full: writes would block (and report not writable).
+    pub stall_writes: bool,
+    /// Every write to a file: (offset, length).
+    pub file_writes: Vec<(u64, usize)>,
     pub futex_waiters: u32,
     pub futex_calls: Vec<(u64, u32, Option<u64>)>,
     pub sleeps: Vec<u64>,
@@ -194,6 +210,9 @@ impl Mock {
             fs_base: 0,
             fail_map: false,
             fail_heap: false,
+            panic_on_block: false,
+            stall_writes: false,
+            file_writes: Vec::new(),
             futex_waiters: 0,
             futex_calls: Vec::new(),
             sleeps: Vec::new(),
@@ -428,7 +447,7 @@ impl Backend for Mock {
                 buf[..n].copy_from_slice(&d[off..off + n]);
                 Ok(n)
             }
-            H::Dir(_) => Err(EISDIR),
+            H::Dir(_) => panic!("the personality must not read a directory object"),
             H::Tty => {
                 let n = buf.len().min(self.tty_in.len());
                 for b in buf.iter_mut().take(n) {
@@ -440,6 +459,10 @@ impl Backend for Mock {
                 let p = *p;
                 let pipe = &mut self.pipes[p];
                 if pipe.buf.is_empty() {
+                    assert!(
+                        pipe.writers == 0 || !self.panic_on_block,
+                        "this read would block (the personality must not ask)"
+                    );
                     return if pipe.writers == 0 {
                         Ok(0)
                     } else {
@@ -461,6 +484,7 @@ impl Backend for Mock {
             H::File(i) => {
                 let i = *i;
                 let end = off as usize + data.len();
+                self.file_writes.push((off, data.len()));
                 if end > MAX_FILE {
                     return Err(EFBIG);
                 }
@@ -471,13 +495,17 @@ impl Backend for Mock {
                 d[off as usize..end].copy_from_slice(data);
                 Ok(data.len())
             }
-            H::Dir(_) => Err(EISDIR),
+            H::Dir(_) => panic!("the personality must not write a directory object"),
             H::Tty => {
                 self.tty_out.extend_from_slice(data);
                 Ok(data.len())
             }
             H::PipeW(p) | H::Sock { tx: p, .. } => {
                 let p = *p;
+                assert!(
+                    !self.stall_writes,
+                    "this write would block (the personality must not ask)"
+                );
                 if self.pipes[p].readers == 0 {
                     return Err(EPIPE);
                 }
@@ -514,7 +542,7 @@ impl Backend for Mock {
         name: &mut [u8; 256],
     ) -> Result<Option<(u64, FileKind, usize)>, Errno> {
         let H::Dir(path) = self.handle(obj) else {
-            return Err(ENOTDIR);
+            panic!("the personality must not list a non-directory object");
         };
         let path = path.clone();
         let own = *self.names.get(&path).ok_or(ENOENT)?;
@@ -532,6 +560,10 @@ impl Backend for Mock {
 
     fn mkdir(&mut self, path: &[u8], mode: u32) -> Result<(), Errno> {
         self.check_path(path);
+        assert_ne!(
+            path, b"/",
+            "an operation on the root must be refused before the backend"
+        );
         if self.names.contains_key(path) {
             return Err(EEXIST);
         }
@@ -541,6 +573,10 @@ impl Backend for Mock {
 
     fn unlink(&mut self, path: &[u8]) -> Result<(), Errno> {
         self.check_path(path);
+        assert_ne!(
+            path, b"/",
+            "an operation on the root must be refused before the backend"
+        );
         let ino = self.lookup(path, false)?;
         if self.inodes[&ino].kind == FileKind::Dir {
             return Err(EISDIR);
@@ -552,6 +588,10 @@ impl Backend for Mock {
 
     fn rmdir(&mut self, path: &[u8]) -> Result<(), Errno> {
         self.check_path(path);
+        assert_ne!(
+            path, b"/",
+            "an operation on the root must be refused before the backend"
+        );
         let ino = self.lookup(path, false)?;
         if self.inodes[&ino].kind != FileKind::Dir {
             return Err(ENOTDIR);
@@ -567,6 +607,14 @@ impl Backend for Mock {
     fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<(), Errno> {
         self.check_path(from);
         self.check_path(to);
+        assert_ne!(
+            from, b"/",
+            "an operation on the root must be refused before the backend"
+        );
+        assert_ne!(
+            to, b"/",
+            "an operation on the root must be refused before the backend"
+        );
         let ino = self.lookup(from, false)?;
         self.parent_ok(to)?;
         if let Some(old) = self.names.get(to).copied() {
@@ -605,6 +653,10 @@ impl Backend for Mock {
 
     fn symlink(&mut self, target: &[u8], path: &[u8]) -> Result<(), Errno> {
         self.check_path(path);
+        assert_ne!(
+            path, b"/",
+            "an operation on the root must be refused before the backend"
+        );
         if self.names.contains_key(path) {
             return Err(EEXIST);
         }
@@ -616,6 +668,14 @@ impl Backend for Mock {
     fn link(&mut self, from: &[u8], to: &[u8]) -> Result<(), Errno> {
         self.check_path(from);
         self.check_path(to);
+        assert_ne!(
+            from, b"/",
+            "an operation on the root must be refused before the backend"
+        );
+        assert_ne!(
+            to, b"/",
+            "an operation on the root must be refused before the backend"
+        );
         let ino = self.lookup(from, false)?;
         if self.inodes[&ino].kind == FileKind::Dir {
             return Err(EPERM);
@@ -681,11 +741,15 @@ impl Backend for Mock {
                 if pipe.writers == 0 && pipe.buf.is_empty() {
                     r |= 0x10; // POLLHUP
                 }
-                if matches!(self.handle(obj), H::Sock { .. }) && events & POLLOUT != 0 {
+                if matches!(self.handle(obj), H::Sock { .. })
+                    && events & POLLOUT != 0
+                    && !self.stall_writes
+                {
                     r |= POLLOUT;
                 }
                 r
             }
+            H::PipeW(_) if self.stall_writes => 0,
             H::PipeW(_) => events & POLLOUT,
             H::Tty => {
                 (if events & POLLIN != 0 && !self.tty_in.is_empty() {
@@ -706,7 +770,7 @@ impl Backend for Mock {
         self.mem.map(plan.addr, plan.len, 3);
         if let Backing::File { obj, offset } = plan.backing {
             let H::File(i) = self.handle(obj) else {
-                return Err(ENODEV);
+                panic!("the personality must map only regular files");
             };
             let d = self.inodes[i].data.clone();
             let start = (offset as usize).min(d.len());
@@ -802,7 +866,7 @@ pub fn config() -> Config {
     Config {
         pid: 4242,
         uid: 1000,
-        gid: 1000,
+        gid: 1001,
         window: (0x1_0000, 0x7fff_ffff_f000),
         brk_base: 0x4000_0000,
         mem_limit: 1 << 30,
