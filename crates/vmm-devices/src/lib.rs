@@ -8,7 +8,12 @@
 //! * [`lapic`] — an xAPIC register model with the timer (one-shot and
 //!   periodic, divide configuration), IRR/ISR, TPR and EOI;
 //! * [`pit`] — PIT channel 2 with the port 0x61 gate and OUT2 status, the
-//!   calibration reference.
+//!   calibration reference;
+//! * for a Linux guest (docs/specs/M11-WINDOW.md §5, step 2): [`uart`] (16550A
+//!   console), [`pic`] (the two 8259A and the ELCR), [`rtc`] (MC146818 and
+//!   CMOS), [`legacy`] (port 0x92, POST, DMA registers, parallel probe) and
+//!   [`map`], the table of the 37 regions a Linux kernel was measured to touch
+//!   and which of them these modules provide.
 //!
 //! Devices are pure state machines over a virtual time in nanoseconds that
 //! the VMM passes in; they never read a clock, so a run is reproducible.
@@ -19,7 +24,12 @@
 
 pub mod decode;
 pub mod lapic;
+pub mod legacy;
+pub mod map;
+pub mod pic;
 pub mod pit;
+pub mod rtc;
+pub mod uart;
 
 pub const NS_PER_SEC: u64 = 1_000_000_000;
 
