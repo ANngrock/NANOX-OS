@@ -1,6 +1,6 @@
 # План: остаток проекта (зона Claude: M9 → M10 → R → M11)
 
-Обновлено: 2026-09-30. Проверка каждого пункта — `m9-checks.sh --replay` (fmt,
+Обновлено: 2026-10-01. Проверка каждого пункта — `m9-checks.sh --replay` (fmt,
 clippy, build-none, тесты, xtask-test) и запись в PR. Критерий ROADMAP не
 закрывается, пока нет исполняемого доказательства именно на том, что в нём
 написано (физическое железо, ядро NANOX, самосборка внутри ОС).
@@ -29,8 +29,16 @@ clippy, build-none, тесты, xtask-test) и запись в PR. Критер�
 - [x] **M10, что не зависит от ядра.**
   - [x] Native userspace target и runtime-слой: спецификация
         `docs/specs/M10-NATIVE.md`, `crates/runtime`, `user/`, `tools/native/`.
-  - [ ] Выбор пути к rustc/cargo внутри NANOX (порт std или личность Linux) —
-        нужно решение владельца и Codex; пока предложение в разделе 6 спецификации.
+  - [x] Выбор пути к rustc/cargo внутри NANOX: владелец выбрал оба — изолированная
+        служба (путь B) и кросс-сборка (путь C), порт `std` (путь A) позже.
+  - [x] Путь B на хосте: `crates/linux-compat` — ядро личности Linux (политика,
+        пути, дескрипторы, память, обработчики 87 вызовов), тесты, мутации.
+  - [x] Путь C на хосте: `tools/native/pack.py` (две сборки в разных каталогах,
+        контракт ELF), формат NXPK, читатель в `crates/runtime`.
+  - [ ] Путь B и C внутри NANOX (ядро с userspace, `Backend` над объектами,
+        перехват `syscall`, загрузчик Linux ELF): [M10-ROUTES](../docs/specs/M10-ROUTES.md), §2.6.
+- [x] **M11: окно сервера** (`crates/serverwin`, [M11-WINDOW](../docs/specs/M11-WINDOW.md)),
+      измерение требований Linux-гостя (`tools/hostguest`).
 
 ## Нельзя закрыть здесь (причина)
 
@@ -45,4 +53,5 @@ clippy, build-none, тесты, xtask-test) и запись в PR. Критер�
 ## Проверка и публикация
 
 - Ветки цепочкой: `claude/m11-server` (от `claude/m10-vmm`), затем
-  `claude/r-research`, `claude/m10-native`; PR к предыдущей ветке.
+  `claude/r-research`, `claude/m10-native`, `claude/m11-window`,
+  `claude/m10-routes`; PR к предыдущей ветке.
