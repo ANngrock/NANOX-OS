@@ -235,6 +235,29 @@ impl Lapic {
         (v & 0xF0 > self.ppr() & 0xF0).then_some(v as u8)
     }
 
+    /// An interrupt arrives from outside (the I/O APIC): the vector is set in IRR. Vectors below 16 are illegal and ignored.
+    pub fn raise(&mut self, v: u8) {
+        if v >= 16 {
+            self.irr[usize::from(v / 32)] |= 1 << (v % 32);
+        }
+    }
+
+    /// The highest vector in service, the one the next EOI completes.
+    pub fn in_service(&self) -> Option<u8> {
+        Self::highest(&self.isr).map(|v| v as u8)
+    }
+
+    /// Is the APIC enabled (globally and by the spurious-vector register)?
+    pub fn is_enabled(&self) -> bool {
+        self.enabled()
+    }
+
+    /// Does LINT0 pass the 8259's interrupts to the CPU (unmasked, ExtINT delivery)? Linux masks it once it uses the I/O APIC.
+    pub fn lint0_extint(&self) -> bool {
+        let l = self.lvt[3];
+        self.enabled() && l & LVT_MASKED == 0 && (l >> 8) & 7 == 7
+    }
+
     /// The vector was injected: IRR → ISR.
     pub fn accept(&mut self, v: u8) {
         let (w, b) = (usize::from(v / 32), 1 << (v % 32));
