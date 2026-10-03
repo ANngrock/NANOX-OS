@@ -13,7 +13,9 @@
 //!   console), [`pic`] (the two 8259A and the ELCR), [`rtc`] (MC146818 and
 //!   CMOS), [`legacy`] (port 0x92, POST, DMA registers, parallel probe),
 //!   [`ioapic`], [`hpet`], [`i8042`] (PS/2 controller and keyboard),
-//!   [`acpi_pm`] (PM1 events, timer, GPE0, SMI command, soft-off) and
+//!   [`acpi_pm`] (PM1 events, timer, GPE0, SMI command, soft-off),
+//!   [`machine`] (all of them on one port and memory bus, with the chipset's
+//!   interrupt wiring: 8259, I/O APIC, local APIC) and
 //!   [`map`], the table of the 37 regions a Linux kernel was measured to touch
 //!   and which of them these modules provide.
 //!
@@ -31,6 +33,7 @@ pub mod i8042;
 pub mod ioapic;
 pub mod lapic;
 pub mod legacy;
+pub mod machine;
 pub mod map;
 pub mod pic;
 pub mod pit;

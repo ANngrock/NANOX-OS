@@ -192,6 +192,11 @@ impl Hpet {
         }
     }
 
+    /// The configuration register of timer `t` (0 for a timer that does not exist).
+    pub fn timer_config(&self, t: usize) -> u64 {
+        self.timer.get(t).map_or(0, |tm| tm.config)
+    }
+
     /// The next edge-triggered interrupt, oldest first.
     pub fn take_fire(&mut self) -> Option<Fire> {
         if self.fires_len == 0 {
