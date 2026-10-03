@@ -20,7 +20,6 @@ use crate::pci::{BarKind, Config};
 
 pub const VENDOR: u16 = 0x1AF4;
 pub const BAR_SIZE: u32 = 0x4000;
-const COMMON: u64 = 0x0000;
 const COMMON_LEN: u64 = 0x38;
 const ISR: u64 = 0x1000;
 const DEVICE: u64 = 0x2000;
@@ -152,7 +151,7 @@ impl VirtioPci {
         cfg.define_bar(0, BarKind::Memory(BAR_SIZE));
         cfg.write(crate::pci::INTERRUPT_LINE, 1, u32::from(line));
         for (t, off, len, extra) in [
-            (1u8, COMMON, COMMON_LEN, None),
+            (1u8, 0, COMMON_LEN, None),
             (2, NOTIFY, 4 * queues as u64, Some(NOTIFY_MULTIPLIER)),
             (3, ISR, 4, None),
             (4, DEVICE, DEVICE_LEN as u64, None),
@@ -264,7 +263,7 @@ impl VirtioPci {
     /// A read of `size` (1, 2 or 4) bytes at `offset` of BAR 0.
     pub fn mmio_read(&mut self, offset: u64, size: u8) -> u32 {
         match offset {
-            o if o < COMMON + COMMON_LEN => self.common_read(o - COMMON, size),
+            o if o < COMMON_LEN => self.common_read(o, size),
             ISR => {
                 let v = u32::from(self.isr);
                 self.isr = 0; // reading clears it
@@ -335,17 +334,12 @@ impl VirtioPci {
             self.kicks |= 1 << q;
             return;
         }
-        if offset < COMMON + COMMON_LEN {
-            self.common_write(offset - COMMON, size, value);
+        if offset < COMMON_LEN {
+            self.common_write(offset, size, value);
         }
     }
 
     fn common_write(&mut self, o: u64, size: u8, v: u32) {
-        let v = match size {
-            1 => v & 0xFF,
-            2 => v & 0xFFFF,
-            _ => v,
-        };
         match (o, size) {
             (0x00, 4) => self.device_sel = v,
             (0x08, 4) => self.driver_sel = v,
@@ -361,11 +355,7 @@ impl VirtioPci {
             (0x18, 2) => {
                 if let Some(q) = self.selected() {
                     let n = v as u16;
-                    if !self.queue[q].enabled
-                        && n != 0
-                        && n <= MAX_QUEUE_SIZE
-                        && n.is_power_of_two()
-                    {
+                    if !self.queue[q].enabled && n <= MAX_QUEUE_SIZE && n.is_power_of_two() {
                         self.queue[q].size = n;
                     }
                 }
@@ -378,8 +368,6 @@ impl VirtioPci {
                     };
                     if v == 1 && ready {
                         self.queue[q].enabled = true;
-                        self.queue[q].last_avail = 0;
-                        self.queue[q].used_idx = 0;
                     }
                 }
             }
@@ -411,9 +399,7 @@ impl VirtioPci {
         }
         let mut s = v;
         // The device accepts FEATURES_OK only for features it offered and VERSION_1 included.
-        if s & STATUS_FEATURES_OK != 0
-            && (self.accepted & !self.offered != 0 || self.accepted & F_VERSION_1 == 0)
-        {
+        if self.accepted & !self.offered != 0 || self.accepted & F_VERSION_1 == 0 {
             s &= !STATUS_FEATURES_OK;
         }
         // Status bits only ever get set by the driver; the device's own bits are kept.

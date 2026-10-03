@@ -208,16 +208,40 @@ fn r(m: &mut Machine, bar: u64, off: u64, size: u8) -> u32 {
 
 /// Places BAR 0, enables memory and bus mastering, and runs the handshake up to DRIVER_OK.
 fn bring_up(m: &mut Machine, dev: u8, bar: u64, queues: &[&Q], accept: u64) -> u8 {
+    handshake(m, dev, bar, queues, accept, true)
+}
+
+/// The same, optionally stopping short of DRIVER_OK.
+fn handshake(
+    m: &mut Machine,
+    dev: u8,
+    bar: u64,
+    queues: &[&Q],
+    accept: u64,
+    driver_ok: bool,
+) -> u8 {
     cfg_write(m, dev, 0x10, 4, bar as u32);
     cfg_write(m, dev, 0x04, 2, 0x0006);
     w(m, bar, 0x14, 1, 0);
-    w(m, bar, 0x14, 1, 1);
-    w(m, bar, 0x14, 1, 3);
+    w(m, bar, 0x14, 1, u32::from(STATUS_ACKNOWLEDGE));
+    w(
+        m,
+        bar,
+        0x14,
+        1,
+        u32::from(STATUS_ACKNOWLEDGE | STATUS_DRIVER),
+    );
     w(m, bar, 0x08, 4, 0);
     w(m, bar, 0x0C, 4, accept as u32);
     w(m, bar, 0x08, 4, 1);
     w(m, bar, 0x0C, 4, (accept >> 32) as u32);
-    w(m, bar, 0x14, 1, 0xB);
+    w(
+        m,
+        bar,
+        0x14,
+        1,
+        u32::from(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK),
+    );
     for (i, q) in queues.iter().enumerate() {
         w(m, bar, 0x16, 2, i as u32);
         w(m, bar, 0x18, 2, u32::from(q.n));
@@ -230,8 +254,8 @@ fn bring_up(m: &mut Machine, dev: u8, bar: u64, queues: &[&Q], accept: u64) -> u
         w(m, bar, 0x1C, 2, 1);
     }
     let s = r(m, bar, 0x14, 1) as u8;
-    if s & 8 != 0 {
-        w(m, bar, 0x14, 1, u32::from(s | 4));
+    if s & STATUS_FEATURES_OK != 0 && driver_ok {
+        w(m, bar, 0x14, 1, u32::from(s | STATUS_DRIVER_OK));
     }
     r(m, bar, 0x14, 1) as u8
 }
@@ -711,10 +735,14 @@ fn bad_requests_get_an_error_status_and_never_touch_the_disk() {
         assert_eq!(t.kick_blk(), 1, "{name}");
         if name == "header too short" {
             // the status byte is still reachable but the request is not trusted: no status is promised
-            assert_eq!(t.q.take_used(&t.ram).len(), 1, "{name}");
+            assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 0)], "{name}");
         } else {
             assert_eq!(t.status(), want, "{name}");
-            assert_eq!(t.q.take_used(&t.ram)[0].0, u32::from(head), "{name}");
+            assert_eq!(
+                t.q.take_used(&t.ram)[0],
+                (u32::from(head), 1),
+                "{name}: only the status byte"
+            );
         }
         assert_eq!(t.disk.data, before, "{name}: disk untouched");
         assert!(t.disk.writes.is_empty(), "{name}");
@@ -1276,4 +1304,677 @@ fn both_devices_share_the_bus_without_interfering() {
     assert_eq!(r(&mut m, BLK_BAR, 0x14, 1), 0xF);
     assert_eq!(m.net.t.resets, 2);
     assert_eq!(m.blk.t.resets, 1);
+}
+
+// ------------------------------------------- register-level details (mutants)
+
+#[test]
+fn the_specification_values_of_the_status_bits() {
+    assert_eq!(
+        [
+            STATUS_ACKNOWLEDGE,
+            STATUS_DRIVER,
+            STATUS_DRIVER_OK,
+            STATUS_FEATURES_OK
+        ],
+        [1, 2, 4, 8]
+    );
+    assert_eq!([STATUS_NEEDS_RESET, STATUS_FAILED], [0x40, 0x80]);
+    assert_eq!(F_VERSION_1, 1 << 32);
+}
+
+#[test]
+fn a_device_nobody_has_touched_reads_zeros_and_all_ones_where_the_spec_says_so() {
+    let mut m = machine();
+    for (dev, bar) in [(3u8, BLK_BAR), (4, NET_BAR)] {
+        cfg_write(&mut m, dev, 0x10, 4, bar as u32);
+        cfg_write(&mut m, dev, 0x04, 2, 0x0002);
+        for off in [0x00u64, 0x08, 0x0C] {
+            assert_eq!(r(&mut m, bar, off, 4), 0, "offset {off:#x}");
+        }
+        assert_eq!(r(&mut m, bar, 0x10, 2), 0xFFFF, "msix_config: NO_VECTOR");
+        assert_eq!(r(&mut m, bar, 0x14, 1), 0, "status");
+        assert_eq!(r(&mut m, bar, 0x16, 2), 0, "queue_select");
+        assert_eq!(
+            r(&mut m, bar, 0x1A, 2),
+            0xFFFF,
+            "queue_msix_vector: NO_VECTOR"
+        );
+        assert_eq!(r(&mut m, bar, 0x1C, 2), 0, "queue_enable");
+        assert_eq!(r(&mut m, bar, 0x1000, 1), 0, "ISR");
+        assert_eq!(
+            m.mmio_read(bar + 0x2000 + 0x10, 4, 0),
+            0,
+            "device configuration past the used bytes"
+        );
+        assert_eq!(
+            cfg_read(&mut m, dev, 0x06, 2) & 8,
+            0,
+            "no interrupt pending"
+        );
+    }
+    assert_eq!(m.blk.t.take_kicks(), 0);
+    assert_eq!(m.net.t.take_kicks(), 0);
+    assert_eq!(m.blk.t.status(), 0);
+    assert_eq!(m.blk.t.accepted_features(), 0);
+    assert!(!m.blk.t.driver_ok());
+    assert_eq!(m.blk.t.cfg.ignored_writes, 0);
+    assert_eq!(m.net.t.cfg.ignored_writes, 0);
+}
+
+#[test]
+fn capability_bytes_are_laid_out_as_the_specification_says() {
+    let mut m = machine();
+    for (dev, notify_len) in [(3u8, 4u32), (4, 8)] {
+        let mut p = cfg_read(&mut m, dev, 0x34, 1);
+        let mut offsets = Vec::new();
+        let mut kinds = Vec::new();
+        while p != 0 {
+            offsets.push(p);
+            let len = cfg_read(&mut m, dev, p + 2, 1);
+            let kind = cfg_read(&mut m, dev, p + 3, 1);
+            kinds.push((kind, len));
+            assert_eq!(cfg_read(&mut m, dev, p + 4, 1), 0, "BAR 0");
+            for pad in 5..8 {
+                assert_eq!(cfg_read(&mut m, dev, p + pad, 1), 0, "padding");
+            }
+            if kind == 2 {
+                assert_eq!(cfg_read(&mut m, dev, p + 12, 4), notify_len);
+            }
+            p = cfg_read(&mut m, dev, p + 1, 1);
+        }
+        assert_eq!(offsets, [0x40, 0x50, 0x64, 0x74]);
+        assert_eq!(kinds, [(1, 16), (2, 20), (3, 16), (4, 16)]);
+    }
+}
+
+#[test]
+fn every_common_configuration_register_reads_back_what_was_written() {
+    let mut m = machine();
+    let q = Q::new(0x1000, 8);
+    cfg_write(&mut m, 4, 0x10, 4, NET_BAR as u32);
+    cfg_write(&mut m, 4, 0x04, 2, 0x0002);
+    w(&mut m, NET_BAR, 0x08, 4, 1);
+    assert_eq!(r(&mut m, NET_BAR, 0x08, 4), 1, "driver_feature_select");
+    assert_eq!(
+        r(&mut m, NET_BAR, 0x00, 4),
+        0,
+        "device_feature_select is separate"
+    );
+    w(&mut m, NET_BAR, 0x16, 2, 1);
+    assert_eq!(r(&mut m, NET_BAR, 0x16, 2), 1, "queue_select");
+    w(&mut m, NET_BAR, 0x28, 4, q.avail as u32);
+    w(&mut m, NET_BAR, 0x2C, 4, 7);
+    w(&mut m, NET_BAR, 0x30, 4, q.used as u32);
+    w(&mut m, NET_BAR, 0x34, 4, 9);
+    w(&mut m, NET_BAR, 0x20, 4, q.desc as u32);
+    w(&mut m, NET_BAR, 0x24, 4, 5);
+    assert_eq!(r(&mut m, NET_BAR, 0x20, 4), q.desc as u32);
+    assert_eq!(r(&mut m, NET_BAR, 0x24, 4), 5);
+    assert_eq!(r(&mut m, NET_BAR, 0x28, 4), q.avail as u32);
+    assert_eq!(r(&mut m, NET_BAR, 0x2C, 4), 7);
+    assert_eq!(r(&mut m, NET_BAR, 0x30, 4), q.used as u32);
+    assert_eq!(r(&mut m, NET_BAR, 0x34, 4), 9);
+    // a read that runs off the end of the structure gets zeros there
+    assert_eq!(
+        r(&mut m, NET_BAR, 0x36, 4),
+        0,
+        "bytes 0x36 and 0x37 are zero, then nothing"
+    );
+    w(&mut m, NET_BAR, 0x34, 4, 0x1234_5678);
+    assert_eq!(
+        r(&mut m, NET_BAR, 0x36, 4),
+        0x1234,
+        "two bytes inside, two beyond the structure"
+    );
+    assert_eq!(
+        r(&mut m, NET_BAR, 0x2000 + 62, 4),
+        0,
+        "the same for the device configuration"
+    );
+    // another queue has its own addresses
+    w(&mut m, NET_BAR, 0x16, 2, 0);
+    assert_eq!(r(&mut m, NET_BAR, 0x20, 4), 0);
+    assert_eq!(r(&mut m, NET_BAR, 0x2C, 4), 0);
+}
+
+#[test]
+fn feature_words_keep_each_other_and_can_be_cleared() {
+    let mut m = machine();
+    cfg_write(&mut m, 3, 0x10, 4, BLK_BAR as u32);
+    cfg_write(&mut m, 3, 0x04, 2, 0x0002);
+    w(&mut m, BLK_BAR, 0x08, 4, 1);
+    w(&mut m, BLK_BAR, 0x0C, 4, 1);
+    w(&mut m, BLK_BAR, 0x08, 4, 0);
+    w(&mut m, BLK_BAR, 0x0C, 4, 0x200);
+    w(&mut m, BLK_BAR, 0x08, 4, 1);
+    assert_eq!(
+        r(&mut m, BLK_BAR, 0x0C, 4),
+        1,
+        "the high half survived a low write"
+    );
+    assert_eq!(m.blk.t.accepted_features(), F_VERSION_1 | 0x200);
+    w(&mut m, BLK_BAR, 0x0C, 4, 0);
+    assert_eq!(r(&mut m, BLK_BAR, 0x0C, 4), 0, "and can be cleared");
+    w(&mut m, BLK_BAR, 0x08, 4, 0);
+    assert_eq!(
+        r(&mut m, BLK_BAR, 0x0C, 4),
+        0x200,
+        "while the low half stayed"
+    );
+    w(&mut m, BLK_BAR, 0x0C, 4, 0);
+    assert_eq!(m.blk.t.accepted_features(), 0);
+}
+
+#[test]
+fn the_largest_queue_size_is_accepted_and_the_next_power_is_not() {
+    let mut m = machine();
+    cfg_write(&mut m, 3, 0x10, 4, BLK_BAR as u32);
+    cfg_write(&mut m, 3, 0x04, 2, 0x0002);
+    w(&mut m, BLK_BAR, 0x18, 2, 16);
+    assert_eq!(r(&mut m, BLK_BAR, 0x18, 2), 16);
+    w(&mut m, BLK_BAR, 0x18, 2, 128);
+    assert_eq!(r(&mut m, BLK_BAR, 0x18, 2), 128);
+    w(&mut m, BLK_BAR, 0x18, 2, 1);
+    assert_eq!(
+        r(&mut m, BLK_BAR, 0x18, 2),
+        1,
+        "a queue of one entry is legal"
+    );
+    w(&mut m, BLK_BAR, 0x18, 2, 0);
+    assert_eq!(r(&mut m, BLK_BAR, 0x18, 2), 1, "zero is not");
+    w(&mut m, BLK_BAR, 0x18, 2, 256);
+    assert_eq!(r(&mut m, BLK_BAR, 0x18, 2), 1);
+}
+
+#[test]
+fn notifications_set_one_bit_per_queue_and_only_for_queues_that_exist() {
+    let mut m = machine();
+    for (dev, bar) in [(3u8, BLK_BAR), (4, NET_BAR)] {
+        cfg_write(&mut m, dev, 0x10, 4, bar as u32);
+        cfg_write(&mut m, dev, 0x04, 2, 0x0002);
+    }
+    w(&mut m, NET_BAR, 0x3000, 4, 0);
+    assert_eq!(m.net.t.take_kicks(), 1);
+    assert_eq!(m.net.t.take_kicks(), 0, "taking clears");
+    w(&mut m, NET_BAR, 0x3004, 4, 1);
+    assert_eq!(m.net.t.take_kicks(), 2);
+    w(&mut m, NET_BAR, 0x3004, 2, 1);
+    w(&mut m, NET_BAR, 0x3000, 1, 0);
+    assert_eq!(m.net.t.take_kicks(), 3, "any access size notifies");
+    w(&mut m, NET_BAR, 0x3008, 4, 2);
+    w(&mut m, NET_BAR, 0x3FFC, 4, 3);
+    assert_eq!(m.net.t.take_kicks(), 0, "there is no queue 2");
+    w(&mut m, BLK_BAR, 0x3004, 4, 1);
+    assert_eq!(m.blk.t.take_kicks(), 0, "the disk has one queue");
+    w(&mut m, BLK_BAR, 0x3000, 4, 0);
+    assert_eq!(m.blk.t.take_kicks(), 1);
+}
+
+#[test]
+fn queues_are_not_served_before_driver_ok() {
+    let mut m = machine();
+    let q = Q::new(0x1000, 8);
+    let s = handshake(&mut m, 3, BLK_BAR, &[&q], BLK_FEATURES, false);
+    assert_eq!(s, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
+    assert!(
+        !m.blk.t.queue_ready(0),
+        "enabled, but the driver is not running yet"
+    );
+    assert!(!m.blk.t.driver_ok());
+    let s = r(&mut m, BLK_BAR, 0x14, 1) as u8;
+    w(&mut m, BLK_BAR, 0x14, 1, u32::from(s | STATUS_DRIVER_OK));
+    assert!(m.blk.t.driver_ok());
+    assert!(m.blk.t.queue_ready(0));
+    assert!(!m.blk.t.queue_ready(1), "the disk has no queue 1");
+    assert!(!m.blk.t.queue_ready(5), "nor a queue 5");
+}
+
+#[test]
+fn net_queue_indices_beyond_the_two_it_has_are_not_ready() {
+    let t = net_rig();
+    assert!(t.m.net.t.queue_ready(0));
+    assert!(t.m.net.t.queue_ready(1));
+    assert!(!t.m.net.t.queue_ready(2));
+    assert!(!t.m.net.t.queue_ready(7));
+}
+
+#[test]
+fn a_reset_forgets_features_selectors_interrupt_and_notifications() {
+    let mut t = blk_rig();
+    blk_request(&mut t.ram, HDR, 4, 0);
+    t.q.add(&mut t.ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+    t.kick_blk();
+    w(&mut t.m, BLK_BAR, 0x3000, 4, 0);
+    w(&mut t.m, BLK_BAR, 0x16, 2, 5);
+    assert!(t.m.blk.t.irq());
+    assert_eq!(cfg_read(&mut t.m, 3, 0x06, 2) & 8, 8);
+    w(&mut t.m, BLK_BAR, 0x14, 1, 0);
+    assert!(!t.m.blk.t.irq(), "the interrupt is gone");
+    assert_eq!(
+        cfg_read(&mut t.m, 3, 0x06, 2) & 8,
+        0,
+        "also in the PCI status"
+    );
+    assert_eq!(t.m.blk.t.accepted_features(), 0);
+    assert_eq!(t.m.blk.t.take_kicks(), 0);
+    assert_eq!(
+        r(&mut t.m, BLK_BAR, 0x16, 2),
+        0,
+        "the reset returns to queue 0"
+    );
+    assert_eq!(r(&mut t.m, BLK_BAR, 0x1000, 1), 0);
+}
+
+// ------------------------------------------------ second round (mutants)
+
+struct Probe {
+    reads: Vec<u64>,
+}
+
+impl BlockBackend for Probe {
+    fn sectors(&self) -> u64 {
+        u64::MAX
+    }
+    fn read(&mut self, s: u64, buf: &mut [u8; SECTOR]) -> bool {
+        self.reads.push(s);
+        buf.fill(0x5A);
+        true
+    }
+    fn write(&mut self, _: u64, _: &[u8; SECTOR]) -> bool {
+        true
+    }
+    fn flush(&mut self) -> bool {
+        true
+    }
+}
+
+fn raw_header(ram: &mut Ram, at: u64, bytes: [u8; 16]) {
+    assert!(ram.write(at, &bytes));
+}
+
+#[test]
+fn the_request_header_is_decoded_byte_by_byte() {
+    // the sector number: eight different bytes
+    let mut t = blk_rig();
+    let mut p = Probe { reads: Vec::new() };
+    let mut h = [0u8; 16];
+    h[8..].copy_from_slice(&0x0807_0605_0403_0201u64.to_le_bytes());
+    raw_header(&mut t.ram, HDR, h);
+    t.q.add(
+        &mut t.ram,
+        &[(HDR, 16, false), (DATA, 512, true), (STATUS, 1, true)],
+    );
+    w(&mut t.m, BLK_BAR, 0x3000, 4, 0);
+    assert_eq!(t.m.service_blk(&mut t.ram, &mut p, 0), 1);
+    assert_eq!(p.reads, [0x0807_0605_0403_0201]);
+    assert_eq!(t.status(), 0);
+    // every byte of the type matters: a type with only one byte set is not a read
+    for i in 1..4 {
+        let mut t = blk_rig();
+        let mut p = Probe { reads: Vec::new() };
+        let mut h = [0u8; 16];
+        h[i] = 1;
+        raw_header(&mut t.ram, HDR, h);
+        t.q.add(
+            &mut t.ram,
+            &[(HDR, 16, false), (DATA, 512, true), (STATUS, 1, true)],
+        );
+        w(&mut t.m, BLK_BAR, 0x3000, 4, 0);
+        t.m.service_blk(&mut t.ram, &mut p, 0);
+        assert_eq!(t.status(), 2, "type byte {i}: unsupported");
+        assert!(p.reads.is_empty(), "type byte {i}");
+    }
+    // the reserved/priority bytes are ignored
+    let mut t = blk_rig();
+    let mut p = Probe { reads: Vec::new() };
+    let mut h = [0u8; 16];
+    h[4..8].copy_from_slice(&[0xFF; 4]);
+    raw_header(&mut t.ram, HDR, h);
+    t.q.add(
+        &mut t.ram,
+        &[(HDR, 16, false), (DATA, 512, true), (STATUS, 1, true)],
+    );
+    w(&mut t.m, BLK_BAR, 0x3000, 4, 0);
+    t.m.service_blk(&mut t.ram, &mut p, 0);
+    assert_eq!(t.status(), 0);
+    assert_eq!(p.reads, [0]);
+}
+
+#[test]
+fn chains_without_a_usable_header_or_status_complete_empty_and_untouched() {
+    type Shape = (&'static str, Vec<(u64, u32, bool)>);
+    let shapes: [Shape; 4] = [
+        ("one descriptor", vec![(HDR, 16, false)]),
+        ("writable header", vec![(HDR, 16, true), (STATUS, 1, true)]),
+        (
+            "read-only status",
+            vec![(HDR, 16, false), (STATUS, 1, false)],
+        ),
+        ("empty status", vec![(HDR, 16, false), (STATUS, 0, true)]),
+    ];
+    for (name, bufs) in shapes {
+        let mut t = blk_rig();
+        blk_request(&mut t.ram, HDR, 4, 0);
+        let head = t.q.add(&mut t.ram, &bufs);
+        assert_eq!(t.kick_blk(), 1, "{name}");
+        assert_eq!(t.disk.flushes, 0, "{name}: nothing executed");
+        assert_eq!(t.status(), 0xEE, "{name}: no status written");
+        assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 0)], "{name}");
+        assert_eq!(t.m.blk.failed, 1, "{name}");
+    }
+}
+
+#[test]
+fn the_last_sector_is_readable_and_used_lengths_are_exact() {
+    let mut t = blk_rig();
+    blk_request(&mut t.ram, HDR, 0, 63);
+    let head = t.q.add(
+        &mut t.ram,
+        &[(HDR, 16, false), (DATA, 512, true), (STATUS, 1, true)],
+    );
+    t.kick_blk();
+    assert_eq!(t.status(), 0);
+    assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 513)]);
+    // flush: one byte (the status)
+    blk_request(&mut t.ram, HDR, 4, 0);
+    let head = t.q.add(&mut t.ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+    t.kick_blk();
+    assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 1)]);
+    // an identifier buffer that is too small: error status, one byte
+    blk_request(&mut t.ram, HDR, 8, 0);
+    let head = t.q.add(
+        &mut t.ram,
+        &[(HDR, 16, false), (DATA, 19, true), (STATUS, 1, true)],
+    );
+    t.kick_blk();
+    assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 1)]);
+    // unknown type: one byte
+    blk_request(&mut t.ram, HDR, 99, 0);
+    let head = t.q.add(&mut t.ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+    t.kick_blk();
+    assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 1)]);
+    // a rejected shape that has a status byte: one byte
+    blk_request(&mut t.ram, HDR, 0, 0);
+    let head = t.q.add(
+        &mut t.ram,
+        &[(HDR, 16, false), (DATA, 100, true), (STATUS, 1, true)],
+    );
+    t.kick_blk();
+    assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 1)]);
+    // a failed flush-less read past the end
+    blk_request(&mut t.ram, HDR, 0, 64);
+    let head = t.q.add(
+        &mut t.ram,
+        &[(HDR, 16, false), (DATA, 512, true), (STATUS, 1, true)],
+    );
+    t.kick_blk();
+    assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 1)]);
+}
+
+#[test]
+fn the_capacity_is_eight_bytes_at_the_start_of_the_device_configuration() {
+    let mut b = vmm_devices::virtio_blk::VirtioBlk::new(0x0807_0605_0403_0201, 11);
+    for i in 0..8u64 {
+        assert_eq!(b.t.mmio_read(0x2000 + i, 1), 1 + i as u32);
+    }
+    assert_eq!(b.t.mmio_read(0x2008, 4), 0);
+    b.set_capacity(0x1112_1314_1516_1718);
+    assert_eq!(b.t.mmio_read(0x2000, 4), 0x1516_1718);
+    assert_eq!(b.t.mmio_read(0x2004, 4), 0x1112_1314);
+}
+
+#[test]
+fn a_queue_is_enabled_only_with_all_three_addresses_set() {
+    for missing in 0..3 {
+        let mut m = machine();
+        cfg_write(&mut m, 3, 0x10, 4, BLK_BAR as u32);
+        cfg_write(&mut m, 3, 0x04, 2, 0x0002);
+        let addrs = [(0x20u64, 0x1000u32), (0x28, 0x2000), (0x30, 0x3000)];
+        for (i, (off, v)) in addrs.iter().enumerate() {
+            if i != missing {
+                w(&mut m, BLK_BAR, *off, 4, *v);
+            }
+        }
+        w(&mut m, BLK_BAR, 0x1C, 2, 1);
+        assert_eq!(r(&mut m, BLK_BAR, 0x1C, 2), 0, "address {missing} is zero");
+        w(&mut m, BLK_BAR, addrs[missing].0, 4, addrs[missing].1);
+        w(&mut m, BLK_BAR, 0x1C, 2, 1);
+        assert_eq!(r(&mut m, BLK_BAR, 0x1C, 2), 1);
+    }
+    // a value of 1 is an address like any other; 0 is not
+    let mut m = machine();
+    cfg_write(&mut m, 3, 0x10, 4, BLK_BAR as u32);
+    cfg_write(&mut m, 3, 0x04, 2, 0x0002);
+    for off in [0x20u64, 0x28, 0x30] {
+        w(&mut m, BLK_BAR, off, 4, 1);
+    }
+    w(&mut m, BLK_BAR, 0x1C, 2, 1);
+    assert_eq!(r(&mut m, BLK_BAR, 0x1C, 2), 1);
+}
+
+#[test]
+fn the_two_halves_of_a_queue_address_are_independent() {
+    let mut m = machine();
+    cfg_write(&mut m, 3, 0x10, 4, BLK_BAR as u32);
+    cfg_write(&mut m, 3, 0x04, 2, 0x0002);
+    for off in [0x20u64, 0x28, 0x30] {
+        w(&mut m, BLK_BAR, off + 4, 4, 0x7);
+        w(&mut m, BLK_BAR, off, 4, 0xFFFF_F000);
+        assert_eq!(
+            r(&mut m, BLK_BAR, off + 4, 4),
+            0x7,
+            "high half after a low write"
+        );
+        assert_eq!(r(&mut m, BLK_BAR, off, 4), 0xFFFF_F000);
+        w(&mut m, BLK_BAR, off, 4, 0x1000);
+        assert_eq!(r(&mut m, BLK_BAR, off, 4), 0x1000, "low half replaced");
+        assert_eq!(r(&mut m, BLK_BAR, off + 4, 4), 0x7);
+        w(&mut m, BLK_BAR, off + 4, 4, 0);
+        assert_eq!(
+            r(&mut m, BLK_BAR, off, 4),
+            0x1000,
+            "low half after a high write"
+        );
+    }
+}
+
+#[test]
+fn a_ring_that_is_exactly_full_is_served_but_one_more_is_an_error() {
+    let mut t = net_rig();
+    for i in 0..8u8 {
+        t.tx(&frame(60 + usize::from(i), i));
+    }
+    assert_eq!(t.kick(1), (8, 0), "eight chains in a queue of eight");
+    assert_eq!(t.m.net.t.status() & STATUS_NEEDS_RESET, 0);
+    assert_eq!(t.wire.sent.len(), 8);
+    // a ninth chain made available while the other eight are outstanding
+    let mut t = net_rig();
+    assert!(t.ram.write(t.tx.avail + 2, &9u16.to_le_bytes()));
+    assert_eq!(t.kick(1), (0, 0));
+    assert_ne!(t.m.net.t.status() & STATUS_NEEDS_RESET, 0);
+}
+
+#[test]
+fn descriptor_indices_equal_to_the_queue_size_are_out_of_range() {
+    // the head
+    let mut t = blk_rig();
+    assert!(t.ram.write(t.q.avail + 4, &8u16.to_le_bytes()));
+    assert!(t.ram.write(t.q.avail + 2, &1u16.to_le_bytes()));
+    assert_eq!(t.kick_blk(), 0);
+    assert_ne!(t.m.blk.t.status() & STATUS_NEEDS_RESET, 0, "head 8 of 8");
+    // a link
+    let mut t = blk_rig();
+    let mut d = [0u8; 16];
+    d[8..12].copy_from_slice(&16u32.to_le_bytes());
+    d[12..14].copy_from_slice(&1u16.to_le_bytes());
+    d[14..16].copy_from_slice(&8u16.to_le_bytes());
+    assert!(t.ram.write(t.q.desc, &d));
+    assert!(t.ram.write(t.q.avail + 4, &0u16.to_le_bytes()));
+    assert!(t.ram.write(t.q.avail + 2, &1u16.to_le_bytes()));
+    assert_eq!(t.kick_blk(), 0);
+    assert_ne!(t.m.blk.t.status() & STATUS_NEEDS_RESET, 0, "link 8 of 8");
+    // the last valid index, 7, is fine
+    let mut t = blk_rig();
+    t.q.next_desc = 6;
+    blk_request(&mut t.ram, HDR, 4, 0);
+    t.q.add(&mut t.ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+    assert_eq!(t.kick_blk(), 1, "descriptors 6 and 7");
+    assert_eq!(t.m.blk.t.status() & STATUS_NEEDS_RESET, 0);
+}
+
+#[test]
+fn a_buffer_given_back_unused_keeps_its_place_in_the_ring() {
+    let mut t = net_rig();
+    let a = t.rx.add(&mut t.ram, &[(FRAMES, 2048, true)]);
+    let b = t.rx.add(&mut t.ram, &[(FRAMES + 0x1000, 2048, true)]);
+    assert_eq!((a, b), (0, 1));
+    assert_eq!(t.kick(0), (0, 0), "no frame yet");
+    t.wire.inbox.push_back(frame(64, 1));
+    assert_eq!(t.kick(0), (0, 1));
+    t.wire.inbox.push_back(frame(65, 2));
+    assert_eq!(t.kick(0), (0, 1));
+    assert_eq!(
+        t.rx.take_used(&t.ram),
+        [(0, 76), (1, 77)],
+        "the first buffer took the first frame, the second buffer the second"
+    );
+    let mut got = [0u8; 64];
+    assert!(t.ram.read(FRAMES + 12, &mut got));
+    assert_eq!(&got[..], &frame(64, 1)[..]);
+    let mut got = [0u8; 65];
+    assert!(t.ram.read(FRAMES + 0x1000 + 12, &mut got));
+    assert_eq!(&got[..], &frame(65, 2)[..]);
+}
+
+#[test]
+fn a_used_ring_the_device_cannot_write_needs_reset() {
+    let mut m = machine();
+    let mut q = Q::new(0x1000, 8);
+    q.used = 0x50000; // beyond the end of RAM
+    assert_eq!(bring_up(&mut m, 3, BLK_BAR, &[&q], BLK_FEATURES), 0xF);
+    let mut ram = Ram(vec![0; 0x40000]);
+    let mut disk = Disk::new(64);
+    blk_request(&mut ram, HDR, 4, 0);
+    q.add(&mut ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+    w(&mut m, BLK_BAR, 0x3000, 4, 0);
+    m.service_blk(&mut ram, &mut disk, 0);
+    assert_ne!(m.blk.t.status() & STATUS_NEEDS_RESET, 0);
+    assert!(
+        !m.blk.t.irq(),
+        "no interrupt for a completion that was not recorded"
+    );
+    // called directly the failure is reported
+    assert!(!m.blk.t.push_used(&mut ram, 0, 0, 0));
+}
+
+#[test]
+fn completing_reports_success_and_interrupts_when_the_ring_flags_are_unreadable() {
+    let mut m = machine();
+    let mut q = Q::new(0x1000, 8);
+    q.avail = 0x50000; // flags cannot be read; the used ring can be written
+    assert_eq!(bring_up(&mut m, 3, BLK_BAR, &[&q], BLK_FEATURES), 0xF);
+    let mut ram = Ram(vec![0; 0x40000]);
+    assert!(m.blk.t.push_used(&mut ram, 0, 3, 17));
+    assert!(m.blk.t.irq(), "when in doubt the driver is told");
+    let mut e = [0u8; 8];
+    assert!(ram.read(q.used + 4, &mut e));
+    assert_eq!(u32::from_le_bytes([e[0], e[1], e[2], e[3]]), 3);
+    assert_eq!(u32::from_le_bytes([e[4], e[5], e[6], e[7]]), 17);
+    let mut idx = [0u8; 2];
+    assert!(ram.read(q.used + 2, &mut idx));
+    assert_eq!(u16::from_le_bytes(idx), 1);
+    // and with readable flags that allow it
+    let mut t = blk_rig();
+    assert!(t.m.blk.t.push_used(&mut t.ram, 0, 1, 2));
+    assert!(t.m.blk.t.irq());
+}
+
+#[test]
+fn a_transmit_chain_with_a_bad_buffer_after_a_good_one_sends_nothing() {
+    let mut t = net_rig();
+    t.ram.write(FRAMES, &[0u8; 64]);
+    t.tx.add(&mut t.ram, &[(FRAMES, 64, false), (0x10_0000, 64, false)]);
+    t.tx.add(&mut t.ram, &[(FRAMES, 64, false), (FRAMES, 64, true)]);
+    assert_eq!(t.kick(1), (2, 0));
+    assert!(t.wire.sent.is_empty());
+    assert_eq!(t.m.net.tx_errors, 2);
+}
+
+#[test]
+fn service_consumes_the_notifications() {
+    let mut t = blk_rig();
+    t.kick_blk();
+    assert_eq!(t.m.blk.t.take_kicks(), 0);
+    let mut n = net_rig();
+    n.kick(1);
+    n.kick(0);
+    assert_eq!(n.m.net.t.take_kicks(), 0);
+}
+
+#[test]
+fn network_constants() {
+    assert_eq!(virtio_net::MAX_FRAME, 2048);
+    assert_eq!(virtio_net::HEADER, 12);
+}
+
+#[test]
+fn the_interrupt_reaches_the_8259_as_soon_as_the_service_returns() {
+    let mut t = blk_rig();
+    program_pic(&mut t.m);
+    blk_request(&mut t.ram, HDR, 4, 0);
+    t.q.add(&mut t.ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+    t.kick_blk();
+    assert!(t.m.pic.int_pending(), "no further call was needed");
+    let mut n = net_rig();
+    program_pic(&mut n.m);
+    n.tx(&frame(60, 1));
+    n.kick(1);
+    assert!(n.m.pic.int_pending());
+}
+
+#[test]
+fn a_function_does_not_disturb_lines_it_is_not_routed_to() {
+    let mut t = blk_rig();
+    program_pic(&mut t.m);
+    // IRQ 12 is driven by something else, level-triggered and unmasked
+    t.m.io_out(0x4D1, 1, 0x1C, 0);
+    t.m.io_out(0xA1, 1, 0xE3, 0);
+    t.m.pic.set_irq(12, true);
+    t.m.sync(0);
+    assert!(t.m.pic.int_pending());
+    t.m.sync(1);
+    assert!(
+        t.m.pic.int_pending(),
+        "a sync does not release a line nobody of ours drives"
+    );
+    assert_eq!(t.m.pending(1), Some(0x28 + 4));
+}
+
+#[test]
+fn an_interrupt_line_beyond_the_8259_is_ignored() {
+    let mut t = blk_rig();
+    program_pic(&mut t.m);
+    for line in [16u32, 17, 255] {
+        cfg_write(&mut t.m, 3, 0x3C, 1, line);
+        blk_request(&mut t.ram, HDR, 4, 0);
+        t.q.add(&mut t.ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+        t.kick_blk();
+        assert_eq!(t.m.pending(0), None, "line {line}");
+        r(&mut t.m, BLK_BAR, 0x1000, 1);
+    }
+}
+
+#[test]
+fn moving_an_asserted_interrupt_to_another_line_releases_the_old_one() {
+    let mut t = blk_rig();
+    program_pic(&mut t.m);
+    blk_request(&mut t.ram, HDR, 4, 0);
+    t.q.add(&mut t.ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+    t.kick_blk();
+    assert_eq!(t.m.pending(0), Some(0x2B));
+    // the new line (IRQ 5) is masked at the 8259: nothing may remain pending
+    cfg_write(&mut t.m, 3, 0x3C, 1, 5);
+    // (the cascade latched the edge, so the 8259 may still answer with its spurious vector)
+    assert_ne!(t.m.pending(0), Some(0x2B), "line 11 was released");
 }

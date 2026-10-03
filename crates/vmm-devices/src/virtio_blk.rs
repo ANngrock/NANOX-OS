@@ -80,10 +80,11 @@ impl VirtioBlk {
     ) -> (u8, u32) {
         let d = chain.descs();
         // header, at least one more buffer (the status), the status last and writable
-        let (Some(h), Some(st)) = (d.first(), d.last()) else {
+        if d.len() < 2 {
             return (STATUS_IOERR, 0);
-        };
-        if d.len() < 2 || h.write || h.len < 16 || !st.write || st.len < 1 {
+        }
+        let (h, st) = (&d[0], &d[d.len() - 1]);
+        if h.write || h.len < 16 || !st.write || st.len < 1 {
             // Without a usable status byte nothing can be reported: complete the chain empty.
             return (STATUS_IOERR, 0);
         }
