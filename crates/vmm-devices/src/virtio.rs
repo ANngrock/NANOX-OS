@@ -10,11 +10,12 @@
 //! size, and refuses what it does not implement (indirect descriptors, packed
 //! rings) by setting DEVICE_NEEDS_RESET, which is what the specification asks
 //! of a device that has been given something broken. Devices built on it are
-//! `virtio_blk` and `virtio_net`.
+//! `virtio_blk`, `virtio_net`, `virtio_gpu`, `virtio_console` and `virtio_input`.
 //!
 //! BAR 0 (16 KiB): common configuration at 0x0000, ISR at 0x1000, device
 //! configuration at 0x2000, notifications at 0x3000 (queue `n` at
-//! `0x3000 + 4n`, multiplier 4).
+//! `0x3000 + 4n`, multiplier 4). The device configuration is read-only here;
+//! a device whose driver writes it (virtio-input) takes those writes itself.
 
 use crate::pci::{BarKind, Config};
 
@@ -22,8 +23,12 @@ pub const VENDOR: u16 = 0x1AF4;
 pub const BAR_SIZE: u32 = 0x4000;
 const COMMON_LEN: u64 = 0x38;
 const ISR: u64 = 0x1000;
-const DEVICE: u64 = 0x2000;
+/// Where the device configuration starts in BAR 0.
+pub const DEVICE: u64 = 0x2000;
+/// The device configuration's length as the capability gives it, unless the device asks for another.
 pub const DEVICE_LEN: usize = 64;
+/// The longest device configuration (virtio-input's: 8 bytes of header and a 128-byte union).
+pub const DEVICE_MAX: usize = 136;
 const NOTIFY: u64 = 0x3000;
 const NOTIFY_MULTIPLIER: u32 = 4;
 
@@ -115,7 +120,7 @@ pub struct VirtioPci {
     queue_sel: u16,
     queue: [Queue; MAX_QUEUES],
     isr: u8,
-    dev_cfg: [u8; DEVICE_LEN],
+    dev_cfg: [u8; DEVICE_MAX],
     /// Queues the driver notified since the device last looked (bit per queue).
     kicks: u32,
     pub resets: u32,
@@ -139,7 +144,19 @@ impl VirtioPci {
     /// A modern virtio PCI function of `device_type` (1 net, 2 block) with `queues` queues and
     /// `features` (without VERSION_1, which is always offered), class code `class`, INTA on `line`.
     pub fn new(device_type: u16, class: u32, queues: usize, features: u64, line: u8) -> Self {
-        assert!(queues <= MAX_QUEUES);
+        Self::with_config_len(device_type, class, queues, features, line, DEVICE_LEN)
+    }
+
+    /// As [`VirtioPci::new`], with a device configuration of `config_len` bytes (at most [`DEVICE_MAX`]).
+    pub fn with_config_len(
+        device_type: u16,
+        class: u32,
+        queues: usize,
+        features: u64,
+        line: u8,
+        config_len: usize,
+    ) -> Self {
+        assert!(queues <= MAX_QUEUES && config_len <= DEVICE_MAX);
         let mut cfg = Config::new(
             VENDOR,
             0x1040 + device_type,
@@ -154,7 +171,7 @@ impl VirtioPci {
             (1u8, 0, COMMON_LEN, None),
             (2, NOTIFY, 4 * queues as u64, Some(NOTIFY_MULTIPLIER)),
             (3, ISR, 4, None),
-            (4, DEVICE, DEVICE_LEN as u64, None),
+            (4, DEVICE, config_len as u64, None),
         ] {
             let (b, n) = cap(t, off as u32, len as u32, extra);
             cfg.add_capability(&b[..n]);
@@ -174,7 +191,7 @@ impl VirtioPci {
                 ..Queue::default()
             }; MAX_QUEUES],
             isr: 0,
-            dev_cfg: [0; DEVICE_LEN],
+            dev_cfg: [0; DEVICE_MAX],
             kicks: 0,
             resets: 0,
         }
@@ -270,7 +287,7 @@ impl VirtioPci {
                 self.refresh();
                 v
             }
-            o if (DEVICE..DEVICE + DEVICE_LEN as u64).contains(&o) => {
+            o if (DEVICE..DEVICE + DEVICE_MAX as u64).contains(&o) => {
                 let at = (o - DEVICE) as usize;
                 let mut w = [0u8; 4];
                 for (i, b) in w.iter_mut().enumerate().take(usize::from(size)) {

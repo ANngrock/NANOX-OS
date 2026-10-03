@@ -20,13 +20,15 @@
 //! * an EOI at the local APIC tells the I/O APIC, which clears remote IRR.
 //!
 //! * PCI bus 0: the host bridge (slot 0), virtio-blk (slot 3), virtio-net
-//!   (slot 4), virtio-gpu (slot 5) and virtio-console, the agent channel (slot
-//!   6); configuration through ports 0xCF8/0xCFC and ECAM, BAR 0 of the virtio
+//!   (slot 4), virtio-gpu (slot 5), virtio-console, the agent channel (slot
+//!   6), and virtio-input as a keyboard (slot 7) and a tablet (slot 8);
+//!   configuration through ports 0xCF8/0xCFC and ECAM, BAR 0 of the virtio
 //!   devices as memory the guest placed. Their INTA goes to I/O APIC pin 16 +
-//!   slot % 4 (active low: 19, 16, 17 and 18) and to the 8259 line in the
-//!   interrupt-line register (11, 10, 5 and 3: lines no ISA device or the SCI
-//!   uses, and none shared between the functions). Their DMA runs in
-//!   `service_blk` / `service_net` / `service_gpu` / `service_console`.
+//!   slot % 4 (active low: 19, 16, 17, 18, 19 and 16; functions on one pin are
+//!   wired-or) and to the 8259 line in the interrupt-line register (11, 10, 5,
+//!   3, 14 and 12: lines no ISA device or the SCI uses, and none shared between
+//!   the functions). Their DMA runs in `service_blk` / `service_net` /
+//!   `service_gpu` / `service_console` / `service_input`.
 //!
 //! Not modeled: the PIT's channel 0 (nothing drives IRQ0 but the HPET), MSI,
 //! PCI bridges, and more than one CPU.
@@ -45,7 +47,8 @@ use crate::uart::Uart;
 use crate::virtio::{GuestMemory, VirtioPci};
 use crate::virtio_blk::{BlockBackend, VirtioBlk};
 use crate::virtio_console::{ConsoleBackend, VirtioConsole};
-use crate::virtio_gpu::{Scanout, VirtioGpu};
+use crate::virtio_gpu::{self, Scanout, VirtioGpu};
+use crate::virtio_input::VirtioInput;
 use crate::virtio_net::{NetBackend, VirtioNet};
 
 pub const PCI_ADDRESS: u16 = 0xCF8;
@@ -60,14 +63,20 @@ pub mod slot {
     pub const NET: u8 = 4;
     pub const GPU: u8 = 5;
     pub const CONSOLE: u8 = 6;
+    pub const KEYBOARD: u8 = 7;
+    pub const TABLET: u8 = 8;
 }
 /// The ISA lines the PCI devices' INTA is routed to on the 8259 (the interrupt line register tells the guest).
 /// IRQ 5 is the display's and IRQ 3 the agent channel's: no ISA device of this platform uses them
-/// (they have 1, 4, 8 and the SCI on 9; COM2 is not modeled).
+/// (they have 1, 4, 8 and the SCI on 9; COM2 is not modeled). The keyboard has IRQ 14 (there is no
+/// IDE controller) and the tablet IRQ 12 (the PS/2 mouse's on a PC; the i8042 here has no auxiliary
+/// port); 7 and 15 are left alone, the 8259s report spurious interrupts there.
 const BLK_PIC_LINE: u8 = 11;
 const NET_PIC_LINE: u8 = 10;
 const GPU_PIC_LINE: u8 = 5;
 const CONSOLE_PIC_LINE: u8 = 3;
+const KEYBOARD_PIC_LINE: u8 = 14;
+const TABLET_PIC_LINE: u8 = 12;
 /// Where a PCI device's INTx lands on the I/O APIC: pins 16..20, rotated by the slot (the q35 swizzle).
 pub fn pci_pin(dev: u8) -> u8 {
     16 + dev % 4
@@ -112,6 +121,10 @@ pub struct Machine {
     pub net: VirtioNet,
     pub gpu: VirtioGpu,
     pub console: VirtioConsole,
+    /// virtio-input at 00:07.0 (a keyboard; the PS/2 one is `kbd`) and 00:08.0 (a tablet over the
+    /// display's default size).
+    pub keyboard: VirtioInput,
+    pub tablet: VirtioInput,
     pci_address: u32,
     /// The 8259 lines driven at the last sync (to release one a function moved away from).
     pci_lines: u16,
@@ -152,6 +165,12 @@ impl Machine {
             net: VirtioNet::new(NET_MAC, NET_PIC_LINE),
             gpu: VirtioGpu::new(GPU_PIC_LINE),
             console: VirtioConsole::new(CONSOLE_PIC_LINE),
+            keyboard: VirtioInput::keyboard(KEYBOARD_PIC_LINE),
+            tablet: VirtioInput::tablet(
+                TABLET_PIC_LINE,
+                virtio_gpu::DEFAULT_WIDTH,
+                virtio_gpu::DEFAULT_HEIGHT,
+            ),
             pci_address: 0,
             pci_lines: 0,
             host_bridge: host_bridge(),
@@ -286,6 +305,8 @@ impl Machine {
             slot::NET => Some(&mut self.net.t.cfg),
             slot::GPU => Some(&mut self.gpu.t.cfg),
             slot::CONSOLE => Some(&mut self.console.t.cfg),
+            slot::KEYBOARD => Some(&mut self.keyboard.t.cfg),
+            slot::TABLET => Some(&mut self.tablet.t.cfg),
             _ => None,
         }
     }
@@ -425,8 +446,13 @@ impl Machine {
             true
         } else if matches!(size, 1 | 2 | 4) && self.virtio_hit(addr).is_some() {
             let (dev, off) = self.virtio_hit(addr).unwrap_or((0, 0));
-            self.virtio_function(dev)
-                .mmio_write(off, size, value as u32);
+            let v = value as u32;
+            // The input devices take writes to their device configuration themselves.
+            match dev {
+                slot::KEYBOARD => self.keyboard.mmio_write(off, size, v),
+                slot::TABLET => self.tablet.mmio_write(off, size, v),
+                _ => self.virtio_function(dev).mmio_write(off, size, v),
+            }
             true
         } else {
             false
@@ -437,19 +463,26 @@ impl Machine {
         self.sync(now);
     }
 
-    /// Which virtio device (its slot) decodes `addr` in its BAR 0, and the offset in it.
-    fn virtio_hit(&self, addr: u64) -> Option<(u8, u64)> {
+    /// The virtio functions and their slots.
+    fn virtio_functions(&self) -> [(u8, &VirtioPci); 6] {
         [
             (slot::BLK, &self.blk.t),
             (slot::NET, &self.net.t),
             (slot::GPU, &self.gpu.t),
             (slot::CONSOLE, &self.console.t),
+            (slot::KEYBOARD, &self.keyboard.t),
+            (slot::TABLET, &self.tablet.t),
         ]
-        .into_iter()
-        .find_map(|(dev, t)| match t.cfg.memory_hit(addr) {
-            Some((0, off)) => Some((dev, off)),
-            _ => None,
-        })
+    }
+
+    /// Which virtio device (its slot) decodes `addr` in its BAR 0, and the offset in it.
+    fn virtio_hit(&self, addr: u64) -> Option<(u8, u64)> {
+        self.virtio_functions()
+            .into_iter()
+            .find_map(|(dev, t)| match t.cfg.memory_hit(addr) {
+                Some((0, off)) => Some((dev, off)),
+                _ => None,
+            })
     }
 
     /// The transport of the virtio function in slot `dev` (one `virtio_hit` found).
@@ -458,6 +491,8 @@ impl Machine {
             slot::BLK => &mut self.blk.t,
             slot::GPU => &mut self.gpu.t,
             slot::CONSOLE => &mut self.console.t,
+            slot::KEYBOARD => &mut self.keyboard.t,
+            slot::TABLET => &mut self.tablet.t,
             _ => &mut self.net.t,
         }
     }
@@ -513,6 +548,15 @@ impl Machine {
         r
     }
 
+    /// Delivers the keyboard's and the tablet's queued events and takes what the guest sent them
+    /// (the LEDs); returns (event buffers, status buffers) completed by the two.
+    pub fn service_input(&mut self, mem: &mut dyn GuestMemory, now: u64) -> (u32, u32) {
+        let (ke, ks) = self.keyboard.service(mem);
+        let (te, ts) = self.tablet.service(mem);
+        self.sync(now);
+        (ke + te, ks + ts)
+    }
+
     // ----------------------------------------------------------- interrupts
 
     /// Brings every device up to `now` and moves the interrupt lines through the chipset to the CPU.
@@ -539,21 +583,18 @@ impl Machine {
                 .set_irq(ioapic_pin(n), if n == SCI_IRQ { !level } else { level });
         }
         // PCI INTx: level, active low at the I/O APIC, high while asserted on the 8259's line.
-        for (dev, line, level) in [
-            (slot::BLK, self.blk.t.cfg.interrupt_line(), self.blk.t.irq()),
-            (slot::NET, self.net.t.cfg.interrupt_line(), self.net.t.irq()),
-            (slot::GPU, self.gpu.t.cfg.interrupt_line(), self.gpu.t.irq()),
-            (
-                slot::CONSOLE,
-                self.console.t.cfg.interrupt_line(),
-                self.console.t.irq(),
-            ),
-        ] {
+        // Functions on one I/O APIC pin are wired-or as well (bit n: pin 16 + n asserted).
+        let mut pins = 0u8;
+        for (dev, t) in self.virtio_functions() {
+            let (line, level) = (t.cfg.interrupt_line(), t.irq());
             if line < 16 {
                 driven |= 1 << line;
                 levels |= u16::from(level) << line;
             }
-            self.ioapic.set_irq(pci_pin(dev), !level);
+            pins |= u8::from(level) << (pci_pin(dev) - 16);
+        }
+        for n in 0..4 {
+            self.ioapic.set_irq(16 + n, pins >> n & 1 == 0);
         }
         // A line the guest moved a function away from is released.
         let released = self.pci_lines & !driven;
