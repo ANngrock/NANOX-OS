@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 
+use vmm_devices::machine::{pci_pin, slot, Machine, PCI_ADDRESS, PCI_DATA};
 use vmm_devices::pci::{CLASS_CODE, COMMAND, DEVICE_ID};
 use vmm_devices::virtio::*;
 use vmm_devices::virtio_console::{ConsoleBackend, VirtioConsole, CLASS, DEVICE_TYPE};
@@ -524,4 +525,82 @@ fn both_directions_work_in_one_service_call() {
     assert_eq!(t.kick(1), (1, 1));
     assert_eq!(t.host.from_guest, pattern(32, 1));
     assert_eq!(t.get(MORE, 20), pattern(20, 2));
+}
+
+// ------------------------------------------------------- on the platform bus
+
+fn cfg_addr(dev: u8, off: u32) -> u32 {
+    (1 << 31) | (u32::from(dev) << 11) | (off & !3)
+}
+
+fn cfg_read(m: &mut Machine, dev: u8, off: u32, size: u8) -> u32 {
+    m.io_out(PCI_ADDRESS, 4, cfg_addr(dev, off), 0);
+    m.io_in(PCI_DATA + (off & 3) as u16, size, 0)
+}
+
+fn cfg_write(m: &mut Machine, dev: u8, off: u32, size: u8, v: u32) {
+    m.io_out(PCI_ADDRESS, 4, cfg_addr(dev, off), 0);
+    m.io_out(PCI_DATA + (off & 3) as u16, size, v, 0);
+}
+
+#[test]
+fn on_the_bus_the_channel_is_slot_6_with_line_3_and_pin_18() {
+    const BAR: u64 = 0xC001_0000;
+    let mut m = Machine::new(0, 100_000_000);
+    assert_eq!(cfg_read(&mut m, slot::CONSOLE, 0, 4), 0x1043_1AF4);
+    assert_eq!(cfg_read(&mut m, slot::CONSOLE, 0x3C, 1), 3, "8259 line");
+    assert_eq!(pci_pin(slot::CONSOLE), 18);
+    cfg_write(&mut m, slot::CONSOLE, 0x10, 4, BAR as u32);
+    cfg_write(&mut m, slot::CONSOLE, 0x04, 2, 0x0006);
+    // the handshake through the bus
+    let rx = Q::new(0x1000, 8);
+    let mut tx = Q::new(0x4000, 8);
+    for (off, size, v) in [
+        (0x14u64, 1u8, 0u32),
+        (0x14, 1, 1),
+        (0x14, 1, 3),
+        (0x08, 4, 1),
+        (0x0C, 4, 1),
+        (0x14, 1, 0xB),
+    ] {
+        m.mmio_write(BAR + off, size, u64::from(v), 0);
+    }
+    for (i, q) in [&rx, &tx].into_iter().enumerate() {
+        m.mmio_write(BAR + 0x16, 2, i as u64, 0);
+        m.mmio_write(BAR + 0x18, 2, u64::from(q.n), 0);
+        m.mmio_write(BAR + 0x20, 4, q.desc, 0);
+        m.mmio_write(BAR + 0x28, 4, q.avail, 0);
+        m.mmio_write(BAR + 0x30, 4, q.used, 0);
+        m.mmio_write(BAR + 0x1C, 2, 1, 0);
+    }
+    m.mmio_write(BAR + 0x14, 1, 0xF, 0);
+    assert_eq!(m.mmio_read(BAR + 0x14, 1, 0), 0xF);
+    assert_eq!(m.unclaimed_mmio, 0);
+    // the 8259: IRQ 3 unmasked and level-triggered, everything else masked
+    for (cmd, data, icw3, base) in [(0x20u16, 0x21u16, 4u8, 0x20u8), (0xA0, 0xA1, 2, 0x28)] {
+        m.io_out(cmd, 1, 0x11, 0);
+        m.io_out(data, 1, u32::from(base), 0);
+        m.io_out(data, 1, u32::from(icw3), 0);
+        m.io_out(data, 1, 1, 0);
+        m.io_out(data, 1, 0xFF, 0);
+    }
+    m.io_out(0x4D0, 1, 0x08, 0);
+    m.io_out(0x21, 1, 0xF7, 0);
+    // a message from the guest
+    let mut ram = Ram(vec![0; 0x40000]);
+    assert!(ram.write(0x8000, b"hello host"));
+    tx.add(&mut ram, &[(0x8000, 10, false)]);
+    m.mmio_write(BAR + 0x3004, 4, 1, 0);
+    let mut host = Host::default();
+    assert_eq!(m.service_console(&mut ram, &mut host, 0), (1, 0));
+    assert_eq!(host.from_guest, b"hello host");
+    assert_eq!(m.pending(0), Some(0x23), "IRQ 3");
+    assert_eq!(m.acknowledge(0), Some(0x23));
+    assert_eq!(
+        m.mmio_read(BAR + 0x1000, 1, 0),
+        1,
+        "the driver reads the ISR"
+    );
+    m.io_out(0x20, 1, 0x20, 0);
+    assert_eq!(m.pending(0), None, "the ISR read dropped the line");
 }

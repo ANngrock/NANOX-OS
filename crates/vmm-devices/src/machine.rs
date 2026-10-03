@@ -20,12 +20,13 @@
 //! * an EOI at the local APIC tells the I/O APIC, which clears remote IRR.
 //!
 //! * PCI bus 0: the host bridge (slot 0), virtio-blk (slot 3), virtio-net
-//!   (slot 4) and virtio-gpu (slot 5); configuration through ports 0xCF8/0xCFC
-//!   and ECAM, BAR 0 of the virtio devices as memory the guest placed. Their
-//!   INTA goes to I/O APIC pin 16 + slot % 4 (active low: 19, 16 and 17) and to
-//!   the 8259 line in the interrupt-line register (11, 10 and 5: lines no ISA
-//!   device or the SCI uses, and none shared between the functions). Their DMA
-//!   runs in `service_blk` / `service_net` / `service_gpu`.
+//!   (slot 4), virtio-gpu (slot 5) and virtio-console, the agent channel (slot
+//!   6); configuration through ports 0xCF8/0xCFC and ECAM, BAR 0 of the virtio
+//!   devices as memory the guest placed. Their INTA goes to I/O APIC pin 16 +
+//!   slot % 4 (active low: 19, 16, 17 and 18) and to the 8259 line in the
+//!   interrupt-line register (11, 10, 5 and 3: lines no ISA device or the SCI
+//!   uses, and none shared between the functions). Their DMA runs in
+//!   `service_blk` / `service_net` / `service_gpu` / `service_console`.
 //!
 //! Not modeled: the PIT's channel 0 (nothing drives IRQ0 but the HPET), MSI,
 //! PCI bridges, and more than one CPU.
@@ -43,6 +44,7 @@ use crate::rtc::Rtc;
 use crate::uart::Uart;
 use crate::virtio::{GuestMemory, VirtioPci};
 use crate::virtio_blk::{BlockBackend, VirtioBlk};
+use crate::virtio_console::{ConsoleBackend, VirtioConsole};
 use crate::virtio_gpu::{Scanout, VirtioGpu};
 use crate::virtio_net::{NetBackend, VirtioNet};
 
@@ -57,12 +59,15 @@ pub mod slot {
     pub const BLK: u8 = 3;
     pub const NET: u8 = 4;
     pub const GPU: u8 = 5;
+    pub const CONSOLE: u8 = 6;
 }
 /// The ISA lines the PCI devices' INTA is routed to on the 8259 (the interrupt line register tells the guest).
-/// IRQ 5 is the display's: no ISA device of this platform uses it (they have 1, 4, 8 and the SCI on 9).
+/// IRQ 5 is the display's and IRQ 3 the agent channel's: no ISA device of this platform uses them
+/// (they have 1, 4, 8 and the SCI on 9; COM2 is not modeled).
 const BLK_PIC_LINE: u8 = 11;
 const NET_PIC_LINE: u8 = 10;
 const GPU_PIC_LINE: u8 = 5;
+const CONSOLE_PIC_LINE: u8 = 3;
 /// Where a PCI device's INTx lands on the I/O APIC: pins 16..20, rotated by the slot (the q35 swizzle).
 pub fn pci_pin(dev: u8) -> u8 {
     16 + dev % 4
@@ -101,10 +106,12 @@ pub struct Machine {
     pub kbd: I8042,
     pub pm: AcpiPm,
     pub lapic: Lapic,
-    /// virtio-blk at 00:03.0, virtio-net at 00:04.0 and virtio-gpu at 00:05.0.
+    /// virtio-blk at 00:03.0, virtio-net at 00:04.0, virtio-gpu at 00:05.0 and the agent channel
+    /// (virtio-console) at 00:06.0.
     pub blk: VirtioBlk,
     pub net: VirtioNet,
     pub gpu: VirtioGpu,
+    pub console: VirtioConsole,
     pci_address: u32,
     /// The 8259 lines driven at the last sync (to release one a function moved away from).
     pci_lines: u16,
@@ -144,6 +151,7 @@ impl Machine {
             blk: VirtioBlk::new(0, BLK_PIC_LINE),
             net: VirtioNet::new(NET_MAC, NET_PIC_LINE),
             gpu: VirtioGpu::new(GPU_PIC_LINE),
+            console: VirtioConsole::new(CONSOLE_PIC_LINE),
             pci_address: 0,
             pci_lines: 0,
             host_bridge: host_bridge(),
@@ -277,6 +285,7 @@ impl Machine {
             slot::BLK => Some(&mut self.blk.t.cfg),
             slot::NET => Some(&mut self.net.t.cfg),
             slot::GPU => Some(&mut self.gpu.t.cfg),
+            slot::CONSOLE => Some(&mut self.console.t.cfg),
             _ => None,
         }
     }
@@ -434,6 +443,7 @@ impl Machine {
             (slot::BLK, &self.blk.t),
             (slot::NET, &self.net.t),
             (slot::GPU, &self.gpu.t),
+            (slot::CONSOLE, &self.console.t),
         ]
         .into_iter()
         .find_map(|(dev, t)| match t.cfg.memory_hit(addr) {
@@ -447,6 +457,7 @@ impl Machine {
         match dev {
             slot::BLK => &mut self.blk.t,
             slot::GPU => &mut self.gpu.t,
+            slot::CONSOLE => &mut self.console.t,
             _ => &mut self.net.t,
         }
     }
@@ -490,6 +501,18 @@ impl Machine {
         r
     }
 
+    /// Moves the agent channel's bytes both ways; returns (chains sent, chains filled).
+    pub fn service_console(
+        &mut self,
+        mem: &mut dyn GuestMemory,
+        be: &mut dyn ConsoleBackend,
+        now: u64,
+    ) -> (u32, u32) {
+        let r = self.console.service(mem, be);
+        self.sync(now);
+        r
+    }
+
     // ----------------------------------------------------------- interrupts
 
     /// Brings every device up to `now` and moves the interrupt lines through the chipset to the CPU.
@@ -520,6 +543,11 @@ impl Machine {
             (slot::BLK, self.blk.t.cfg.interrupt_line(), self.blk.t.irq()),
             (slot::NET, self.net.t.cfg.interrupt_line(), self.net.t.irq()),
             (slot::GPU, self.gpu.t.cfg.interrupt_line(), self.gpu.t.irq()),
+            (
+                slot::CONSOLE,
+                self.console.t.cfg.interrupt_line(),
+                self.console.t.irq(),
+            ),
         ] {
             if line < 16 {
                 driven |= 1 << line;
