@@ -42,6 +42,7 @@ pub mod rtc;
 pub mod uart;
 pub mod virtio;
 pub mod virtio_blk;
+pub mod virtio_console;
 pub mod virtio_net;
 
 pub const NS_PER_SEC: u64 = 1_000_000_000;
