@@ -19,11 +19,13 @@
 //!   ExtINT (the virtual wire); other delivery modes are counted;
 //! * an EOI at the local APIC tells the I/O APIC, which clears remote IRR.
 //!
-//! * PCI bus 0: the host bridge (slot 0), virtio-blk (slot 3) and virtio-net
-//!   (slot 4); configuration through ports 0xCF8/0xCFC and ECAM, BAR 0 of the
-//!   virtio devices as memory the guest placed. Their INTA goes to I/O APIC
-//!   pin 16 + slot % 4 (active low) and to the 8259 line in the interrupt-line
-//!   register (11 and 10). Their DMA runs in `service_blk` / `service_net`.
+//! * PCI bus 0: the host bridge (slot 0), virtio-blk (slot 3), virtio-net
+//!   (slot 4) and virtio-gpu (slot 5); configuration through ports 0xCF8/0xCFC
+//!   and ECAM, BAR 0 of the virtio devices as memory the guest placed. Their
+//!   INTA goes to I/O APIC pin 16 + slot % 4 (active low: 19, 16 and 17) and to
+//!   the 8259 line in the interrupt-line register (11, 10 and 5: lines no ISA
+//!   device or the SCI uses, and none shared between the functions). Their DMA
+//!   runs in `service_blk` / `service_net` / `service_gpu`.
 //!
 //! Not modeled: the PIT's channel 0 (nothing drives IRQ0 but the HPET), MSI,
 //! PCI bridges, and more than one CPU.
@@ -39,8 +41,9 @@ use crate::pic::Pic;
 use crate::pit::Pit2;
 use crate::rtc::Rtc;
 use crate::uart::Uart;
-use crate::virtio::GuestMemory;
+use crate::virtio::{GuestMemory, VirtioPci};
 use crate::virtio_blk::{BlockBackend, VirtioBlk};
+use crate::virtio_gpu::{Scanout, VirtioGpu};
 use crate::virtio_net::{NetBackend, VirtioNet};
 
 pub const PCI_ADDRESS: u16 = 0xCF8;
@@ -53,10 +56,13 @@ pub mod slot {
     pub const HOST_BRIDGE: u8 = 0;
     pub const BLK: u8 = 3;
     pub const NET: u8 = 4;
+    pub const GPU: u8 = 5;
 }
 /// The ISA lines the PCI devices' INTA is routed to on the 8259 (the interrupt line register tells the guest).
+/// IRQ 5 is the display's: no ISA device of this platform uses it (they have 1, 4, 8 and the SCI on 9).
 const BLK_PIC_LINE: u8 = 11;
 const NET_PIC_LINE: u8 = 10;
+const GPU_PIC_LINE: u8 = 5;
 /// Where a PCI device's INTx lands on the I/O APIC: pins 16..20, rotated by the slot (the q35 swizzle).
 pub fn pci_pin(dev: u8) -> u8 {
     16 + dev % 4
@@ -95,9 +101,10 @@ pub struct Machine {
     pub kbd: I8042,
     pub pm: AcpiPm,
     pub lapic: Lapic,
-    /// virtio-blk at 00:03.0 and virtio-net at 00:04.0.
+    /// virtio-blk at 00:03.0, virtio-net at 00:04.0 and virtio-gpu at 00:05.0.
     pub blk: VirtioBlk,
     pub net: VirtioNet,
+    pub gpu: VirtioGpu,
     pci_address: u32,
     /// The 8259 lines driven at the last sync (to release one a function moved away from).
     pci_lines: u16,
@@ -136,6 +143,7 @@ impl Machine {
             lapic: Lapic::new(bus_hz),
             blk: VirtioBlk::new(0, BLK_PIC_LINE),
             net: VirtioNet::new(NET_MAC, NET_PIC_LINE),
+            gpu: VirtioGpu::new(GPU_PIC_LINE),
             pci_address: 0,
             pci_lines: 0,
             host_bridge: host_bridge(),
@@ -268,6 +276,7 @@ impl Machine {
             slot::HOST_BRIDGE => Some(&mut self.host_bridge),
             slot::BLK => Some(&mut self.blk.t.cfg),
             slot::NET => Some(&mut self.net.t.cfg),
+            slot::GPU => Some(&mut self.gpu.t.cfg),
             _ => None,
         }
     }
@@ -358,12 +367,7 @@ impl Machine {
             )))
         } else if matches!(size, 1 | 2 | 4) && self.virtio_hit(addr).is_some() {
             let (dev, off) = self.virtio_hit(addr).unwrap_or((0, 0));
-            let t = if dev == slot::BLK {
-                &mut self.blk.t
-            } else {
-                &mut self.net.t
-            };
-            Some(u64::from(t.mmio_read(off, size)))
+            Some(u64::from(self.virtio_function(dev).mmio_read(off, size)))
         } else {
             None
         };
@@ -412,12 +416,8 @@ impl Machine {
             true
         } else if matches!(size, 1 | 2 | 4) && self.virtio_hit(addr).is_some() {
             let (dev, off) = self.virtio_hit(addr).unwrap_or((0, 0));
-            let t = if dev == slot::BLK {
-                &mut self.blk.t
-            } else {
-                &mut self.net.t
-            };
-            t.mmio_write(off, size, value as u32);
+            self.virtio_function(dev)
+                .mmio_write(off, size, value as u32);
             true
         } else {
             false
@@ -430,12 +430,25 @@ impl Machine {
 
     /// Which virtio device (its slot) decodes `addr` in its BAR 0, and the offset in it.
     fn virtio_hit(&self, addr: u64) -> Option<(u8, u64)> {
-        [(slot::BLK, &self.blk.t), (slot::NET, &self.net.t)]
-            .into_iter()
-            .find_map(|(dev, t)| match t.cfg.memory_hit(addr) {
-                Some((0, off)) => Some((dev, off)),
-                _ => None,
-            })
+        [
+            (slot::BLK, &self.blk.t),
+            (slot::NET, &self.net.t),
+            (slot::GPU, &self.gpu.t),
+        ]
+        .into_iter()
+        .find_map(|(dev, t)| match t.cfg.memory_hit(addr) {
+            Some((0, off)) => Some((dev, off)),
+            _ => None,
+        })
+    }
+
+    /// The transport of the virtio function in slot `dev` (one `virtio_hit` found).
+    fn virtio_function(&mut self, dev: u8) -> &mut VirtioPci {
+        match dev {
+            slot::BLK => &mut self.blk.t,
+            slot::GPU => &mut self.gpu.t,
+            _ => &mut self.net.t,
+        }
     }
 
     // -------------------------------------------------------------- virtio
@@ -460,6 +473,19 @@ impl Machine {
         now: u64,
     ) -> (u32, u32) {
         let r = self.net.service(mem, be);
+        self.sync(now);
+        r
+    }
+
+    /// Serves the display's queues: the control commands change the resources and reach `scan`;
+    /// returns (control commands, cursor commands) completed. A reset of the device is noticed here too.
+    pub fn service_gpu(
+        &mut self,
+        mem: &mut dyn GuestMemory,
+        scan: &mut dyn Scanout,
+        now: u64,
+    ) -> (u32, u32) {
+        let r = self.gpu.service(mem, scan);
         self.sync(now);
         r
     }
@@ -493,6 +519,7 @@ impl Machine {
         for (dev, line, level) in [
             (slot::BLK, self.blk.t.cfg.interrupt_line(), self.blk.t.irq()),
             (slot::NET, self.net.t.cfg.interrupt_line(), self.net.t.irq()),
+            (slot::GPU, self.gpu.t.cfg.interrupt_line(), self.gpu.t.irq()),
         ] {
             if line < 16 {
                 driven |= 1 << line;
