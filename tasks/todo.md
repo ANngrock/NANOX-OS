@@ -39,6 +39,18 @@ clippy, build-none, тесты, xtask-test) и запись в PR. Критер�
         перехват `syscall`, загрузчик Linux ELF): [M10-ROUTES](../docs/specs/M10-ROUTES.md), §2.6.
 - [x] **M11: окно сервера** (`crates/serverwin`, [M11-WINDOW](../docs/specs/M11-WINDOW.md)),
       измерение требований Linux-гостя (`tools/hostguest`).
+- [ ] **VMM для гостя Linux** (M11-WINDOW §5; устройства в `crates/vmm-devices`, PR #13):
+  - [x] Шаг 2: UART, 8259+ELCR, RTC, легаси-порты, IOAPIC, HPET, i8042, ACPI PM, шина `Machine`.
+  - [x] Шаг 3: шина PCI (механизм №1, ECAM), транспорт virtio 1.x, `virtio-blk`, `virtio-net`.
+  - [x] Шаг 4: `virtio-gpu` (2D) за трейтом `Scanout`.
+  - [x] Шаг 6: канал агента `virtio-console`.
+  - [ ] Шаг 5: ввод `virtio-input` (клавиатура и планшет) — агент, ветка `claude/m10-vmm-input`.
+  - [ ] PIT канал 0 и IRQ0 (последняя частичная строка `map`) — агент, `claude/m10-vmm-pit`.
+  - [ ] Шаг 1, часть: ACPI-таблицы платформы (RSDP…DSDT) — агент, `claude/m10-vmm-acpi`.
+  - [ ] Свести три ветки в `claude/m10-vmm-legacy`, мутации, STATUS, пуш, PR #13.
+  - [ ] Дальше: прошивка гостя (UEFI) с этими таблицами; подключение `Machine` к VMM
+        (выходы SVM на порты и MMIO, NPT для BAR); загрузка ядра Linux до
+        `NANOX_GUEST_REPORT_END`; вложенный SVM.
 
 ## Нельзя закрыть здесь (причина)
 
