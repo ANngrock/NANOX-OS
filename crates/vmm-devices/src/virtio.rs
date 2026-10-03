@@ -126,7 +126,7 @@ fn cap(cfg_type: u8, offset: u32, length: u32, extra: Option<u32>) -> ([u8; 20],
     b[0] = 0x09; // vendor-specific
     b[2] = if extra.is_some() { 20 } else { 16 };
     b[3] = cfg_type;
-    b[4] = 0; // BAR 0
+    // b[4] (the BAR, 0) and the padding after it stay zero.
     b[8..12].copy_from_slice(&offset.to_le_bytes());
     b[12..16].copy_from_slice(&length.to_le_bytes());
     if let Some(m) = extra {
@@ -334,9 +334,8 @@ impl VirtioPci {
             self.kicks |= 1 << q;
             return;
         }
-        if offset < COMMON_LEN {
-            self.common_write(offset, size, value);
-        }
+        // Only the common configuration is writable; every other offset is ignored there.
+        self.common_write(offset, size, value);
     }
 
     fn common_write(&mut self, o: u64, size: u8, v: u32) {

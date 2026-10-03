@@ -1978,3 +1978,104 @@ fn moving_an_asserted_interrupt_to_another_line_releases_the_old_one() {
     // (the cascade latched the edge, so the 8259 may still answer with its spurious vector)
     assert_ne!(t.m.pending(0), Some(0x2B), "line 11 was released");
 }
+
+// ------------------------------------------------ third round (mutants)
+
+#[test]
+#[should_panic]
+fn a_function_with_more_queues_than_the_engine_holds_cannot_be_built() {
+    let _ = VirtioPci::new(1, 0x02_0000, 3, 0, 10);
+}
+
+#[test]
+fn a_request_header_and_status_in_the_last_bytes_of_ram_are_served() {
+    let mut t = blk_rig();
+    let end = t.ram.0.len() as u64;
+    // the header is the last 16 bytes, the status the very last byte of a second request
+    blk_request(&mut t.ram, end - 16, 4, 0);
+    let head =
+        t.q.add(&mut t.ram, &[(end - 16, 16, false), (STATUS, 1, true)]);
+    assert_eq!(t.kick_blk(), 1);
+    assert_eq!(t.status(), 0, "the header was read in full");
+    assert_eq!(t.disk.flushes, 1);
+    assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 1)]);
+    assert!(t.ram.write(end - 1, &[0xEE]));
+    blk_request(&mut t.ram, HDR, 4, 0);
+    let head = t.q.add(&mut t.ram, &[(HDR, 16, false), (end - 1, 1, true)]);
+    assert_eq!(t.kick_blk(), 1);
+    let mut last = [0xEEu8; 1];
+    assert!(t.ram.read(end - 1, &mut last));
+    assert_eq!(last, [0], "the status landed in the last byte");
+    assert_eq!(t.disk.flushes, 2);
+    assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 1)]);
+    // a data buffer that ends exactly at the end of RAM is served too
+    assert!(t.ram.write(STATUS, &[0xEE]));
+    blk_request(&mut t.ram, HDR, 0, 9);
+    let head = t.q.add(
+        &mut t.ram,
+        &[(HDR, 16, false), (end - 512, 512, true), (STATUS, 1, true)],
+    );
+    assert_eq!(t.kick_blk(), 1);
+    assert_eq!(t.status(), 0);
+    let mut got = [0u8; SECTOR];
+    assert!(t.ram.read(end - 512, &mut got));
+    assert_eq!(&got[..], &t.disk.data[9 * SECTOR..10 * SECTOR]);
+    assert_eq!(t.q.take_used(&t.ram), [(u32::from(head), 513)]);
+}
+
+#[test]
+fn a_header_in_memory_the_guest_does_not_have_completes_the_chain_empty() {
+    let mut t = blk_rig();
+    let head =
+        t.q.add(&mut t.ram, &[(0x10_0000, 16, false), (STATUS, 1, true)]);
+    assert_eq!(t.kick_blk(), 1);
+    assert_eq!(
+        t.status(),
+        0xEE,
+        "no status for a request that could not be read"
+    );
+    assert_eq!(
+        t.q.take_used(&t.ram),
+        [(u32::from(head), 0)],
+        "nothing was written to the guest"
+    );
+    assert_eq!(t.m.blk.requests, 1);
+    assert_eq!(t.m.blk.failed, 1);
+    assert_eq!(t.disk.flushes, 0);
+    assert!(t.m.blk.t.driver_ok(), "not a reason to reset");
+}
+
+#[test]
+fn writes_outside_the_common_configuration_change_nothing() {
+    let mut t = blk_rig();
+    blk_request(&mut t.ram, HDR, 4, 0);
+    t.q.add(&mut t.ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+    t.kick_blk();
+    assert!(t.m.blk.t.irq());
+    // the ISR is read-only (reading clears it), the structure just past the common one is reserved
+    w(&mut t.m, BLK_BAR, 0x1000, 4, 0);
+    assert!(t.m.blk.t.irq(), "a write to the ISR does not clear it");
+    w(&mut t.m, BLK_BAR, 0x38, 4, 0xFFFF_FFFF);
+    w(&mut t.m, BLK_BAR, 0x3C, 4, 0xFFFF_FFFF);
+    assert_eq!(r(&mut t.m, BLK_BAR, 0x38, 4), 0);
+    assert_eq!(
+        r(&mut t.m, BLK_BAR, 0x14, 1),
+        0xF,
+        "the handshake state is untouched"
+    );
+    assert_eq!(r(&mut t.m, BLK_BAR, 0x1000, 1), 1, "the ISR still says why");
+}
+
+#[test]
+fn a_function_routed_to_irq_0_drives_that_line_only_while_it_asserts() {
+    let mut t = blk_rig();
+    program_pic(&mut t.m);
+    t.m.io_out(0x21, 1, 0xFA, 0); // IRQ0 and the cascade unmasked
+    cfg_write(&mut t.m, 3, 0x3C, 1, 0);
+    t.m.sync(0);
+    assert_eq!(t.m.pending(0), None, "a quiet function does not raise IRQ0");
+    blk_request(&mut t.ram, HDR, 4, 0);
+    t.q.add(&mut t.ram, &[(HDR, 16, false), (STATUS, 1, true)]);
+    t.kick_blk();
+    assert_eq!(t.m.pending(0), Some(0x20), "IRQ0 when it asserts");
+}
