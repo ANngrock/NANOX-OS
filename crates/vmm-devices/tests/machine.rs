@@ -118,7 +118,7 @@ fn byte_wide_devices_answer_wide_accesses_as_consecutive_bytes() {
 }
 
 #[test]
-fn pci_configuration_ports_say_nobody_is_there() {
+fn pci_configuration_ports_answer_for_present_functions_and_empty_slots() {
     let mut m = machine();
     m.io_out(PCI_ADDRESS, 4, 0x8000_0000, 0);
     assert_eq!(
@@ -126,7 +126,9 @@ fn pci_configuration_ports_say_nobody_is_there() {
         0x8000_0000,
         "the address register reads back"
     );
-    assert_eq!(m.io_in(PCI_DATA, 4, 0), 0xFFFF_FFFF);
+    assert_eq!(m.io_in(PCI_DATA, 4, 0), 0x29C0_8086, "the host bridge");
+    m.io_out(PCI_ADDRESS, 4, 0x8000_0000 | (31 << 11), 0);
+    assert_eq!(m.io_in(PCI_DATA, 4, 0), 0xFFFF_FFFF, "nobody at 00:1f.0");
     assert_eq!(m.io_in(PCI_DATA, 2, 0), 0xFFFF);
     assert_eq!(m.io_in(PCI_DATA + 3, 1, 0), 0xFF);
     m.io_out(PCI_DATA, 4, 0x1234, 0);
@@ -487,8 +489,10 @@ fn what_a_linux_kernel_does_in_its_first_moments_works_through_the_bus() {
     m.io_out(SMI_CMD, 1, u32::from(ACPI_ENABLE), 0);
     let t = m.io_in(0x608, 4, NS);
     assert_eq!(t, 3_579_545);
-    // PCI: nothing there yet
+    // PCI: the host bridge answers, the next slot is empty
     m.io_out(PCI_ADDRESS, 4, 0x8000_0000, 0);
+    assert_eq!(m.io_in(PCI_DATA, 4, 0), 0x29C0_8086);
+    m.io_out(PCI_ADDRESS, 4, 0x8000_0800, 0);
     assert_eq!(m.io_in(PCI_DATA, 4, 0), 0xFFFF_FFFF);
     assert_eq!(
         m.unclaimed_in + m.unclaimed_out + m.unclaimed_mmio,

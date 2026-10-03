@@ -6,6 +6,7 @@ use vmm_devices::i8042::I8042;
 use vmm_devices::ioapic::{self, IoApic};
 use vmm_devices::lapic;
 use vmm_devices::legacy::Legacy;
+use vmm_devices::machine::{Machine, ECAM_BASE, ECAM_SIZE};
 use vmm_devices::map::*;
 use vmm_devices::pic::Pic;
 use vmm_devices::pit::Pit2;
@@ -66,6 +67,12 @@ fn claimed(module: &str, port: u64) -> bool {
         "i8042" => I8042::owns(p),
         "acpi-pm" => AcpiPm::owns(p),
         "pit" => Pit2::new().read(p, 0).is_some(),
+        // configuration mechanism #1 is dword-addressed at 0xCF8 and 0xCFC
+        "pci" => {
+            let mut m = Machine::new(0, 100_000_000);
+            m.io_in(p & !3, 4, 0);
+            m.unclaimed_in == 0
+        }
         m => panic!("unknown module {m}"),
     }
 }
@@ -78,6 +85,8 @@ fn mmio_claimed(module: &str, lo: u64, hi: u64) -> Option<bool> {
             let (a, b) = (lo - ioapic::DEFAULT_BASE, hi - ioapic::DEFAULT_BASE);
             lo >= ioapic::DEFAULT_BASE && IoApic::owns(a) && IoApic::owns(b)
         }
+        "pci" if lo < 0x1_0000 => return None,
+        "pci" => lo >= ECAM_BASE && hi < ECAM_BASE + ECAM_SIZE,
         "hpet" => {
             lo >= hpet::DEFAULT_BASE
                 && Hpet::owns(lo - hpet::DEFAULT_BASE)
@@ -123,7 +132,7 @@ fn the_partial_region_says_what_is_missing_and_is_really_missing() {
 
 #[test]
 fn pending_regions_name_a_planned_step() {
-    let steps = ["display", "pci"];
+    let steps = ["display"];
     for r in MEASURED {
         if let Status::Pending(step) = r.status {
             assert!(steps.contains(&step), "{}: {step}", r.name);
@@ -133,7 +142,7 @@ fn pending_regions_name_a_planned_step() {
     for r in MEASURED {
         if let Status::Pending(_) = r.status {
             for &(lo, _) in r.ranges {
-                for m in ["uart", "rtc", "pic", "legacy", "i8042", "acpi-pm"] {
+                for m in ["uart", "rtc", "pic", "legacy", "i8042", "acpi-pm", "pci"] {
                     assert!(
                         !claimed(m, lo) || lo >= 0x1_0000,
                         "{} port {lo:#x} is already claimed by {m}",
@@ -147,7 +156,7 @@ fn pending_regions_name_a_planned_step() {
 
 #[test]
 fn the_tally() {
-    assert_eq!(tally(), (22, 1, 5, 9));
+    assert_eq!(tally(), (25, 1, 2, 9));
     let (a, b, c, d) = tally();
     assert_eq!(a + b + c + d, MEASURED.len());
 }

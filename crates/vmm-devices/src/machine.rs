@@ -19,9 +19,14 @@
 //!   ExtINT (the virtual wire); other delivery modes are counted;
 //! * an EOI at the local APIC tells the I/O APIC, which clears remote IRR.
 //!
-//! Not modeled: the PIT's channel 0 (nothing drives IRQ0 but the HPET), the
-//! PCI bus (the configuration ports answer "no device" until it exists), and
-//! more than one CPU.
+//! * PCI bus 0: the host bridge (slot 0), virtio-blk (slot 3) and virtio-net
+//!   (slot 4); configuration through ports 0xCF8/0xCFC and ECAM, BAR 0 of the
+//!   virtio devices as memory the guest placed. Their INTA goes to I/O APIC
+//!   pin 16 + slot % 4 (active low) and to the 8259 line in the interrupt-line
+//!   register (11 and 10). Their DMA runs in `service_blk` / `service_net`.
+//!
+//! Not modeled: the PIT's channel 0 (nothing drives IRQ0 but the HPET), MSI,
+//! PCI bridges, and more than one CPU.
 
 use crate::acpi_pm::AcpiPm;
 use crate::hpet::{self, Hpet};
@@ -29,14 +34,36 @@ use crate::i8042::I8042;
 use crate::ioapic::{self, IoApic};
 use crate::lapic::{self, Lapic};
 use crate::legacy::Legacy;
+use crate::pci::{BarKind, Config};
 use crate::pic::Pic;
 use crate::pit::Pit2;
 use crate::rtc::Rtc;
 use crate::uart::Uart;
+use crate::virtio::GuestMemory;
+use crate::virtio_blk::{BlockBackend, VirtioBlk};
+use crate::virtio_net::{NetBackend, VirtioNet};
 
 pub const PCI_ADDRESS: u16 = 0xCF8;
 pub const PCI_DATA: u16 = 0xCFC;
+/// The memory-mapped configuration window (ECAM), as the q35 chipset places it.
+pub const ECAM_BASE: u64 = 0xB000_0000;
+pub const ECAM_SIZE: u64 = 0x1000_0000;
+/// PCI device numbers on bus 0.
+pub mod slot {
+    pub const HOST_BRIDGE: u8 = 0;
+    pub const BLK: u8 = 3;
+    pub const NET: u8 = 4;
+}
+/// The ISA lines the PCI devices' INTA is routed to on the 8259 (the interrupt line register tells the guest).
+const BLK_PIC_LINE: u8 = 11;
+const NET_PIC_LINE: u8 = 10;
+/// Where a PCI device's INTx lands on the I/O APIC: pins 16..20, rotated by the slot (the q35 swizzle).
+pub fn pci_pin(dev: u8) -> u8 {
+    16 + dev % 4
+}
 const SCI_IRQ: u8 = 9;
+/// The card's MAC address: locally administered, unicast.
+pub const NET_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x4E, 0x58, 0x01];
 
 /// The ISA IRQ lines the platform drives.
 pub mod irq {
@@ -68,7 +95,14 @@ pub struct Machine {
     pub kbd: I8042,
     pub pm: AcpiPm,
     pub lapic: Lapic,
+    /// virtio-blk at 00:03.0 and virtio-net at 00:04.0.
+    pub blk: VirtioBlk,
+    pub net: VirtioNet,
     pci_address: u32,
+    /// The 8259 lines driven at the last sync (to release one a function moved away from).
+    pci_lines: u16,
+    /// The host bridge (00:00.0), the Intel q35 MCH as Linux expects to find it.
+    pub host_bridge: Config,
     /// Port reads, port writes and memory accesses nothing claimed.
     pub unclaimed_in: u32,
     pub unclaimed_out: u32,
@@ -100,7 +134,11 @@ impl Machine {
             kbd: I8042::new(),
             pm: AcpiPm::new(),
             lapic: Lapic::new(bus_hz),
+            blk: VirtioBlk::new(0, BLK_PIC_LINE),
+            net: VirtioNet::new(NET_MAC, NET_PIC_LINE),
             pci_address: 0,
+            pci_lines: 0,
+            host_bridge: host_bridge(),
             unclaimed_in: 0,
             unclaimed_out: 0,
             unclaimed_mmio: 0,
@@ -161,8 +199,10 @@ impl Machine {
     /// The device that takes an access of exactly this size at this port, if any.
     fn read_whole(&mut self, port: u16, size: u8, now: u64) -> Option<u32> {
         match port {
-            PCI_ADDRESS if size == 4 => Some(self.pci_address),
-            PCI_DATA..=0xCFF => Some(ones(size)), // no device answers
+            PCI_ADDRESS..=0xCFB if port + u16::from(size) <= PCI_DATA => {
+                Some(self.pci_address_read(port, size))
+            }
+            PCI_DATA..=0xCFF => Some(self.pci_data_read(port, size)),
             p if AcpiPm::owns(p) => self.pm.read(p, size, now),
             p if size == 1 => self.read_byte(p, now).map(u32::from),
             _ => None,
@@ -187,11 +227,14 @@ impl Machine {
 
     fn write_whole(&mut self, port: u16, size: u8, value: u32, now: u64) -> bool {
         match port {
-            PCI_ADDRESS if size == 4 => {
-                self.pci_address = value;
+            PCI_ADDRESS..=0xCFB if port + u16::from(size) <= PCI_DATA => {
+                self.pci_address_write(port, size, value);
                 true
             }
-            PCI_DATA..=0xCFF => true,
+            PCI_DATA..=0xCFF => {
+                self.pci_data_write(port, size, value);
+                true
+            }
             p if AcpiPm::owns(p) => self.pm.write(p, size, value, now),
             p if size == 1 => self.write_byte(p, value as u8, now),
             _ => false,
@@ -214,25 +257,116 @@ impl Machine {
         }
     }
 
+    // ------------------------------------------------------------------ PCI
+
+    /// The configuration space of a function on bus 0, if one is there.
+    fn config_of(&mut self, bus: u8, dev: u8, func: u8) -> Option<&mut Config> {
+        if bus != 0 || func != 0 {
+            return None;
+        }
+        match dev {
+            slot::HOST_BRIDGE => Some(&mut self.host_bridge),
+            slot::BLK => Some(&mut self.blk.t.cfg),
+            slot::NET => Some(&mut self.net.t.cfg),
+            _ => None,
+        }
+    }
+
+    /// Reads configuration space; an empty slot answers all ones. Offsets inside the PCIe extended range (256..4096) read as ones.
+    fn config_read(&mut self, bus: u8, dev: u8, func: u8, off: usize, size: u8) -> u32 {
+        match self.config_of(bus, dev, func) {
+            Some(c) => c.read(off, size),
+            None => ones(size),
+        }
+    }
+
+    fn config_write(&mut self, bus: u8, dev: u8, func: u8, off: usize, size: u8, value: u32) {
+        if let Some(c) = self.config_of(bus, dev, func) {
+            c.write(off, size, value);
+        }
+    }
+
+    /// The address register at 0xCF8..0xCFB, read as a whole or in parts.
+    fn pci_address_read(&self, port: u16, size: u8) -> u32 {
+        let shift = 8 * u32::from(port - PCI_ADDRESS);
+        (self.pci_address >> shift) & (u32::MAX >> (32 - 8 * u32::from(size)))
+    }
+
+    fn pci_address_write(&mut self, port: u16, size: u8, value: u32) {
+        let shift = 8 * u32::from(port - PCI_ADDRESS);
+        let mask = (u32::MAX >> (32 - 8 * u32::from(size))) << shift;
+        self.pci_address = (self.pci_address & !mask) | ((value << shift) & mask);
+    }
+
+    /// Port 0xCFC..0xCFF: the data window of configuration mechanism #1, addressed by the register at 0xCF8.
+    fn pci_data_read(&mut self, port: u16, size: u8) -> u32 {
+        let a = self.pci_address;
+        if a & (1 << 31) == 0 {
+            return ones(size);
+        }
+        let off = ((a & 0xFC) + u32::from(port - PCI_DATA)) as usize;
+        self.config_read(
+            (a >> 16) as u8,
+            ((a >> 11) & 31) as u8,
+            ((a >> 8) & 7) as u8,
+            off,
+            size,
+        )
+    }
+
+    fn pci_data_write(&mut self, port: u16, size: u8, value: u32) {
+        let a = self.pci_address;
+        if a & (1 << 31) == 0 {
+            return;
+        }
+        let off = ((a & 0xFC) + u32::from(port - PCI_DATA)) as usize;
+        self.config_write(
+            (a >> 16) as u8,
+            ((a >> 11) & 31) as u8,
+            ((a >> 8) & 7) as u8,
+            off,
+            size,
+            value,
+        );
+    }
+
     // --------------------------------------------------------------- memory
 
     /// A memory read of `size` bytes at physical address `addr` in device space.
     pub fn mmio_read(&mut self, addr: u64, size: u8, now: u64) -> u64 {
         self.sync(now);
         let lapic_base = self.lapic.base();
-        let found =
-            if (ioapic::DEFAULT_BASE..ioapic::DEFAULT_BASE + 0x1000).contains(&addr) && size == 4 {
-                self.ioapic.read(addr - ioapic::DEFAULT_BASE).map(u64::from)
-            } else if (hpet::DEFAULT_BASE..hpet::DEFAULT_BASE + hpet::SIZE).contains(&addr) {
-                self.hpet.read(addr - hpet::DEFAULT_BASE, size, now)
-            } else if (lapic_base..lapic_base + 0x1000).contains(&addr)
-                && size == 4
-                && addr.is_multiple_of(16)
-            {
-                Some(u64::from(self.lapic.read((addr - lapic_base) as u32, now)))
+        let found = if (ioapic::DEFAULT_BASE..ioapic::DEFAULT_BASE + 0x1000).contains(&addr)
+            && size == 4
+        {
+            self.ioapic.read(addr - ioapic::DEFAULT_BASE).map(u64::from)
+        } else if (hpet::DEFAULT_BASE..hpet::DEFAULT_BASE + hpet::SIZE).contains(&addr) {
+            self.hpet.read(addr - hpet::DEFAULT_BASE, size, now)
+        } else if (lapic_base..lapic_base + 0x1000).contains(&addr)
+            && size == 4
+            && addr.is_multiple_of(16)
+        {
+            Some(u64::from(self.lapic.read((addr - lapic_base) as u32, now)))
+        } else if (ECAM_BASE..ECAM_BASE + ECAM_SIZE).contains(&addr) && matches!(size, 1 | 2 | 4) {
+            let a = addr - ECAM_BASE;
+            Some(u64::from(self.config_read(
+                (a >> 20) as u8,
+                ((a >> 15) & 31) as u8,
+                ((a >> 12) & 7) as u8,
+                (a & 0xFFF) as usize,
+                size,
+            )))
+        } else if matches!(size, 1 | 2 | 4) && self.virtio_hit(addr).is_some() {
+            let (dev, off) = self.virtio_hit(addr).unwrap_or((0, 0));
+            let t = if dev == slot::BLK {
+                &mut self.blk.t
             } else {
-                None
+                &mut self.net.t
             };
+            Some(u64::from(t.mmio_read(off, size)))
+        } else {
+            None
+        };
         let v = found.unwrap_or_else(|| {
             self.unclaimed_mmio += 1;
             u64::from(ones(size.min(4))) | if size == 8 { u64::MAX << 32 } else { 0 }
@@ -245,32 +379,89 @@ impl Machine {
     pub fn mmio_write(&mut self, addr: u64, size: u8, value: u64, now: u64) {
         self.sync(now);
         let lapic_base = self.lapic.base();
-        let ok =
-            if (ioapic::DEFAULT_BASE..ioapic::DEFAULT_BASE + 0x1000).contains(&addr) && size == 4 {
-                self.ioapic.write(addr - ioapic::DEFAULT_BASE, value as u32)
-            } else if (hpet::DEFAULT_BASE..hpet::DEFAULT_BASE + hpet::SIZE).contains(&addr) {
-                self.hpet.write(addr - hpet::DEFAULT_BASE, size, value, now)
-            } else if (lapic_base..lapic_base + 0x1000).contains(&addr)
-                && size == 4
-                && addr.is_multiple_of(16)
-            {
-                let off = (addr - lapic_base) as u32;
-                // An EOI completes the highest vector in service; level interrupts of the I/O APIC hear of it.
-                let done = (off == lapic::reg::EOI)
-                    .then(|| self.lapic.in_service())
-                    .flatten();
-                self.lapic.write(off, value as u32, now);
-                if let Some(v) = done {
-                    self.ioapic.eoi(v);
-                }
-                true
+        let ok = if (ioapic::DEFAULT_BASE..ioapic::DEFAULT_BASE + 0x1000).contains(&addr)
+            && size == 4
+        {
+            self.ioapic.write(addr - ioapic::DEFAULT_BASE, value as u32)
+        } else if (hpet::DEFAULT_BASE..hpet::DEFAULT_BASE + hpet::SIZE).contains(&addr) {
+            self.hpet.write(addr - hpet::DEFAULT_BASE, size, value, now)
+        } else if (lapic_base..lapic_base + 0x1000).contains(&addr)
+            && size == 4
+            && addr.is_multiple_of(16)
+        {
+            let off = (addr - lapic_base) as u32;
+            // An EOI completes the highest vector in service; level interrupts of the I/O APIC hear of it.
+            let done = (off == lapic::reg::EOI)
+                .then(|| self.lapic.in_service())
+                .flatten();
+            self.lapic.write(off, value as u32, now);
+            if let Some(v) = done {
+                self.ioapic.eoi(v);
+            }
+            true
+        } else if (ECAM_BASE..ECAM_BASE + ECAM_SIZE).contains(&addr) && matches!(size, 1 | 2 | 4) {
+            let a = addr - ECAM_BASE;
+            self.config_write(
+                (a >> 20) as u8,
+                ((a >> 15) & 31) as u8,
+                ((a >> 12) & 7) as u8,
+                (a & 0xFFF) as usize,
+                size,
+                value as u32,
+            );
+            true
+        } else if matches!(size, 1 | 2 | 4) && self.virtio_hit(addr).is_some() {
+            let (dev, off) = self.virtio_hit(addr).unwrap_or((0, 0));
+            let t = if dev == slot::BLK {
+                &mut self.blk.t
             } else {
-                false
+                &mut self.net.t
             };
+            t.mmio_write(off, size, value as u32);
+            true
+        } else {
+            false
+        };
         if !ok {
             self.unclaimed_mmio += 1;
         }
         self.sync(now);
+    }
+
+    /// Which virtio device (its slot) decodes `addr` in its BAR 0, and the offset in it.
+    fn virtio_hit(&self, addr: u64) -> Option<(u8, u64)> {
+        [(slot::BLK, &self.blk.t), (slot::NET, &self.net.t)]
+            .into_iter()
+            .find_map(|(dev, t)| match t.cfg.memory_hit(addr) {
+                Some((0, off)) => Some((dev, off)),
+                _ => None,
+            })
+    }
+
+    // -------------------------------------------------------------- virtio
+
+    /// Serves the disk's virtqueue (the guest's DMA goes through `mem`), then lets the interrupt reach the chipset.
+    pub fn service_blk(
+        &mut self,
+        mem: &mut dyn GuestMemory,
+        be: &mut dyn BlockBackend,
+        now: u64,
+    ) -> u32 {
+        let n = self.blk.service(mem, be);
+        self.sync(now);
+        n
+    }
+
+    /// Sends what the guest transmitted and delivers what the network has for it.
+    pub fn service_net(
+        &mut self,
+        mem: &mut dyn GuestMemory,
+        be: &mut dyn NetBackend,
+        now: u64,
+    ) -> (u32, u32) {
+        let r = self.net.service(mem, be);
+        self.sync(now);
+        r
     }
 
     // ----------------------------------------------------------- interrupts
@@ -280,19 +471,42 @@ impl Machine {
         self.hpet.sync(now);
         self.lapic.update(now);
 
-        // Level lines: what the devices drive now.
+        // Level lines: what the devices drive now. The 8259 takes the wired-or of an ISA device
+        // and the PCI functions routed to the same line.
         let sci = self.pm.sci(now);
-        let lines: [(u8, bool); 4] = [
+        let isa: [(u8, bool); 4] = [
             (irq::KEYBOARD, self.kbd.irq1()),
             (irq::COM1, self.uart.irq()),
             (irq::RTC, self.rtc.irq(now)),
             (irq::SCI, sci),
         ];
-        for (n, level) in lines {
-            self.pic.set_irq(n, level);
+        let mut levels = 0u16;
+        let mut driven = 0u16;
+        for (n, level) in isa {
+            driven |= 1 << n;
+            levels |= u16::from(level) << n;
             // The SCI is wired active low at the I/O APIC.
             self.ioapic
                 .set_irq(ioapic_pin(n), if n == SCI_IRQ { !level } else { level });
+        }
+        // PCI INTx: level, active low at the I/O APIC, high while asserted on the 8259's line.
+        for (dev, line, level) in [
+            (slot::BLK, self.blk.t.cfg.interrupt_line(), self.blk.t.irq()),
+            (slot::NET, self.net.t.cfg.interrupt_line(), self.net.t.irq()),
+        ] {
+            if line < 16 {
+                driven |= 1 << line;
+                levels |= u16::from(level) << line;
+            }
+            self.ioapic.set_irq(pci_pin(dev), !level);
+        }
+        // A line the guest moved a function away from is released.
+        let released = self.pci_lines & !driven;
+        self.pci_lines = driven;
+        for n in 0..16u8 {
+            if (driven | released) >> n & 1 != 0 {
+                self.pic.set_irq(n, levels >> n & 1 != 0);
+            }
         }
         // HPET: edge pulses, and level timers on the pin of their route.
         while let Some(f) = self.hpet.take_fire() {
@@ -397,4 +611,11 @@ impl Machine {
     pub fn key(&mut self, byte: u8) {
         self.kbd.push_scancode(byte);
     }
+}
+
+/// 00:00.0, the q35 memory controller hub: Intel 8086:29C0, host bridge class, QEMU's subsystem id.
+fn host_bridge() -> Config {
+    let mut c = Config::new(0x8086, 0x29C0, 0x06_0000, 0, (0x1AF4, 0x1100), 0);
+    c.define_bar(0, BarKind::Unused);
+    c
 }

@@ -35,10 +35,14 @@ pub mod lapic;
 pub mod legacy;
 pub mod machine;
 pub mod map;
+pub mod pci;
 pub mod pic;
 pub mod pit;
 pub mod rtc;
 pub mod uart;
+pub mod virtio;
+pub mod virtio_blk;
+pub mod virtio_net;
 
 pub const NS_PER_SEC: u64 = 1_000_000_000;
 
