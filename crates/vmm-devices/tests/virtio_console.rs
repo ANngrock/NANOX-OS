@@ -594,6 +594,10 @@ fn on_the_bus_the_channel_is_slot_6_with_line_3_and_pin_18() {
     let mut host = Host::default();
     assert_eq!(m.service_console(&mut ram, &mut host, 0), (1, 0));
     assert_eq!(host.from_guest, b"hello host");
+    assert!(
+        m.pic.int_pending(),
+        "the service itself carried the line to the 8259"
+    );
     assert_eq!(m.pending(0), Some(0x23), "IRQ 3");
     assert_eq!(m.acknowledge(0), Some(0x23));
     assert_eq!(
@@ -603,4 +607,22 @@ fn on_the_bus_the_channel_is_slot_6_with_line_3_and_pin_18() {
     );
     m.io_out(0x20, 1, 0x20, 0);
     assert_eq!(m.pending(0), None, "the ISR read dropped the line");
+}
+
+#[test]
+fn a_buffer_longer_than_one_step_is_filled_to_its_end_and_not_beyond() {
+    let mut t = rig();
+    let data = pattern(600, 4);
+    t.host.for_guest.extend(&data);
+    t.put(DATA + 300, &[0xAB; 16]);
+    t.rx.add(&mut t.ram, &[(DATA, 300, true)]);
+    assert_eq!(t.kick(0), (0, 1));
+    assert_eq!(t.get(DATA, 300), data[..300]);
+    assert_eq!(
+        t.get(DATA + 300, 16),
+        [0xAB; 16],
+        "nothing written past the buffer"
+    );
+    assert_eq!(t.host.for_guest.len(), 300, "only what fitted was taken");
+    assert_eq!(t.rx.take_used(&t.ram), [(0, 300)]);
 }
