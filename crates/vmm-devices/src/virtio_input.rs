@@ -129,8 +129,7 @@ fn event(kind: u16, code: u16, value: u32) -> [u8; EVENT_LEN] {
     e
 }
 
-/// The events of one report; the one after the last the host gave is EV_SYN / SYN_REPORT / 0,
-/// an event of zeros.
+/// The events of one report: what the host gave, then EV_SYN / SYN_REPORT / 0.
 #[derive(Clone, Copy, Debug, Default)]
 struct Report {
     events: [[u8; EVENT_LEN]; MAX_REPORT],
@@ -141,8 +140,8 @@ struct Report {
 pub struct VirtioInput {
     pub t: VirtioPci,
     caps: &'static Caps,
-    /// The largest ABS_X and ABS_Y (the keyboard has no axes).
-    abs_max: [u32; 2],
+    /// The largest ABS_X and ABS_Y; the keyboard has no axes.
+    abs_max: Option<[u32; 2]>,
     select: u8,
     subsel: u8,
     queue: [Report; QUEUE],
@@ -206,7 +205,7 @@ fn bitmap(u: &mut [u8], codes: &[(u16, u16)]) -> u8 {
 impl VirtioInput {
     /// A keyboard on 8259 line `line`.
     pub fn keyboard(line: u8) -> Self {
-        Self::new(&KEYBOARD, [0, 0], line)
+        Self::new(&KEYBOARD, None, line)
     }
 
     /// An absolute pointer over a `width` x `height` screen: ABS_X 0..=width - 1, ABS_Y 0..=height - 1,
@@ -214,12 +213,12 @@ impl VirtioInput {
     pub fn tablet(line: u8, width: u32, height: u32) -> Self {
         Self::new(
             &TABLET,
-            [width.saturating_sub(1), height.saturating_sub(1)],
+            Some([width.saturating_sub(1), height.saturating_sub(1)]),
             line,
         )
     }
 
-    fn new(caps: &'static Caps, abs_max: [u32; 2], line: u8) -> Self {
+    fn new(caps: &'static Caps, abs_max: Option<[u32; 2]>, line: u8) -> Self {
         let mut d = Self {
             t: VirtioPci::with_config_len(DEVICE_TYPE, CLASS, 2, 0, line, CONFIG_LEN),
             caps,
@@ -268,12 +267,12 @@ impl VirtioInput {
     /// The pointer is at (`x`, `y`), each clamped to its axis: ABS_X, ABS_Y and SYN_REPORT.
     /// False, and nothing happens, on a device without axes.
     pub fn move_to(&mut self, x: u32, y: u32) -> bool {
-        if !self.has(EV_ABS, ABS_X) {
+        let Some(max) = self.abs_max else {
             return false;
-        }
+        };
         self.report(&[
-            event(EV_ABS, ABS_X, x.min(self.abs_max[0])),
-            event(EV_ABS, ABS_Y, y.min(self.abs_max[1])),
+            event(EV_ABS, ABS_X, x.min(max[0])),
+            event(EV_ABS, ABS_Y, y.min(max[1])),
         ]);
         true
     }
@@ -289,6 +288,7 @@ impl VirtioInput {
             ..Report::default()
         };
         r.events[..events.len()].copy_from_slice(events);
+        r.events[events.len()] = event(EV_SYN, SYN_REPORT, 0);
         if self.len == QUEUE {
             // The oldest report goes; if the guest has begun to receive it, the one after it does,
             // and the oldest moves into its place.
@@ -360,11 +360,17 @@ impl VirtioInput {
                 8
             }
             cfg::EV_BITS => bitmap(u, self.codes(u16::from(self.subsel))),
-            cfg::ABS_INFO if self.has(EV_ABS, u16::from(self.subsel)) => {
-                // min, max, fuzz, flat, resolution: all 0 but max
-                u[4..8].copy_from_slice(&self.abs_max[usize::from(self.subsel)].to_le_bytes());
-                20
-            }
+            cfg::ABS_INFO => match self
+                .abs_max
+                .and_then(|max| max.get(usize::from(self.subsel)).copied())
+            {
+                // The axes are ABS_X and ABS_Y, 0 and 1. min, max, fuzz, flat, resolution: all 0 but max
+                Some(max) => {
+                    u[4..8].copy_from_slice(&max.to_le_bytes());
+                    20
+                }
+                None => 0,
+            },
             // UNSET, PROP_BITS (no properties) and anything else.
             _ => 0,
         };

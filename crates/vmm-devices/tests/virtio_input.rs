@@ -106,8 +106,15 @@ impl Q {
 
 /// Runs the handshake with the given accepted features and enables both queues.
 fn bring_up(d: &mut VirtioInput, ev: &Q, st: &Q, accept: u64) -> u8 {
+    handshake(d, ev, st, accept, true)
+}
+
+/// As `bring_up`; `reset`: whether the driver writes 0 to the status register first.
+fn handshake(d: &mut VirtioInput, ev: &Q, st: &Q, accept: u64, reset: bool) -> u8 {
     d.t.cfg.write(COMMAND, 2, 0x0006);
-    d.mmio_write(0x14, 1, 0);
+    if reset {
+        d.mmio_write(0x14, 1, 0);
+    }
     d.mmio_write(0x14, 1, 1);
     d.mmio_write(0x14, 1, 3);
     d.mmio_write(0x08, 4, 0);
@@ -388,8 +395,8 @@ fn the_keyboard_has_its_keys_autorepeat_and_three_leds() {
         assert_eq!(query(&mut k, cfg::EV_BITS, kind), (0, union(&[])), "{kind}");
     }
     assert_eq!(
-        (EV_SYN, EV_KEY, EV_ABS, EV_LED, EV_REP),
-        (0, 1, 3, 0x11, 0x14)
+        (EV_SYN, EV_KEY, EV_ABS, EV_LED, EV_REP, SYN_REPORT),
+        (0, 1, 3, 0x11, 0x14, 0)
     );
 }
 
@@ -439,8 +446,23 @@ fn abs_info_gives_each_axis_its_range_and_nothing_else() {
 fn neither_device_has_input_properties_and_unknown_selects_answer_nothing() {
     let mut k = VirtioInput::keyboard(14);
     let mut t = VirtioInput::tablet(12, WIDTH, HEIGHT);
+    assert_eq!(
+        [
+            cfg::UNSET,
+            cfg::ID_NAME,
+            cfg::ID_SERIAL,
+            cfg::ID_DEVIDS,
+            cfg::PROP_BITS,
+            cfg::EV_BITS,
+            cfg::ABS_INFO
+        ],
+        [0, 1, 2, 3, 0x10, 0x11, 0x12],
+        "VIRTIO_INPUT_CFG_*"
+    );
     for d in [&mut k, &mut t] {
-        assert_eq!(query(d, cfg::PROP_BITS, 0), (0, union(&[])));
+        for subsel in [0u8, 1, 3] {
+            assert_eq!(query(d, 0x10, subsel), (0, union(&[])), "PROP_BITS");
+        }
         for select in [4u8, 5, 0x0F, 0x13, 0x20, 0xFF] {
             for subsel in [0u8, 1] {
                 assert_eq!(query(d, select, subsel), (0, union(&[])), "{select}");
@@ -729,11 +751,16 @@ fn bad_event_buffers_are_returned_empty_and_the_event_waits_for_a_good_one() {
 #[test]
 fn the_status_queue_takes_the_leds_and_ignores_everything_else() {
     let mut r = kbd();
-    let steps: [(Ev, u8); 9] = [
+    let steps: [(Ev, u8); 13] = [
         ((0x11, 1, 1), 0b010),
         ((0x11, 0, 1), 0b011),
         ((0x11, 1, 0), 0b001),
         ((0x11, 2, 0x0100_0000), 0b101),
+        // the value is the whole le32: any byte of it set means on
+        ((0x11, 1, 0x0000_0100), 0b111),
+        ((0x11, 1, 0), 0b101),
+        ((0x11, 1, 0x0001_0000), 0b111),
+        ((0x11, 1, 0), 0b101),
         ((0x11, 3, 1), 0b101),
         ((0x11, 8, 1), 0b101),
         ((0x14, 1, 1), 0b101),
@@ -747,8 +774,8 @@ fn the_status_queue_takes_the_leds_and_ignores_everything_else() {
         assert!(r.d.t.irq(), "the status buffer was completed");
         r.d.t.mmio_read(0x1000, 1);
     }
-    assert_eq!(r.d.status_events, 9);
-    assert_eq!(r.st.take_used(&r.ram).len(), 9);
+    assert_eq!(r.d.status_events, 13);
+    assert_eq!(r.st.take_used(&r.ram).len(), 13);
     assert!(r.ev.take_used(&r.ram).is_empty());
     assert_eq!((LED_NUML, LED_CAPSL, LED_SCROLLL), (0, 1, 2));
     // the tablet has no LEDs
@@ -783,6 +810,29 @@ fn bad_status_buffers_are_counted_and_returned() {
     );
     assert_eq!(r.service(), (0, 1));
     assert_eq!((r.d.status_bad, r.d.status_events, r.d.leds), (4, 1, 0b010));
+}
+
+#[test]
+fn a_driver_that_does_not_reset_first_still_gets_the_first_event_first() {
+    let mut d = VirtioInput::keyboard(14);
+    let (ev, st) = (Q::new(0x1000, 128), Q::new(0x4000, 16));
+    assert_eq!(handshake(&mut d, &ev, &st, F_VERSION_1, false), 0xF);
+    assert_eq!(d.t.resets, 0, "no reset happened");
+    let mut r = Rig {
+        d,
+        ram: Ram(vec![0; 0x40000]),
+        ev,
+        st,
+    };
+    assert!(r.d.key(KEY_A, true));
+    assert!(r.d.key(KEY_S, true));
+    r.post(4);
+    assert_eq!(r.service(), (4, 0));
+    assert_eq!(
+        r.received(),
+        [(1, KEY_A, 1), SYN, (1, KEY_S, 1), SYN],
+        "from the first event of the first report"
+    );
 }
 
 #[test]
@@ -969,6 +1019,10 @@ fn on_the_bus_the_keyboard_is_slot_7_on_irq_14_and_the_tablet_slot_8_on_irq_12()
     kst.add(&mut ram, &[(0x22000, 8, false)]);
     assert!(m.keyboard.key(KEY_A, true));
     assert_eq!(m.service_input(&mut ram, 0), (2, 1));
+    assert!(
+        m.pic.int_pending(),
+        "the service itself carried the line to the 8259"
+    );
     assert_eq!(m.keyboard.leds, 0b010);
     assert_eq!(m.pending(0), Some(0x2E), "IRQ 14");
     assert_eq!(m.acknowledge(0), Some(0x2E));
@@ -988,6 +1042,7 @@ fn on_the_bus_the_keyboard_is_slot_7_on_irq_14_and_the_tablet_slot_8_on_irq_12()
     assert!(m.keyboard.key(KEY_A, false));
     assert!(m.tablet.move_to(512, 384));
     assert_eq!(m.service_input(&mut ram, 0), (5, 2));
+    assert!(m.pic.int_pending(), "and again");
     assert_eq!(m.pending(0), Some(0x2C), "IRQ 12");
     assert_eq!(kev.take_used(&ram), [(0, 8), (1, 8), (2, 8), (3, 8)]);
     assert_eq!(tev.take_used(&ram), [(0, 8), (1, 8), (2, 8)]);
