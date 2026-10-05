@@ -109,4 +109,7 @@
 - **Перед `nix-collect-garbage` закрепить окружение и входы flake:**
   `nix develop --offline --profile ~/.nix-dev-root --command true` и `nix-store --add-root`
   для путей из `nix flake archive --json`; без этого сборщик удаляет toolchain, и
-  `nix develop --offline` перестаёт работать.
+  `nix develop --offline` перестаёт работать. Профиля мало: `nix develop` нужны и входы
+  сборки оболочки (stdenv), иначе он офлайн собирает GCC из исходников — закреплять ещё
+  `nix build .#devShells.x86_64-linux.default.inputDerivation --out-link ~/.nix-dev-inputs`.
+  Если всё же удалены — один раз `nix develop` с сетью (кэш nixos.org), не `--offline`.
