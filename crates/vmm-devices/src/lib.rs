@@ -17,7 +17,9 @@
 //!   [`machine`] (all of them on one port and memory bus, with the chipset's
 //!   interrupt wiring: 8259, I/O APIC, local APIC) and
 //!   [`map`], the table of the 37 regions a Linux kernel was measured to touch
-//!   and which of them these modules provide.
+//!   and which of them these modules provide;
+//! * [`acpi`] (step 1, part): the ACPI tables that describe this platform to
+//!   the guest, written into a buffer at a guest physical address.
 //!
 //! Devices are pure state machines over a virtual time in nanoseconds that
 //! the VMM passes in; they never read a clock, so a run is reproducible.
@@ -26,6 +28,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod acpi;
 pub mod acpi_pm;
 pub mod decode;
 pub mod hpet;
