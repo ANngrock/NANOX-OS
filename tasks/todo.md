@@ -44,10 +44,10 @@ clippy, build-none, тесты, xtask-test) и запись в PR. Критер�
   - [x] Шаг 3: шина PCI (механизм №1, ECAM), транспорт virtio 1.x, `virtio-blk`, `virtio-net`.
   - [x] Шаг 4: `virtio-gpu` (2D) за трейтом `Scanout`.
   - [x] Шаг 6: канал агента `virtio-console`.
-  - [ ] Шаг 5: ввод `virtio-input` (клавиатура и планшет) — агент, ветка `claude/m10-vmm-input`.
-  - [ ] PIT канал 0 и IRQ0 (последняя частичная строка `map`) — агент, `claude/m10-vmm-pit`.
-  - [ ] Шаг 1, часть: ACPI-таблицы платформы (RSDP…DSDT) — агент, `claude/m10-vmm-acpi`.
-  - [ ] Свести три ветки в `claude/m10-vmm-legacy`, мутации, STATUS, пуш, PR #13.
+  - [x] Шаг 5: ввод `virtio-input` (клавиатура и планшет).
+  - [x] PIT каналы 0–2 и IRQ0 (частичных строк в `map` больше нет).
+  - [x] Шаг 1, часть: ACPI-таблицы платформы (RSDP…DSDT).
+  - [x] Свести три ветки в `claude/m10-vmm-legacy`, мутации, STATUS, пуш, PR #13.
   - [ ] Дальше: прошивка гостя (UEFI) с этими таблицами; подключение `Machine` к VMM
         (выходы SVM на порты и MMIO, NPT для BAR); загрузка ядра Linux до
         `NANOX_GUEST_REPORT_END`; вложенный SVM.
