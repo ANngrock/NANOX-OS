@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use hw_svm::exit::code;
 use hw_svm::npt::Npt;
 use hw_svm::perm::{IoPermissionMap, MsrPermissionMap, IOPM_BYTES, MSRPM_BYTES};
+use hw_svm::platform_vm::{Host, PlatformVcpu};
 use hw_svm::vmcb::{ctl, tlb, Gprs, Vmcb};
 use hw_svm::vmm::{Outcome, Vcpu, VmConfig};
 use hw_svm::{Clock, FrameAlloc, NptPerms, PhysMem, SvmCpu, PAGE_SIZE};
@@ -185,6 +186,12 @@ pub enum Step {
         len: u8,
         assist: bool,
     },
+    /// A nested page fault with this error code at `gpa`, without progress
+    /// (a fetch, a page-table walk, a permission fault).
+    Npf {
+        gpa: u64,
+        error: u64,
+    },
     /// Sets RFLAGS.IF; the next step is in the interrupt shadow.
     Sti,
     Cli,
@@ -203,7 +210,7 @@ impl Step {
             Step::Vmmcall => 3,
             Step::Hlt | Step::Sti | Step::Cli => 1,
             Step::Pause => 2,
-            Step::Load { .. } | Step::Store { .. } => 3,
+            Step::Load { .. } | Step::Store { .. } | Step::Npf { .. } => 3,
             Step::Tick | Step::SpinForever | Step::TripleFault => 2,
             Step::Mmio { len, .. } => u64::from(len),
         }
@@ -675,6 +682,12 @@ impl SvmCpu for FakeCpu {
                         }
                     }
                 }
+                Step::Npf { gpa, error } => {
+                    Self::exit(vmcb, code::NPF, error, gpa, rip);
+                    vmcb.write_u8(ctl::INSN_LEN, 0);
+                    self.pending = pend(false, false);
+                    return;
+                }
                 Step::Tick => {
                     Self::exit(vmcb, code::INTR, 0, 0, rip);
                     self.pending = pend(false, false);
@@ -743,6 +756,13 @@ pub struct Rig {
 }
 
 impl Rig {
+    /// A rig for `PlatformVcpu`: its MSR policy in the permission map.
+    pub fn platform(script: &[Step]) -> Self {
+        let mut rig = Self::new(script);
+        rig.cpu.mem.write_bytes(MSRPM_PA, &platform_msr_map_bytes());
+        rig
+    }
+
     pub fn new(script: &[Step]) -> Self {
         let mut mem = Mem::new();
         let mut frames = Frames::new();
@@ -807,6 +827,23 @@ pub fn run(rig: &mut Rig, vcpu: &mut Vcpu<'_>) -> Outcome {
         rig.prepared = true;
     }
     vcpu.run(&mut rig.cpu, &mut rig.clock, &mut vmcb, &mut rig.gprs)
+}
+
+/// Runs the rig's guest on the platform vCPU with `host`.
+pub fn run_platform(rig: &mut Rig, vcpu: &mut PlatformVcpu<'_>, host: &mut Host<'_>) -> Outcome {
+    let mut vmcb = Vmcb::wrap(&mut rig.page);
+    if !rig.prepared {
+        vcpu.prepare(&mut vmcb);
+        rig.prepared = true;
+    }
+    vcpu.run(&mut rig.cpu, &mut rig.clock, host, &mut vmcb, &mut rig.gprs)
+}
+
+pub fn platform_msr_map_bytes() -> Vec<u8> {
+    let mut m = [0u8; MSRPM_BYTES];
+    let mut map = MsrPermissionMap::intercept_all(&mut m);
+    PlatformVcpu::msr_policy(&mut map);
+    m.to_vec()
 }
 
 pub fn msr_map_bytes() -> Vec<u8> {

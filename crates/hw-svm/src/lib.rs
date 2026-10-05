@@ -34,12 +34,15 @@ pub mod exit;
 pub mod guest;
 pub mod npt;
 pub mod perm;
+pub mod platform_vm;
+mod shared;
 pub mod vmcb;
 pub mod vmm;
 
 pub use caps::{SvmCaps, SvmUnavailable};
 pub use exit::{Exit, IoExit};
 pub use npt::{Npt, NptPerms};
+pub use platform_vm::PlatformVcpu;
 pub use vmcb::{Gprs, Vmcb};
 pub use vmm::{Vcpu, Verdict, VmConfig};
 

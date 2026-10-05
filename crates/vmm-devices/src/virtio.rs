@@ -29,7 +29,8 @@ pub const DEVICE: u64 = 0x2000;
 pub const DEVICE_LEN: usize = 64;
 /// The longest device configuration (virtio-input's: 8 bytes of header and a 128-byte union).
 pub const DEVICE_MAX: usize = 136;
-const NOTIFY: u64 = 0x3000;
+/// Where the notification registers start in BAR 0 (queue `n` at `NOTIFY + 4n`).
+pub const NOTIFY: u64 = 0x3000;
 const NOTIFY_MULTIPLIER: u32 = 4;
 
 pub const F_VERSION_1: u64 = 1 << 32;
