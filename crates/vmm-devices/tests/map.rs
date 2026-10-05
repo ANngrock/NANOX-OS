@@ -9,7 +9,7 @@ use vmm_devices::legacy::Legacy;
 use vmm_devices::machine::{Machine, ECAM_BASE, ECAM_SIZE};
 use vmm_devices::map::*;
 use vmm_devices::pic::Pic;
-use vmm_devices::pit::Pit2;
+use vmm_devices::pit::Pit;
 use vmm_devices::rtc::Rtc;
 use vmm_devices::uart::Uart;
 
@@ -66,7 +66,7 @@ fn claimed(module: &str, port: u64) -> bool {
         "legacy" => Legacy::owns(p),
         "i8042" => I8042::owns(p),
         "acpi-pm" => AcpiPm::owns(p),
-        "pit" => Pit2::new().read(p, 0).is_some(),
+        "pit" => Pit::owns(p) && Pit::new().read(p, 0).is_some(),
         // configuration mechanism #1 is dword-addressed at 0xCF8 and 0xCFC
         "pci" => {
             let mut m = Machine::new(0, 100_000_000);
@@ -119,15 +119,22 @@ fn every_done_region_is_claimed_by_its_module() {
 }
 
 #[test]
-fn the_partial_region_says_what_is_missing_and_is_really_missing() {
+fn no_region_is_partly_provided() {
     let partial: Vec<_> = MEASURED
         .iter()
         .filter(|r| matches!(r.status, Status::Partial(..)))
+        .map(|r| r.name)
         .collect();
-    assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].name, "pit");
-    assert!(claimed("pit", 0x42) && claimed("pit", 0x43) && claimed("pit", 0x61));
-    assert!(!claimed("pit", 0x40), "channel 0 is not modeled");
+    assert!(partial.is_empty(), "partly provided: {partial:?}");
+    // The last one was the PIT (channel 2 only): now every port of the chip and port 0x61 are its own.
+    let pit = MEASURED.iter().find(|r| r.name == "pit").unwrap();
+    assert_eq!(pit.status, Status::Done("pit"));
+    for port in (0x40..=0x43).chain([0x61]) {
+        assert!(claimed("pit", port), "{port:#x}");
+    }
+    for port in [0x3F, 0x44, 0x60, 0x62] {
+        assert!(!claimed("pit", port), "{port:#x} is not the PIT's");
+    }
 }
 
 #[test]
@@ -142,7 +149,9 @@ fn pending_regions_name_a_planned_step() {
     for r in MEASURED {
         if let Status::Pending(_) = r.status {
             for &(lo, _) in r.ranges {
-                for m in ["uart", "rtc", "pic", "legacy", "i8042", "acpi-pm", "pci"] {
+                for m in [
+                    "uart", "rtc", "pic", "legacy", "i8042", "acpi-pm", "pci", "pit",
+                ] {
                     assert!(
                         !claimed(m, lo) || lo >= 0x1_0000,
                         "{} port {lo:#x} is already claimed by {m}",
@@ -156,7 +165,7 @@ fn pending_regions_name_a_planned_step() {
 
 #[test]
 fn the_tally() {
-    assert_eq!(tally(), (25, 1, 2, 9));
+    assert_eq!(tally(), (26, 0, 2, 9));
     let (a, b, c, d) = tally();
     assert_eq!(a + b + c + d, MEASURED.len());
 }

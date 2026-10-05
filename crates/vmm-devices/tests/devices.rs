@@ -1,6 +1,6 @@
 use vmm_devices::decode::{decode, merge, source_value, DecodeError, Operation, Reg, Source};
 use vmm_devices::lapic::{self, reg, Lapic, LVT_MASKED, LVT_PERIODIC, SVR_ENABLE};
-use vmm_devices::pit::{self, Pit2};
+use vmm_devices::pit::{self, Pit};
 
 fn r(index: u8) -> Reg {
     Reg {
@@ -484,7 +484,7 @@ fn divide_change_keeps_the_count_continuous() {
 
 #[test]
 fn pit_mode0_out2_and_gate() {
-    let mut p = Pit2::new();
+    let mut p = Pit::new();
     assert_eq!(p.read(pit::PORT_SPEAKER, 0), Some(0));
     p.write(pit::PORT_SPEAKER, 0, 0);
     p.write(pit::PORT_CONTROL, pit::CONTROL_MODE0, 0);
@@ -499,7 +499,7 @@ fn pit_mode0_out2_and_gate() {
     assert!(p.out2(done));
     assert_eq!(p.read(pit::PORT_SPEAKER, done), Some(0x21));
     // Closing the gate pauses the count.
-    let mut q = Pit2::new();
+    let mut q = Pit::new();
     q.write(pit::PORT_CONTROL, pit::CONTROL_MODE0, 0);
     q.write(pit::PORT_CHANNEL2, 100, 0);
     q.write(pit::PORT_CHANNEL2, 0, 0);
@@ -512,19 +512,40 @@ fn pit_mode0_out2_and_gate() {
     assert_eq!(q.unsupported, 0);
 }
 
+/// What this model used to refuse (other modes on channel 2, count reads,
+/// channel 0) is the 8254 now; the full coverage is in tests/pit.rs.
 #[test]
-fn pit_unsupported_programming_keeps_out2_low() {
-    let mut p = Pit2::new();
-    p.write(pit::PORT_CONTROL, 0xB6, 0); // mode 3 (square wave)
-    p.write(pit::PORT_CHANNEL2, 1, 0);
+fn pit_channel2_square_wave_count_reads_and_channel0_ports() {
+    let mut p = Pit::new();
+    p.write(pit::PORT_CONTROL, 0xB6, 0); // channel 2, mode 3 (square wave)
+    p.write(pit::PORT_CHANNEL2, 4, 0);
     p.write(pit::PORT_CHANNEL2, 0, 0);
+    assert!(
+        p.out2(1_000_000_000),
+        "gate closed: mode 3 stopped, OUT high"
+    );
     p.write(pit::PORT_SPEAKER, 1, 0);
-    assert!(!p.out2(1_000_000_000));
-    assert_eq!(p.read(pit::PORT_CHANNEL2, 0), Some(0));
-    p.write(pit::PORT_CONTROL, 0x34, 0); // channel 0
-    assert_eq!(p.unsupported, 3);
-    assert!(!p.write(0x40, 0, 0), "channel 0 port not modeled");
-    assert_eq!(p.read(0x40, 0), None);
+    // Count 4: clocks at 839, 1677, 2515, 3353, 4191 ns; high for clocks 1-2, low for 3-4.
+    assert!(p.out2(2_514));
+    assert!(!p.out2(2_515));
+    assert!(!p.out2(4_190));
+    assert!(p.out2(4_191));
+    assert_eq!(p.read(pit::PORT_SPEAKER, 2_515), Some(0x01));
+    // the counter goes down by two in each half
+    assert_eq!(p.read(pit::PORT_CHANNEL2, 1_677), Some(2));
+    assert_eq!(p.read(pit::PORT_CHANNEL2, 1_677), Some(0));
+    assert_eq!(p.read(pit::PORT_CHANNEL2, 2_515), Some(4));
+    assert_eq!(p.unsupported, 0);
+    assert!(p.write(0x40, 0, 0), "channel 0 is modeled");
+    assert!(p.read(0x40, 0).is_some());
+    assert_eq!(
+        p.read(pit::PORT_CONTROL, 0),
+        Some(0),
+        "the control port reads nothing"
+    );
+    assert_eq!(p.unsupported, 1);
+    assert!(!p.write(0x44, 0, 0));
+    assert_eq!(p.read(0x60, 0), None);
 }
 
 // ---- the NANOX M1 calibration, access by access ------------------------------
@@ -535,7 +556,7 @@ struct Machine {
     now: u64,
     quantum: u64,
     lapic: Lapic,
-    pit: Pit2,
+    pit: Pit,
     ticks: u64,
     irq_enabled: bool,
 }
@@ -599,7 +620,7 @@ fn m1_kernel_calibration_and_periodic_verification_pass() {
         now: 0,
         quantum: 1_000, // 1 us per exit
         lapic: Lapic::new(BUS),
-        pit: Pit2::new(),
+        pit: Pit::new(),
         ticks: 0,
         irq_enabled: false,
     };

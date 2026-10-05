@@ -551,6 +551,120 @@ fn the_8259_reaches_the_cpu_through_the_hpet_legacy_timer_too() {
     );
 }
 
+// ------------------------------------------------------------- PIT on IRQ0
+
+/// Linux's periodic tick: channel 0, mode 2, LSB then MSB, LATCH = 1193 (HZ = 1000).
+/// Its edges come 1194, 2387, 5966, 7159 clocks after the count: ceil(k * 1e9 / 1193182) ns.
+fn pit_tick(m: &mut Machine, now: u64) {
+    out(m, 0x43, 0x34, now);
+    out(m, 0x40, 0xA9, now);
+    out(m, 0x40, 0x04, now);
+}
+
+fn pic_at_0x20(m: &mut Machine) {
+    for (p, v) in [
+        (0x20, 0x11),
+        (0x21, 0x20),
+        (0x21, 0x04),
+        (0x21, 0x01),
+        (0x21, 0x00),
+    ] {
+        out(m, p, v, 0);
+    }
+}
+
+#[test]
+fn pit_channel_0_drives_irq0_on_the_8259() {
+    let mut m = machine();
+    pic_at_0x20(&mut m);
+    pit_tick(&mut m, 0);
+    assert_eq!(
+        m.acknowledge(0),
+        Some(0x20),
+        "the control word ended the power-on mode 0's low OUT: an edge"
+    );
+    out(&mut m, 0x20, 0x20, 0);
+    assert_eq!(m.next_event(0), Some(1_000_686));
+    assert_eq!(m.pending(1_000_685), None);
+    assert_eq!(m.acknowledge(1_000_686), Some(0x20));
+    out(&mut m, 0x20, 0x20, 1_000_686);
+    assert_eq!(m.next_event(1_000_686), Some(2_000_534));
+    assert_eq!(m.pending(2_000_533), None);
+    assert_eq!(
+        m.acknowledge(2_000_534),
+        Some(0x20),
+        "every period, a fresh edge"
+    );
+    assert_eq!(m.pit_coalesced, 0);
+    assert_eq!(m.unclaimed_in + m.unclaimed_out, 0);
+}
+
+#[test]
+fn pit_channel_0_is_io_apic_pin_2() {
+    let mut m = machine();
+    enable_lapic(&mut m);
+    route(&mut m, 2, 0x30, 0);
+    route(&mut m, 0, 0x3F, 0);
+    pit_tick(&mut m, 0);
+    assert_eq!(m.acknowledge(0), Some(0x30), "the control word's edge");
+    eoi(&mut m, 0);
+    assert_eq!(m.pending(1_000_685), None);
+    assert_eq!(m.acknowledge(1_000_686), Some(0x30), "pin 2, not pin 0");
+    eoi(&mut m, 1_000_686);
+    assert_eq!(m.pending(1_000_687), None, "an edge, once");
+    assert_eq!(m.acknowledge(2_000_534), Some(0x30));
+}
+
+#[test]
+fn a_late_sync_merges_pit_ticks_into_one_irq0_and_counts_the_rest() {
+    let mut m = machine();
+    enable_lapic(&mut m);
+    route(&mut m, 2, 0x30, 0);
+    pit_tick(&mut m, 0);
+    assert_eq!(m.acknowledge(0), Some(0x30));
+    eoi(&mut m, 0);
+    // the VMM comes back after five ticks
+    assert_eq!(m.acknowledge(5_000_076), Some(0x30));
+    assert_eq!(m.pit_coalesced, 4);
+    eoi(&mut m, 5_000_076);
+    assert_eq!(m.pending(5_000_076), None);
+    assert_eq!(m.next_event(5_000_076), Some(5_999_923));
+    assert_eq!(m.acknowledge(5_999_923), Some(0x30));
+    assert_eq!(m.pit_coalesced, 4, "on time again: nothing merged");
+}
+
+#[test]
+fn hpet_legacy_replacement_takes_irq0_from_the_pit() {
+    let mut m = machine();
+    enable_lapic(&mut m);
+    route(&mut m, 2, 0x30, 0);
+    // legacy replacement on, the counter running, timer 0 one-shot at 5 ms
+    m.mmio_write(HPET + hpet::REG_TIMER0, 8, 1 << 2, 0);
+    m.mmio_write(HPET + hpet::REG_CONFIG, 8, 3, 0);
+    m.mmio_write(HPET + hpet::REG_TIMER0 + 8, 8, 50_000, 0);
+    pit_tick(&mut m, 0);
+    assert_eq!(
+        m.next_event(0),
+        Some(5_000_000),
+        "the HPET's deadline; the PIT's ticks lead nowhere"
+    );
+    assert_eq!(m.pending(1_000_686), None, "no PIT tick on IRQ0");
+    assert_eq!(m.pending(4_999_999), None);
+    assert_eq!(m.acknowledge(5_000_000), Some(0x30), "the HPET's");
+    eoi(&mut m, 5_000_000);
+    assert_eq!(m.pit_coalesced, 0, "dropped ticks are not merged ones");
+    // legacy replacement off: IRQ0 is the PIT's again
+    m.mmio_write(HPET + hpet::REG_CONFIG, 8, 1, 5_000_001);
+    assert_eq!(
+        m.pending(5_000_001),
+        None,
+        "the ticks it missed stay missed"
+    );
+    assert_eq!(m.next_event(5_000_001), Some(5_000_076));
+    assert_eq!(m.acknowledge(5_000_076), Some(0x30));
+    assert_eq!(m.pit_coalesced, 0);
+}
+
 #[test]
 fn an_edge_hpet_timer_does_not_touch_a_pin_another_device_uses() {
     let mut m = machine();

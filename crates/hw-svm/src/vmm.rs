@@ -8,8 +8,9 @@
 //! * the `isa-debug-exit` port: a write of `v` ends the run with exit
 //!   status `(v << 1) | 1`, exactly as QEMU reports it to the M0 harness,
 //!   so a candidate's test mode behaves the same under this VMM;
-//! * a local APIC (xAPIC MMIO page, IA32_APIC_BASE) and PIT channel 2 with
-//!   port 0x61, from `vmm-devices`; the 8259 PICs only accept their masks.
+//! * a local APIC (xAPIC MMIO page, IA32_APIC_BASE) and the PIT with port
+//!   0x61 (its IRQ0 is not wired here), from `vmm-devices`; the 8259 PICs only
+//!   accept their masks.
 //!
 //! Time is virtual and deterministic: every exit advances it by
 //! `exit_quantum_ns`, PAUSE is intercepted so spin-waits exit too, and a
@@ -31,7 +32,7 @@ use crate::vmcb::{bits, ctl, misc1, misc2, save, tlb, vintr, Gprs, StateError, V
 use crate::{Clock, Error, SvmCpu};
 use vmm_devices::decode::{self, Operation, Source};
 use vmm_devices::lapic::{self, Lapic};
-use vmm_devices::pit::Pit2;
+use vmm_devices::pit::Pit;
 
 /// Hypervisor vendor signature returned in CPUID 4000_0000h (EBX, ECX,
 /// EDX).
@@ -174,7 +175,7 @@ pub struct Vcpu<'s> {
     msr_faults: u32,
     ud: u32,
     lapic: Lapic,
-    pit: Pit2,
+    pit: Pit,
     now: u64,
     irqs: u64,
     mmio: u64,
@@ -254,7 +255,7 @@ impl<'s> Vcpu<'s> {
             msr_faults: 0,
             ud: 0,
             lapic: Lapic::new(cfg.lapic_bus_hz.max(1)),
-            pit: Pit2::new(),
+            pit: Pit::new(),
             now: 0,
             irqs: 0,
             mmio: 0,
@@ -693,7 +694,7 @@ impl<'s> Vcpu<'s> {
                 self.truncated = true;
             }
         } else {
-            // PIT channel 2 and port 0x61; other ports ignore writes.
+            // The PIT and port 0x61; other ports ignore writes.
             let _ = self.pit.write(io.port, vmcb.rax() as u8, self.now);
         }
         skip_to(vmcb, io.next_rip);
