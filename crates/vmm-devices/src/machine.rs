@@ -9,10 +9,12 @@
 //!
 //! * ISA IRQ lines go to both the 8259 pair and the I/O APIC, pin = IRQ, except
 //!   IRQ0 which is pin 2 (the usual interrupt-source override);
-//! * IRQ1 keyboard, IRQ4 COM1, IRQ8 RTC, IRQ9 the ACPI SCI (level, and active
-//!   low electrically at the I/O APIC, as the override says), and the HPET: in
-//!   legacy replacement mode timer 0 is IRQ0 and timer 1 is IRQ8, otherwise a
-//!   timer goes to the pin of its route;
+//! * IRQ0 the PIT's channel 0 (an edge for each rising edge of its OUT), IRQ1
+//!   keyboard, IRQ4 COM1, IRQ8 RTC, IRQ9 the ACPI SCI (level, and active low
+//!   electrically at the I/O APIC, as the override says), and the HPET: in
+//!   legacy replacement mode timer 0 is IRQ0 and timer 1 is IRQ8, and the PIT
+//!   no longer reaches IRQ0 (as on ICH chipsets and in QEMU); otherwise a timer
+//!   goes to the pin of its route;
 //! * the I/O APIC's messages are fixed or lowest-priority interrupts for the
 //!   one CPU: they land in the local APIC's IRR; an ExtINT message and the
 //!   8259's INT are seen only while the local APIC is off or its LINT0 passes
@@ -28,8 +30,7 @@
 //!   uses, and none shared between the functions). Their DMA runs in
 //!   `service_blk` / `service_net` / `service_gpu` / `service_console`.
 //!
-//! Not modeled: the PIT's channel 0 (nothing drives IRQ0 but the HPET), MSI,
-//! PCI bridges, and more than one CPU.
+//! Not modeled: MSI, PCI bridges, and more than one CPU.
 
 use crate::acpi_pm::AcpiPm;
 use crate::hpet::{self, Hpet};
@@ -39,7 +40,7 @@ use crate::lapic::{self, Lapic};
 use crate::legacy::Legacy;
 use crate::pci::{BarKind, Config};
 use crate::pic::Pic;
-use crate::pit::Pit2;
+use crate::pit::Pit;
 use crate::rtc::Rtc;
 use crate::uart::Uart;
 use crate::virtio::{GuestMemory, VirtioPci};
@@ -98,7 +99,7 @@ pub fn ioapic_pin(irq: u8) -> u8 {
 pub struct Machine {
     pub uart: Uart,
     pub pic: Pic,
-    pub pit: Pit2,
+    pub pit: Pit,
     pub rtc: Rtc,
     pub legacy: Legacy,
     pub ioapic: IoApic,
@@ -123,6 +124,8 @@ pub struct Machine {
     pub unclaimed_mmio: u32,
     /// I/O APIC messages that are neither fixed nor lowest-priority nor ExtINT.
     pub other_messages: u32,
+    /// PIT ticks merged into another's IRQ0 edge because the VMM synced after both.
+    pub pit_coalesced: u64,
 }
 
 /// All-ones of an access size: what an empty bus returns.
@@ -140,7 +143,7 @@ impl Machine {
         Self {
             uart: Uart::new(),
             pic: Pic::new(),
-            pit: Pit2::new(),
+            pit: Pit::new(),
             rtc: Rtc::new(epoch_secs),
             legacy: Legacy::new(),
             ioapic: IoApic::new(),
@@ -159,6 +162,7 @@ impl Machine {
             unclaimed_out: 0,
             unclaimed_mmio: 0,
             other_messages: 0,
+            pit_coalesced: 0,
         }
     }
 
@@ -565,11 +569,14 @@ impl Machine {
         }
         // HPET: edge pulses, and level timers on the pin of their route.
         while let Some(f) = self.hpet.take_fire() {
-            self.pic.set_irq(f.irq, true);
-            self.pic.set_irq(f.irq, false);
-            let pin = ioapic_pin(f.irq);
-            self.ioapic.set_irq(pin, true);
-            self.ioapic.set_irq(pin, false);
+            self.pulse(f.irq);
+        }
+        // PIT channel 0: an edge on IRQ0, unless the HPET in legacy replacement mode has the line.
+        // Ticks a late sync finds together make one edge, as the 8259's request bit would merge them.
+        let ticks = self.pit.take_edges(now);
+        if ticks > 0 && !self.hpet.legacy_replacement() {
+            self.pulse(irq::TIMER);
+            self.pit_coalesced += ticks - 1;
         }
         for t in 0..hpet::TIMERS {
             let route = self.hpet_level_pin(t);
@@ -587,6 +594,15 @@ impl Machine {
                 _ => self.other_messages += 1,
             }
         }
+    }
+
+    /// An edge on an ISA IRQ line, at the 8259 and at its I/O APIC pin.
+    fn pulse(&mut self, irq: u8) {
+        self.pic.set_irq(irq, true);
+        self.pic.set_irq(irq, false);
+        let pin = ioapic_pin(irq);
+        self.ioapic.set_irq(pin, true);
+        self.ioapic.set_irq(pin, false);
     }
 
     /// The I/O APIC pin of a level-triggered HPET timer (its route; legacy replacement is edge-only).
@@ -632,6 +648,9 @@ impl Machine {
             self.hpet.next_event(now),
             self.pm.next_event(now),
             self.lapic.next_deadline(),
+            self.pit
+                .next_event(now)
+                .filter(|_| !self.hpet.legacy_replacement()),
         ]
         .into_iter()
         .flatten()

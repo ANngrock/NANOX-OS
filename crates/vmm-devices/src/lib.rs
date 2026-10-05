@@ -7,8 +7,8 @@
 //!   QEMU TCG);
 //! * [`lapic`] — an xAPIC register model with the timer (one-shot and
 //!   periodic, divide configuration), IRR/ISR, TPR and EOI;
-//! * [`pit`] — PIT channel 2 with the port 0x61 gate and OUT2 status, the
-//!   calibration reference;
+//! * [`pit`] — the 8254 PIT, its three channels and port 0x61 (channel 2's
+//!   gate and OUT2): the calibration reference, and the IRQ0 tick;
 //! * for a Linux guest (docs/specs/M11-WINDOW.md §5, step 2): [`uart`] (16550A
 //!   console), [`pic`] (the two 8259A and the ELCR), [`rtc`] (MC146818 and
 //!   CMOS), [`legacy`] (port 0x92, POST, DMA registers, parallel probe),

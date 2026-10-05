@@ -128,8 +128,13 @@ impl Hpet {
         }
     }
 
+    /// Legacy replacement mode: timers 0 and 1 have IRQ0 and IRQ8, the PIT and the RTC lose them.
+    pub fn legacy_replacement(&self) -> bool {
+        self.config & CONF_LEGACY != 0
+    }
+
     fn irq_of(&self, t: usize) -> u8 {
-        if self.config & CONF_LEGACY != 0 && t < 2 {
+        if self.legacy_replacement() && t < 2 {
             [0, 8][t]
         } else {
             ((self.timer[t].config >> TN_ROUTE_SHIFT) & 0x1F) as u8
