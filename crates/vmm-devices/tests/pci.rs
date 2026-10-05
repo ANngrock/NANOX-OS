@@ -239,7 +239,9 @@ fn scanning_the_bus_the_way_linux_does_finds_exactly_the_present_functions() {
             (0, 3, 0, 0x1042_1AF4),
             (0, 4, 0, 0x1041_1AF4),
             (0, 5, 0, 0x1050_1AF4),
-            (0, 6, 0, 0x1043_1AF4)
+            (0, 6, 0, 0x1043_1AF4),
+            (0, 7, 0, 0x1052_1AF4),
+            (0, 8, 0, 0x1052_1AF4)
         ]
     );
 }
@@ -283,7 +285,7 @@ fn ecam_shows_the_same_registers() {
     assert_eq!(m.mmio_read(ecam(0, 0, 0, 0), 2, 0), 0x8086);
     assert_eq!(m.mmio_read(ecam(0, 0, 0, 2), 2, 0), 0x29C0);
     assert_eq!(m.mmio_read(ecam(0, 0, 0, 3), 1, 0), 0x29);
-    assert_eq!(m.mmio_read(ecam(0, 7, 0, 0), 4, 0), 0xFFFF_FFFF);
+    assert_eq!(m.mmio_read(ecam(0, 9, 0, 0), 4, 0), 0xFFFF_FFFF);
     assert_eq!(m.mmio_read(ecam(1, 0, 0, 0), 4, 0), 0xFFFF_FFFF);
     assert_eq!(m.mmio_read(ecam(0, 0, 1, 0), 4, 0), 0xFFFF_FFFF);
     assert_eq!(
@@ -314,7 +316,7 @@ fn ecam_shows_the_same_registers() {
 #[test]
 fn writes_to_an_empty_slot_go_nowhere() {
     let mut m = machine();
-    m.io_out(PCI_ADDRESS, 4, cfg_addr(0, 7, 0, 4), 0);
+    m.io_out(PCI_ADDRESS, 4, cfg_addr(0, 9, 0, 4), 0);
     m.io_out(PCI_DATA, 4, 0xFFFF, 0);
     assert_eq!(m.io_in(PCI_DATA, 4, 0), 0xFFFF_FFFF);
     assert_eq!((m.unclaimed_in, m.unclaimed_out), (0, 0));

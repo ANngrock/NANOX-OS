@@ -1937,10 +1937,10 @@ fn the_interrupt_reaches_the_8259_as_soon_as_the_service_returns() {
 fn a_function_does_not_disturb_lines_it_is_not_routed_to() {
     let mut t = blk_rig();
     program_pic(&mut t.m);
-    // IRQ 12 is driven by something else, level-triggered and unmasked
-    t.m.io_out(0x4D1, 1, 0x1C, 0);
-    t.m.io_out(0xA1, 1, 0xE3, 0);
-    t.m.pic.set_irq(12, true);
+    // IRQ 15 is driven by something else (no function uses it), level-triggered and unmasked
+    t.m.io_out(0x4D1, 1, 0x8C, 0);
+    t.m.io_out(0xA1, 1, 0x73, 0);
+    t.m.pic.set_irq(15, true);
     t.m.sync(0);
     assert!(t.m.pic.int_pending());
     t.m.sync(1);
@@ -1948,7 +1948,7 @@ fn a_function_does_not_disturb_lines_it_is_not_routed_to() {
         t.m.pic.int_pending(),
         "a sync does not release a line nobody of ours drives"
     );
-    assert_eq!(t.m.pending(1), Some(0x28 + 4));
+    assert_eq!(t.m.pending(1), Some(0x28 + 7));
 }
 
 #[test]
