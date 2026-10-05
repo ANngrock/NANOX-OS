@@ -24,9 +24,6 @@ use crate::GuestMemory;
 /// Offsets in the image and in the zero page (they coincide for the setup header).
 mod off {
     pub const ACPI_RSDP_ADDR: usize = 0x070;
-    pub const EXT_RAMDISK_IMAGE: usize = 0x0C0;
-    pub const EXT_RAMDISK_SIZE: usize = 0x0C4;
-    pub const EXT_CMD_LINE_PTR: usize = 0x0C8;
     pub const E820_ENTRIES: usize = 0x1E8;
     pub const SETUP_SECTS: usize = 0x1F1;
     pub const BOOT_FLAG: usize = 0x1FE;
@@ -69,8 +66,6 @@ pub const LOW_RAM_LIMIT: u64 = 0xB000_0000;
 pub const HIGH_RAM_BASE: u64 = 1 << 32;
 /// The kernel never goes below 1 MiB.
 pub const MIN_LOAD_ADDRESS: u64 = 0x10_0000;
-/// Entries of `boot_params.e820_table`.
-pub const E820_MAX: usize = 128;
 
 pub const E820_RAM: u32 = 1;
 pub const E820_RESERVED: u32 = 2;
@@ -197,7 +192,8 @@ pub fn parse_header(image: &[u8]) -> Result<SetupHeader, LinuxError> {
         n => n,
     };
     let payload_offset = (usize::from(setup_sects) + 1) * 512;
-    if header_end > image.len() || payload_offset >= image.len() {
+    // The header ends at most at 0x301, before any payload offset (at least 0xA00).
+    if payload_offset >= image.len() {
         return Err(LinuxError::Truncated);
     }
     let xloadflags = u16_at(image, off::XLOADFLAGS);
@@ -223,18 +219,6 @@ pub fn parse_header(image: &[u8]) -> Result<SetupHeader, LinuxError> {
 /// End of RAM below 4 GiB.
 fn low_ram_end(ram: u64) -> u64 {
     ram.min(LOW_RAM_LIMIT)
-}
-
-/// Is `[start, start + len)` RAM in a guest with `ram` bytes?
-fn is_ram(ram: u64, start: u64, len: u64) -> bool {
-    let Some(end) = start.checked_add(len) else {
-        return false;
-    };
-    let in_low_conventional = end <= LOW_RAM_END;
-    let in_low = start >= MIN_LOAD_ADDRESS && end <= low_ram_end(ram);
-    let high_len = ram.saturating_sub(LOW_RAM_LIMIT);
-    let in_high = start >= HIGH_RAM_BASE && end <= HIGH_RAM_BASE + high_len;
-    in_low_conventional || in_low || in_high
 }
 
 fn overlaps(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
@@ -274,7 +258,11 @@ fn plan(image: &[u8], initrd_len: u64, cfg: &LinuxConfig<'_>) -> Result<Plan, Li
     let payload_len = (image.len() - hdr.payload_offset) as u64;
     // The kernel decompresses in place: it needs init_size bytes from its load address.
     let kernel_len = payload_len.max(u64::from(hdr.init_size));
-    if !is_ram(cfg.ram_bytes, load, kernel_len) {
+    // The kernel must lie in the low RAM: only the low 4 GiB are mapped at the entry.
+    if load
+        .checked_add(kernel_len)
+        .is_none_or(|end| end > low_ram_end(cfg.ram_bytes))
+    {
         return Err(LinuxError::GuestTooSmall);
     }
     let kernel_end = load + kernel_len;
@@ -309,8 +297,7 @@ fn plan(image: &[u8], initrd_len: u64, cfg: &LinuxConfig<'_>) -> Result<Plan, Li
             let in_low = a.region_gpa >= MIN_LOAD_ADDRESS && region_end <= low_end;
             let rsdp_inside = a.rsdp_gpa >= a.region_gpa
                 && a.rsdp_gpa.checked_add(20).is_some_and(|e| e <= region_end);
-            if a.region_len == 0
-                || !in_low
+            if !in_low
                 || !rsdp_inside
                 || overlaps(a.region_gpa, a.region_len, load, kernel_len)
                 || overlaps(a.region_gpa, a.region_len, initrd, initrd_len)
@@ -369,13 +356,10 @@ pub fn load_linux<M: GuestMemory + ?Sized>(
     zp[off::LOADFLAGS] |= LOADED_HIGH;
     zp[off::CMD_LINE_PTR..off::CMD_LINE_PTR + 4]
         .copy_from_slice(&(CMDLINE_GPA as u32).to_le_bytes());
-    zp[off::EXT_CMD_LINE_PTR..off::EXT_CMD_LINE_PTR + 4].copy_from_slice(&0u32.to_le_bytes());
     zp[off::RAMDISK_IMAGE..off::RAMDISK_IMAGE + 4]
         .copy_from_slice(&(p.initrd as u32).to_le_bytes());
     zp[off::RAMDISK_SIZE..off::RAMDISK_SIZE + 4]
         .copy_from_slice(&(initrd.len() as u32).to_le_bytes());
-    zp[off::EXT_RAMDISK_IMAGE..off::EXT_RAMDISK_IMAGE + 4].copy_from_slice(&0u32.to_le_bytes());
-    zp[off::EXT_RAMDISK_SIZE..off::EXT_RAMDISK_SIZE + 4].copy_from_slice(&0u32.to_le_bytes());
     if let Some(a) = cfg.acpi {
         zp[off::ACPI_RSDP_ADDR..off::ACPI_RSDP_ADDR + 8].copy_from_slice(&a.rsdp_gpa.to_le_bytes());
     }

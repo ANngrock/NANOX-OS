@@ -878,3 +878,115 @@ fn the_header_of_a_real_kernel_when_one_is_available() {
     );
     assert_eq!(m.bytes(BOOT_PARAMS_GPA + 0x202, 4), b"HdrS");
 }
+
+// ---------------------------------------------- edges found by the mutants
+
+#[test]
+fn the_fixed_low_memory_layout() {
+    assert_eq!(
+        [GDT_GPA, BOOT_PARAMS_GPA, PAGE_TABLES_GPA, CMDLINE_GPA],
+        [0x500, 0x7000, 0x9000, 0x2_0000]
+    );
+    assert_eq!(
+        [LOW_RAM_END, LOW_RAM_LIMIT, HIGH_RAM_BASE, MIN_LOAD_ADDRESS],
+        [0x9_FC00, 0xB000_0000, 1 << 32, MIB]
+    );
+    // nothing written right after the zero page or after the six table pages
+    let mut m = Sparse::new();
+    load_linux(&mut m, &Img::new().bytes(), &[], &cfg(64 * MIB)).unwrap();
+    assert_eq!(m.byte(BOOT_PARAMS_GPA + 4096), 0xEE);
+    assert_eq!(m.byte(BOOT_PARAMS_GPA - 1), 0xEE);
+    assert_eq!(m.byte(PAGE_TABLES_GPA + 6 * 4096), 0xEE);
+    assert_eq!(m.byte(PAGE_TABLES_GPA - 1), 0xEE);
+}
+
+#[test]
+fn load_address_edges() {
+    let at = |img: Img, ram: u64| {
+        load_linux(&mut Sparse::new(), &img.bytes(), &[], &cfg(ram)).map(|e| e.load_address)
+    };
+    // no alignment requirement: the preferred address as it is, even an odd one
+    assert_eq!(
+        at(
+            Img {
+                pref: 0x110_0001,
+                align: 0,
+                ..Img::new()
+            },
+            256 * MIB
+        ),
+        Ok(0x110_0001)
+    );
+    // a fixed kernel exactly at 1 MiB
+    assert_eq!(
+        at(
+            Img {
+                relocatable: false,
+                pref: MIB,
+                align: 0x1000,
+                ..Img::new()
+            },
+            256 * MIB
+        ),
+        Ok(MIB)
+    );
+    // a relocatable kernel that prefers an address above 4 GiB does not get one: only the low
+    // 4 GiB are mapped at the entry
+    assert_eq!(
+        at(
+            Img {
+                pref: 0x1_0000_0000,
+                ..Img::new()
+            },
+            8 << 30
+        ),
+        Err(LinuxError::GuestTooSmall)
+    );
+}
+
+#[test]
+fn initrd_ceiling_edges() {
+    let place = |max: u32, len: usize, ram: u64, init_size: u32| {
+        let img = Img {
+            initrd_max: max,
+            init_size,
+            ..Img::new()
+        };
+        load_linux(&mut Sparse::new(), &img.bytes(), &vec![9u8; len], &cfg(ram))
+            .map(|e| e.initrd_gpa)
+    };
+    // initrd_addr_max is the last usable byte
+    assert_eq!(
+        place(0x37FF_FFFF, 0x1000, 2 << 30, 0x30_0000),
+        Ok(0x37FF_F000)
+    );
+    assert_eq!(
+        place(0x37FF_FFFE, 0x1000, 2 << 30, 0x30_0000),
+        Ok(0x37FF_E000)
+    );
+    // a place that only exists unaligned is no place: the kernel ends at 0x12F_E400
+    assert_eq!(
+        place(u32::MAX, 0x1000, 0x12F_E800 + 0x1000, 0x2F_E400),
+        Err(LinuxError::GuestTooSmall)
+    );
+    assert_eq!(
+        place(u32::MAX, 0x1000, 0x12F_F000 + 0x1000, 0x2F_E400),
+        Ok(0x12F_F000)
+    );
+}
+
+#[test]
+fn a_one_byte_ram_entry_is_still_an_entry() {
+    let mut m = Sparse::new();
+    let acpi = Acpi {
+        rsdp_gpa: 255 * MIB,
+        region_gpa: 255 * MIB,
+        region_len: MIB - 1,
+    };
+    let c = LinuxConfig {
+        acpi: Some(acpi),
+        ..cfg(256 * MIB)
+    };
+    load_linux(&mut m, &Img::new().bytes(), &[], &c).unwrap();
+    assert_eq!(e820(&m).last(), Some(&(256 * MIB - 1, 1, E820_RAM)));
+}
