@@ -36,7 +36,7 @@
 //! SRAT/SLIT, a VGA window.
 
 use crate::acpi_pm;
-use crate::hpet::{self, Hpet};
+use crate::hpet;
 use crate::i8042;
 use crate::ioapic;
 use crate::lapic;
@@ -77,8 +77,9 @@ const ACCESS_BYTE: u8 = 1;
 const ACCESS_WORD: u8 = 2;
 const ACCESS_DWORD: u8 = 3;
 
-/// FADT: the event block is the status and the enable register, of equal width.
-const PM1_EVT_LEN: u8 = 2 * (acpi_pm::PM1_ENABLE - acpi_pm::PM1_STATUS) as u8;
+/// FADT: the event block is the status and the enable register, two bytes each (the tests
+/// check that against `acpi_pm`'s ports).
+const PM1_EVT_LEN: u8 = 4;
 const PM1_CNT_LEN: u8 = 2;
 const PM_TMR_LEN: u8 = 4;
 /// GPE0: the status half, then the enable half.
@@ -188,10 +189,8 @@ fn write(w: &mut W, base: u64, cfg: &Platform) -> Layout {
     let hpet = table(w, base, hpet_table);
     let mcfg = table(w, base, mcfg_table);
     let xsdt = table(w, base, |w| xsdt_table(w, &[fadt, madt, hpet, mcfg]));
-    let len = w.pos;
-    w.pos = 0;
     rsdp(w, xsdt);
-    w.pos = len;
+    let len = w.pos;
     Layout {
         rsdp: base,
         facs,
@@ -303,23 +302,19 @@ fn gas(w: &mut W, space: u8, bits: u8, access: u8, address: u64) {
 
 // ------------------------------------------------------------------ tables
 
+/// The RSDP goes to the start of the buffer (the area [`write`] left for it, already zero:
+/// the reserved bytes and the unused RsdtAddress stay so).
 fn rsdp(w: &mut W, xsdt: u64) {
-    let at = w.pos;
-    w.bytes(b"RSD PTR ");
-    w.byte(0); // checksum of the first 20 bytes
-    w.bytes(&OEM_ID);
-    w.byte(2); // revision: ACPI 2.0 and later
-    w.u32(0); // no RSDT
-    w.u32(RSDP_LEN);
-    w.u64(xsdt);
-    w.byte(0); // extended checksum
-    w.zeros(3);
-    for (len, field) in [(20, 8), (RSDP_LEN as usize, 32)] {
-        if let Some(b) = w.out.get(at..at + len) {
-            let c = 0u8.wrapping_sub(sum(b));
-            w.put(at + field, &[c]);
-        }
-    }
+    let mut r = [0u8; RSDP_LEN as usize];
+    r[..8].copy_from_slice(b"RSD PTR ");
+    r[9..15].copy_from_slice(&OEM_ID);
+    r[15] = 2; // revision: ACPI 2.0 and later
+    r[20..24].copy_from_slice(&RSDP_LEN.to_le_bytes());
+    r[24..32].copy_from_slice(&xsdt.to_le_bytes());
+    // The first checksum covers the 20 bytes of the ACPI 1.0 structure, the extended one all 36.
+    r[8] = 0u8.wrapping_sub(sum(&r[..20]));
+    r[32] = 0u8.wrapping_sub(sum(&r));
+    w.put(0, &r);
 }
 
 fn facs_table(w: &mut W) {
@@ -417,7 +412,7 @@ fn madt_table(w: &mut W, cpus: u8) {
 fn hpet_table(w: &mut W) {
     let t = header(w, b"HPET", 1);
     // Event timer block id: bits 31:0 of the general capabilities register.
-    w.u32(Hpet::new().read(hpet::REG_ID, 4, 0).unwrap_or(0) as u32);
+    w.u32(hpet::CAPABILITIES as u32);
     gas(w, SYSTEM_MEMORY, 0, 0, hpet::DEFAULT_BASE);
     w.byte(0); // HPET number
     w.u16(0); // minimum clock tick in periodic mode
@@ -437,7 +432,6 @@ fn mcfg_table(w: &mut W) {
 
 // --------------------------------------------------------------------- AML
 
-const ZERO_OP: u8 = 0x00;
 const ONE_OP: u8 = 0x01;
 const NAME_OP: u8 = 0x08;
 const BYTE_PREFIX: u8 = 0x0A;
@@ -450,47 +444,75 @@ const PACKAGE_OP: u8 = 0x12;
 const EXT_OP_PREFIX: u8 = 0x5B;
 const DEVICE_OP: u8 = 0x82;
 
-/// A compressed EISA id ("PNP0A08"): three letters of five bits and four hex digits, stored big-endian.
-const fn eisa_id(id: &[u8; 7]) -> u32 {
-    const fn letter(c: u8) -> u32 {
-        (c - b'@') as u32
-    }
-    const fn hex(c: u8) -> u32 {
-        (if c <= b'9' { c - b'0' } else { c - b'A' + 10 }) as u32
-    }
-    let v = (letter(id[0]) << 26)
-        | (letter(id[1]) << 21)
-        | (letter(id[2]) << 16)
-        | (hex(id[3]) << 12)
-        | (hex(id[4]) << 8)
-        | (hex(id[5]) << 4)
-        | hex(id[6]);
-    v.swap_bytes()
-}
+// Compressed EISA ids (EisaId ("PNP0A08") and so on) as the DWord a Name holds: the three
+// letters at five bits each ("PNP" is 0x41 0xD0), then the four hex digits as two bytes,
+// read little-endian. The tests encode them again from the text.
+const PNP0A08: u32 = 0x080A_D041;
+const PNP0A03: u32 = 0x030A_D041;
+const PNP0501: u32 = 0x0105_D041;
+const PNP0303: u32 = 0x0303_D041;
+const PNP0B00: u32 = 0x000B_D041;
+const PNP0103: u32 = 0x0301_D041;
+const PNP0C02: u32 = 0x020C_D041;
 
-const PNP0A08: u32 = eisa_id(b"PNP0A08");
-const PNP0A03: u32 = eisa_id(b"PNP0A03");
-const PNP0501: u32 = eisa_id(b"PNP0501");
-const PNP0303: u32 = eisa_id(b"PNP0303");
-const PNP0B00: u32 = eisa_id(b"PNP0B00");
-const PNP0103: u32 = eisa_id(b"PNP0103");
-const PNP0C02: u32 = eisa_id(b"PNP0C02");
-
-/// An integer in its shortest encoding.
-fn int(w: &mut W, v: u32) {
-    match v {
-        0 => w.byte(ZERO_OP),
-        1 => w.byte(ONE_OP),
-        2..=0xFF => w.bytes(&[BYTE_PREFIX, v as u8]),
+/// An AML integer in its shortest encoding: the bytes and how many of them are used (1..=5).
+/// Public so that the tests can check the boundaries between the encodings, which no
+/// table [`build`] writes reaches (0xFF, 0x100, 0xFFFF, 0x10000).
+pub fn aml_integer(v: u32) -> ([u8; 5], usize) {
+    let mut b = [0u8; 5];
+    let n = match v {
+        // ZeroOp is the byte 0, which `b` already holds.
+        0 => 1,
+        1 => {
+            b[0] = ONE_OP;
+            1
+        }
+        2..=0xFF => {
+            b[0] = BYTE_PREFIX;
+            b[1] = v as u8;
+            2
+        }
         0x100..=0xFFFF => {
-            w.byte(WORD_PREFIX);
-            w.u16(v as u16);
+            b[0] = WORD_PREFIX;
+            b[1..3].copy_from_slice(&(v as u16).to_le_bytes());
+            3
         }
         _ => {
-            w.byte(DWORD_PREFIX);
-            w.u32(v);
+            b[0] = DWORD_PREFIX;
+            b[1..].copy_from_slice(&v.to_le_bytes());
+            5
+        }
+    };
+    (b, n)
+}
+
+fn int(w: &mut W, v: u32) {
+    let (b, n) = aml_integer(v);
+    w.bytes(&b[..n]);
+}
+
+/// The PkgLength of an AML package whose contents (after the length) are `body` bytes: the
+/// bytes and how many of them are used (1..=4), the fewest that can hold the length, which
+/// counts those bytes too. One byte holds 6 bits of length; each further byte adds 8, and
+/// the lead byte then keeps 4 bits and the count of the following bytes. Public for the
+/// same reason as [`aml_integer`]: the thresholds are not all reachable through [`build`].
+/// A body of 2^28 - 4 bytes or more does not fit: the length is cut to its low 28 bits.
+pub fn aml_package_length(body: usize) -> ([u8; 4], usize) {
+    let mut n = 1;
+    while n < 4 && body + n >= 1 << (if n == 1 { 6 } else { 8 * n - 4 }) {
+        n += 1;
+    }
+    let len = body + n;
+    let mut b = [0u8; 4];
+    if n == 1 {
+        b[0] = len as u8;
+    } else {
+        b[0] = (((n - 1) as u8) << 6) | (len as u8 & 0x0F);
+        for (i, x) in b.iter_mut().enumerate().take(n).skip(1) {
+            *x = (len >> (8 * i - 4)) as u8;
         }
     }
+    (b, n)
 }
 
 fn string(w: &mut W, s: &[u8]) {
@@ -519,22 +541,8 @@ fn open(w: &mut W) -> usize {
 
 /// Ends the object [`open`] started: the shortest package length goes in front of the contents.
 fn close(w: &mut W, at: usize) {
-    let body = w.pos - at - 4;
-    // n bytes encode lengths below 2^6, 2^12, 2^20, 2^28; the length counts these bytes too.
-    let mut n = 1;
-    while n < 4 && body + n >= 1 << (if n == 1 { 6 } else { 8 * n - 4 }) {
-        n += 1;
-    }
-    let len = body + n;
-    let lead = if n == 1 {
-        len as u8
-    } else {
-        (((n - 1) as u8) << 6) | (len as u8 & 0x0F)
-    };
-    w.put(at, &[lead]);
-    for i in 1..n {
-        w.put(at + i, &[(len >> (8 * i - 4)) as u8]);
-    }
+    let (len, n) = aml_package_length(w.pos - at - 4);
+    w.put(at, &len[..n]);
     if let Some(b) = w.out.get_mut(at..w.pos) {
         b.copy_within(4.., n);
     }

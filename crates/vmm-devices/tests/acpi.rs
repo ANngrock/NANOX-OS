@@ -972,6 +972,13 @@ fn the_hpet_table_is_the_device_at_its_address() {
         id,
         "event timer block id: the capabilities register"
     );
+    // The register is the same with the counter running and later in time.
+    m.mmio_write(hpet::DEFAULT_BASE + hpet::REG_CONFIG, 8, 1, 1_000);
+    assert_eq!(
+        m.mmio_read(hpet::DEFAULT_BASE + hpet::REG_ID, 4, 5_000_000),
+        id
+    );
+    assert_eq!(id, hpet::CAPABILITIES & 0xFFFF_FFFF);
     assert_eq!(f.at(40, 1), u64::from(SYSTEM_MEMORY));
     assert_eq!(f.at(44, 8), hpet::DEFAULT_BASE);
     f.rest_is_zero("HPET");
@@ -1231,6 +1238,118 @@ fn aml_encodings_byte_for_byte() {
     ]
     .concat();
     assert!(has(&rtc), "{rtc:x?}");
+}
+
+// ------------------------------------------------- AML encoder boundaries
+
+/// A PkgLength decoded (ACPI 6, 20.2.4), independently of the encoder: its value and the bytes it took.
+fn decode_pkg_length(b: &[u8]) -> (usize, usize) {
+    let extra = usize::from(b[0] >> 6);
+    if extra == 0 {
+        return (usize::from(b[0] & 0x3F), 1);
+    }
+    assert_eq!(b[0] & 0x30, 0, "reserved bits of the lead byte");
+    let mut v = usize::from(b[0] & 0x0F);
+    for k in 0..extra {
+        v |= usize::from(b[1 + k]) << (4 + 8 * k);
+    }
+    (v, 1 + extra)
+}
+
+#[test]
+fn aml_integers_switch_encoding_exactly_at_the_byte_word_and_dword_limits() {
+    for (v, bytes) in [
+        (0u32, &[0x00][..]),
+        (1, &[0x01]),
+        (2, &[0x0A, 2]),
+        (0x7F, &[0x0A, 0x7F]),
+        (0xFF, &[0x0A, 0xFF]),
+        (0x100, &[0x0B, 0x00, 0x01]),
+        (0x1234, &[0x0B, 0x34, 0x12]),
+        (0xFFFF, &[0x0B, 0xFF, 0xFF]),
+        (0x1_0000, &[0x0C, 0, 0, 1, 0]),
+        (0xDEAD_BEEF, &[0x0C, 0xEF, 0xBE, 0xAD, 0xDE]),
+        (u32::MAX, &[0x0C, 0xFF, 0xFF, 0xFF, 0xFF]),
+    ] {
+        let (b, n) = acpi::aml_integer(v);
+        assert_eq!(&b[..n], bytes, "{v:#x}");
+        assert!(b[n..].iter().all(|&x| x == 0), "{v:#x}: unused bytes");
+    }
+    // The parser (which insists on the shortest form) reads back every value around the limits.
+    for v in (0..0x400).chain(0xFF00..0x1_0100) {
+        let (b, n) = acpi::aml_integer(v);
+        let mut a = Aml {
+            b: &b[..n],
+            i: 0,
+            widest: 0,
+        };
+        assert_eq!(a.object(), Obj::Int(v.into()));
+        assert_eq!(a.i, n);
+    }
+}
+
+#[test]
+fn aml_package_lengths_are_the_shortest_that_hold_their_own_size() {
+    // The largest body each width holds: the length counts its own bytes and has 6, 12, 20 and 28 bits.
+    let limit = [0x3E, 0xFFD, 0xF_FFFC, 0x0FFF_FFFB];
+    let width = |body: usize| 1 + limit.iter().take(3).filter(|&&m| body > m).count();
+    let mut bodies: Vec<usize> = (0..0x2000).collect();
+    for m in limit {
+        bodies.extend([m - 1, m, m + 1]);
+    }
+    for body in bodies.into_iter().filter(|&b| b <= limit[3]) {
+        let (bytes, n) = acpi::aml_package_length(body);
+        assert_eq!(n, width(body), "body {body:#x}");
+        assert_eq!(decode_pkg_length(&bytes), (body + n, n), "body {body:#x}");
+        assert!(
+            bytes[n..].iter().all(|&x| x == 0),
+            "{body:#x}: unused bytes"
+        );
+    }
+    // Exact bytes at the first and last body of each width.
+    for (body, bytes) in [
+        (0, &[1][..]),
+        (0x3E, &[0x3F]),
+        (0x3F, &[0x41, 0x04]),
+        (0xFFD, &[0x4F, 0xFF]),
+        (0xFFE, &[0x81, 0x00, 0x01]),
+        (0xF_FFFC, &[0x8F, 0xFF, 0xFF]),
+        (0xF_FFFD, &[0xC1, 0x00, 0x00, 0x01]),
+        (0x0FFF_FFFB, &[0xCF, 0xFF, 0xFF, 0xFF]),
+    ] {
+        let (b, n) = acpi::aml_package_length(body);
+        assert_eq!(&b[..n], bytes, "body {body:#x}");
+    }
+    // Too large for four bytes: the length is cut to 28 bits, in four bytes, without panic.
+    for body in [0x0FFF_FFFC, 0x1000_0000, 0x1234_5678] {
+        let (bytes, n) = acpi::aml_package_length(body);
+        assert_eq!(n, 4, "{body:#x}");
+        assert_eq!(
+            decode_pkg_length(&bytes),
+            ((body + 4) & 0x0FFF_FFFF, 4),
+            "{body:#x}"
+        );
+    }
+}
+
+#[test]
+fn the_eisa_ids_are_the_compressed_text_of_the_device_names() {
+    // Known values (iasl prints EisaId ("PNP0A08") for 0x080AD041), then every id the DSDT uses.
+    assert_eq!(eisa("PNP0A08"), 0x080A_D041);
+    assert_eq!(eisa("PNP0303"), 0x0303_D041);
+    let (b, l) = tables();
+    let ns = namespace(&b, &l);
+    for (path, id) in [
+        ("PCI0._HID", "PNP0A08"),
+        ("PCI0._CID", "PNP0A03"),
+        ("PCI0.COM1._HID", "PNP0501"),
+        ("PCI0.KBD_._HID", "PNP0303"),
+        ("PCI0.RTC_._HID", "PNP0B00"),
+        ("HPET._HID", "PNP0103"),
+        ("MBRD._HID", "PNP0C02"),
+    ] {
+        assert_eq!(ns.int(&format!("\\_SB_.{path}")), eisa(id), "{path}");
+    }
 }
 
 // ------------------------------------------------------------------ errors

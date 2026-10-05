@@ -26,6 +26,10 @@ pub const PERIOD_FS: u64 = 100_000_000;
 const VENDOR: u64 = 0x8086;
 
 pub const REG_ID: u64 = 0x000;
+/// What the general capabilities and ID register (`REG_ID`) reads: revision 1, three timers, a
+/// 64-bit counter, legacy replacement routing, the vendor id and the counter period.
+pub const CAPABILITIES: u64 =
+    1 | ((TIMERS as u64 - 1) << 8) | (1 << 13) | (1 << 15) | (VENDOR << 16) | (PERIOD_FS << 32);
 pub const REG_CONFIG: u64 = 0x010;
 pub const REG_STATUS: u64 = 0x020;
 pub const REG_COUNTER: u64 = 0x0F0;
@@ -246,13 +250,7 @@ impl Hpet {
 
     fn read_reg(&mut self, offset: u64, now: u64) -> u64 {
         match offset {
-            REG_ID => {
-                1 | ((TIMERS as u64 - 1) << 8)
-                    | (1 << 13)
-                    | (1 << 15)
-                    | (VENDOR << 16)
-                    | (PERIOD_FS << 32)
-            }
+            REG_ID => CAPABILITIES,
             REG_CONFIG => self.config,
             REG_STATUS => self.status,
             REG_COUNTER => self.counter(now),
