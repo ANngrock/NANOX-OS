@@ -56,7 +56,8 @@ pub const PORT_SPEAKER: u16 = 0x61;
 /// Channel 2, lobyte/hibyte, mode 0, binary.
 pub const CONTROL_MODE0: u8 = 0xB0;
 
-/// A deferred count waits for the next trigger (modes 1 and 5).
+/// A deferred count waits for the next trigger (modes 1 and 5): the clock it is taken at never comes
+/// in this run (the trigger starts a new one), so its start clock is never read.
 const AT_TRIGGER: i64 = i64::MAX;
 
 #[derive(Clone, Copy, Debug)]
@@ -228,9 +229,11 @@ impl Channel {
         }
     }
 
+    /// The count register holds a count the counting element does not have: none written yet (the clock
+    /// stands at 0 until one is), its loading clock not come, or a newer one waiting. Called after `settle`
+    /// (a read-back is a port write), so a deferral whose clock came is gone.
     fn null_count(&self, now: u64) -> bool {
-        let c = self.clock(now);
-        self.cr == 0 || c < 1 || self.defer.is_some_and(|(at, _)| c < at)
+        self.clock(now) < 1 || self.defer.is_some()
     }
 
     fn status_byte(&self, now: u64) -> u8 {
@@ -254,12 +257,14 @@ impl Channel {
         let since = self.since?;
         let m = self.mode();
         let e = match self.defer {
+            // A count that waits for a trigger changes nothing before it: the running count's edge, if any.
+            None | Some((AT_TRIGGER, _)) => rise_after(m, i64::from(self.n), c),
+            // The running count's edge counts if it comes by the clock the new count is taken at.
             Some((at, start)) => match rise_after(m, i64::from(self.n), c) {
-                Some(e) if c < at && e <= at => Some(e),
+                Some(e) if e <= at => Some(e),
                 _ => rise_after(m, i64::from(self.cr), c.max(at) - at + start)
                     .and_then(|e| e.checked_add(at - start)),
             },
-            None => rise_after(m, i64::from(self.n), c),
         }?;
         since.checked_add(ns_for_events((e - self.base) as u64, HZ))
     }

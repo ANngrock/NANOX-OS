@@ -758,3 +758,327 @@ fn linux_quick_pit_calibrate_reads_the_msb_of_channel_2() {
     assert_eq!(msb(clk(512)), 0xFE);
     assert_eq!(msb(clk(513)), 0xFD);
 }
+
+// ------------------------------------------------ boundaries (mutation round)
+
+#[test]
+fn a_bcd_digit_is_flagged_from_10_on() {
+    for (raw, flagged) in [
+        (0x0009u16, false),
+        (0x000A, true),
+        (0x000B, true),
+        (0x0090, false),
+        (0x00A0, true),
+        (0x0900, false),
+        (0x0A00, true),
+        (0x9000, false),
+        (0xA000, true),
+        (0x9999, false),
+    ] {
+        let p = channel0(0x31, raw);
+        assert_eq!(p.unsupported, u32::from(flagged), "{raw:#06x}");
+    }
+}
+
+#[test]
+fn control_word_mode_bits_6_and_7_are_modes_2_and_3() {
+    // 0x3C is "mode 6" = 2: low for one clock every 10
+    let mut p = channel0(0x3C, 10);
+    p.take_edges(0);
+    assert!(p.out(0, clk(10) - 1));
+    assert!(!p.out(0, clk(10)));
+    assert!(p.out(0, clk(11)));
+    assert_eq!(p.next_event(clk(11)), Some(clk(21)));
+    assert_eq!(p.take_edges(clk(31)), 3);
+    assert_eq!(latched(&mut p, 0, clk(32)), 9, "reloaded at 31, one down");
+    // 0x3E is "mode 7" = 3: five clocks high, five low
+    let mut p = channel0(0x3E, 10);
+    p.take_edges(0);
+    assert!(p.out(0, clk(5)));
+    assert!(!p.out(0, clk(6)));
+    assert!(!p.out(0, clk(10)));
+    assert!(p.out(0, clk(11)));
+    assert_eq!(p.next_event(clk(11)), Some(clk(21)));
+    assert_eq!(latched(&mut p, 0, clk(2)), 8, "down by two");
+    assert_eq!(p.take_edges(clk(31)), 3);
+}
+
+#[test]
+fn a_count_of_2_ticks_every_two_clocks_in_modes_2_and_3() {
+    for ctrl in [0x34, 0x36] {
+        let mut p = channel0(ctrl, 2);
+        p.take_edges(0);
+        assert_eq!(p.next_event(0), Some(clk(3)), "{ctrl:#x}");
+        assert_eq!(p.take_edges(clk(3) - 1), 0);
+        assert_eq!(p.take_edges(clk(3)), 1);
+        assert_eq!(p.next_event(clk(3)), Some(clk(5)));
+        assert_eq!(p.take_edges(clk(103)), 50, "5, 7, ..., 103");
+        assert!(p.out(0, clk(103)), "high for one clock");
+        assert!(!p.out(0, clk(104)), "low for one");
+    }
+}
+
+#[test]
+fn the_new_count_is_the_count_from_the_clock_it_is_taken_with_no_sync_between() {
+    // mode 2: 100 running, 40 written at clock 150 (taken where the period ends, clock 201)
+    let mut p = channel0(0x34, 100);
+    p.take_edges(clk(150));
+    count16(&mut p, CH0, 40, clk(150));
+    // read without a latch command, so nothing settles the channel first
+    let count = |p: &Pit, t| {
+        let mut q = p.clone();
+        u16::from(q.read(CH0, t).unwrap()) | u16::from(q.read(CH0, t).unwrap()) << 8
+    };
+    assert_eq!(count(&p, clk(200)), 1);
+    assert_eq!(
+        count(&p, clk(201)),
+        40,
+        "the new count from its first clock"
+    );
+    assert_eq!(count(&p, clk(202)), 39);
+    assert!(p.out(0, clk(201)));
+    // mode 3, 10 running, 20 written in the high half (clock 3): taken where OUT falls, clock 6
+    let mut p = channel0(0x36, 10);
+    p.take_edges(clk(3));
+    count16(&mut p, CH0, 20, clk(3));
+    assert_eq!(count(&p, clk(5)), 2);
+    assert_eq!(
+        count(&p, clk(6)),
+        20,
+        "the low half of the new count begins"
+    );
+    assert!(!p.out(0, clk(6)));
+    assert_eq!(count(&p, clk(7)), 18);
+}
+
+#[test]
+fn a_count_written_where_the_previous_one_is_taken_waits_for_its_period() {
+    let mut p = channel0(0x34, 100);
+    p.take_edges(0);
+    assert_eq!(p.take_edges(clk(150)), 1, "clock 101");
+    count16(&mut p, CH0, 40, clk(150)); // taken at clock 201
+    count16(&mut p, CH0, 30, clk(201)); // 40 runs by then; 30 waits for its period's end, 241
+    assert_eq!(status(&mut p, 0, clk(201)), 0xF4, "OUT high, null count");
+    assert_eq!(p.next_event(clk(201)), Some(clk(241)));
+    assert_eq!(p.take_edges(clk(201)), 1, "the old period's reload");
+    assert_eq!(p.take_edges(clk(241)), 1);
+    assert_eq!(latched(&mut p, 0, clk(250)), 21, "30 from 241, nine down");
+    assert_eq!(p.next_event(clk(250)), Some(clk(271)));
+    assert_eq!(p.take_edges(clk(301)), 2, "271 and 301");
+}
+
+#[test]
+fn a_new_count_written_at_the_first_low_clock_of_mode_3_waits_for_the_period_end() {
+    // 10: high for clocks 1..=5, low for 6..=10; written at clock 6, the first low one
+    let mut p = channel0(0x36, 10);
+    p.take_edges(clk(6));
+    count16(&mut p, CH0, 20, clk(6));
+    assert!(!p.out(0, clk(10)), "still the old low half");
+    assert!(p.out(0, clk(11)), "20 starts high at clock 11");
+    assert!(p.out(0, clk(20)));
+    assert!(!p.out(0, clk(21)));
+    assert!(p.out(0, clk(31)));
+    assert_eq!(p.next_event(clk(6)), Some(clk(11)));
+    assert_eq!(p.take_edges(clk(31)), 2, "11 and 31");
+    // 11 is odd: high for clocks 1..=6, low for 7..=11
+    let mut p = channel0(0x36, 11);
+    p.take_edges(clk(7));
+    count16(&mut p, CH0, 20, clk(7));
+    assert!(!p.out(0, clk(11)));
+    assert!(p.out(0, clk(12)));
+    assert_eq!(p.next_event(clk(7)), Some(clk(12)));
+}
+
+/// Edges a sync at every clock from `from` (exclusive) to `to` sees, added up.
+fn edges_stepping(p: &Pit, from: u64, to: u64) -> u64 {
+    let mut q = p.clone();
+    (from + 1..=to).map(|k| q.take_edges(clk(k))).sum()
+}
+
+/// The first clock after `from` at which a sync at every clock sees an edge, within `horizon`.
+fn next_edge_stepping(p: &Pit, from: u64, horizon: u64) -> Option<u64> {
+    let mut q = p.clone();
+    q.take_edges(clk(from));
+    (from + 1..=from + horizon)
+        .map(clk)
+        .find(|&t| q.take_edges(t) > 0)
+}
+
+/// Channel 0 in `ctrl` with count `n` since 0, a count `cr` written at clock `w`.
+fn rewritten(ctrl: u8, n: u16, cr: u16, w: u64) -> Pit {
+    let mut p = channel0(ctrl, n);
+    p.take_edges(clk(w));
+    count16(&mut p, CH0, cr, clk(w));
+    p
+}
+
+#[test]
+fn a_late_sync_counts_what_a_sync_at_every_clock_counts_across_a_new_count() {
+    for ctrl in [0x34, 0x36] {
+        for n in [2, 3, 5, 10, 11] {
+            for cr in [2, 3, 4, 7, 10, 11] {
+                for w in 1..=2 * u64::from(n) + 2 {
+                    let p = rewritten(ctrl, n, cr, w);
+                    for to in w..w + 4 * u64::from(n.max(cr)) + 4 {
+                        let mut late = p.clone();
+                        assert_eq!(
+                            late.take_edges(clk(to)),
+                            edges_stepping(&p, w, to),
+                            "mode {} {n} -> {cr} written at {w}, synced at {to}",
+                            (ctrl >> 1) & 7
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn next_event_across_a_new_count_is_the_next_edge_stepping_finds_with_no_sync() {
+    for ctrl in [0x34, 0x36] {
+        for n in [2, 3, 5, 10, 11] {
+            for cr in [2, 3, 4, 7, 10, 11] {
+                for w in 1..=2 * u64::from(n) + 2 {
+                    let p = rewritten(ctrl, n, cr, w);
+                    let horizon = 2 * u64::from(n.max(cr)) + 4;
+                    for c in w..w + 3 * u64::from(n.max(cr)) + 3 {
+                        // `p` was last touched at clock w: `c` may be before or after the new count is taken
+                        assert_eq!(
+                            p.next_event(clk(c)),
+                            next_edge_stepping(&p, c, horizon),
+                            "mode {} {n} -> {cr} written at {w}, asked at {c}",
+                            (ctrl >> 1) & 7
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_gate_edge_drops_a_count_that_was_waiting() {
+    let mut p = Pit::new();
+    p.write(SPK, 1, 0);
+    ctl(&mut p, 0xB4, 0); // channel 2, mode 2
+    count16(&mut p, CH2, 10, 0);
+    count16(&mut p, CH2, 20, clk(3)); // waits for the period's end, clock 11
+    p.write(SPK, 0, clk(4));
+    let t = clk(5);
+    p.write(SPK, 1, t); // the gate's edge restarts the channel with 20
+    assert!(p.out2(t + clk(19)));
+    assert!(
+        !p.out2(t + clk(20)),
+        "low at clock 20 of the new run, not at 30"
+    );
+    assert!(p.out2(t + clk(21)));
+    let mut q = p.clone();
+    assert_eq!(q.read(CH2, t + clk(7)), Some(14));
+}
+
+#[test]
+fn opening_the_gate_before_any_count_starts_nothing() {
+    // Linux opens the gate, then programs the channel; no mode may count a count that is not there
+    for ctrl in [0xB0, 0xB2, 0xB4, 0xB6, 0xB8, 0xBA] {
+        let high = (ctrl >> 1) & 7 != 0; // mode 0's OUT is low until its count runs out
+        let mut p = Pit::new();
+        ctl(&mut p, ctrl, 0);
+        p.write(SPK, 1, 0);
+        for t in [clk(1), clk(2), clk(1000)] {
+            assert_eq!(p.out2(t), high, "{ctrl:#x} at {t}");
+        }
+        assert_eq!(p.out2_deadline(), None, "{ctrl:#x}");
+        assert_eq!(p.read(SPK, clk(1000)), Some(u8::from(high) << 5 | 1));
+    }
+}
+
+#[test]
+fn a_count_of_1_behind_a_closed_gate_runs_when_the_gate_opens() {
+    let t = 1_000_000;
+    // (control word, OUT at 1, 2 and 3 clocks after the gate opens)
+    for (ctrl, want) in [
+        (0xB0, [false, true, true]), // mode 0: high after N + 1 = 2 clocks
+        (0xB2, [false, true, true]), // mode 1: low for N = 1 clock from the trigger
+        (0xB8, [true, false, true]), // mode 4: strobe at clock N + 1 = 2
+        (0xBA, [true, false, true]), // mode 5 likewise after the trigger
+    ] {
+        let mut p = Pit::new();
+        ctl(&mut p, ctrl, 0);
+        count16(&mut p, CH2, 1, 0);
+        assert_eq!(p.out2_deadline(), None, "{ctrl:#x}: gate closed");
+        p.write(SPK, 1, t);
+        for (k, level) in want.into_iter().enumerate() {
+            let clocks = k as u64 + 1;
+            assert_eq!(p.out2(t + clk(clocks)), level, "{ctrl:#x} at {clocks}");
+        }
+    }
+}
+
+#[test]
+fn mode_5_keeps_the_running_count_and_takes_a_new_one_at_the_next_trigger() {
+    let mut p = Pit::new();
+    ctl(&mut p, 0xBA, 0); // channel 2, LSB/MSB, mode 5
+    count16(&mut p, CH2, 5, 0);
+    p.write(SPK, 1, 0); // trigger
+    p.write(SPK, 0, clk(2)); // the gate going low does not stop mode 5
+    count16(&mut p, CH2, 2, clk(3)); // written during the run
+    assert_eq!(status(&mut p, 2, clk(3)), 0xFA, "OUT high, null count");
+    assert!(p.out2(clk(5)));
+    assert!(
+        !p.out2(clk(6)),
+        "the strobe at clock N + 1 = 6, gate low or not"
+    );
+    assert!(p.out2(clk(7)));
+    let t = clk(10);
+    p.write(SPK, 1, t); // the next trigger takes 2
+    assert_eq!(status(&mut p, 2, t + clk(1)), 0xBA, "loaded");
+    assert!(p.out2(t + clk(2)));
+    assert!(!p.out2(t + clk(3)));
+    assert!(p.out2(t + clk(4)));
+}
+
+#[test]
+fn mode_1_count_written_on_the_clock_after_a_trigger_is_not_taken_until_the_next() {
+    let mut p = Pit::new();
+    ctl(&mut p, 0xB2, 0);
+    count16(&mut p, CH2, 5, 0);
+    p.write(SPK, 1, 0); // trigger
+    count16(&mut p, CH2, 2, clk(1)); // the running pulse has loaded 5 by now
+    assert!(!p.out2(clk(1)));
+    assert!(!p.out2(clk(3)), "a pulse of 2 would be over");
+    assert!(!p.out2(clk(5)));
+    assert!(p.out2(clk(6)), "5 clocks");
+}
+
+#[test]
+fn reserved_bits_of_read_back_and_latch_commands_do_not_matter() {
+    // read-back of channel 0's count and status, bit 0 set
+    let mut p = channel0(0x34, 1000);
+    ctl(&mut p, 0xC3, clk(11));
+    assert_eq!(p.read(CH0, clk(50)), Some(0xB4), "status first");
+    assert_eq!(
+        p.read(CH0, clk(50)),
+        Some(0xDE),
+        "then the count of clock 11: 990"
+    );
+    assert_eq!(p.read(CH0, clk(50)), Some(0x03));
+    // a latch command's low four bits are don't-care: it must not reprogram the channel
+    let mut p = channel0(0x34, 1000);
+    ctl(&mut p, 0x0F, clk(11));
+    assert_eq!(p.read(CH0, clk(50)), Some(0xDE));
+    assert_eq!(p.read(CH0, clk(50)), Some(0x03));
+    assert_eq!(
+        status(&mut p, 0, clk(60)) & 0x3F,
+        0x34,
+        "still mode 2, LSB/MSB"
+    );
+}
+
+#[test]
+fn a_count_of_1_in_mode_0_reads_as_loaded_in_the_status_byte() {
+    let mut p = channel0(0x30, 1);
+    assert_eq!(status(&mut p, 0, 0), 0x70, "not loaded yet");
+    assert_eq!(status(&mut p, 0, clk(1)), 0x30, "loaded, OUT low");
+    assert_eq!(status(&mut p, 0, clk(2)), 0xB0, "terminal count");
+}
