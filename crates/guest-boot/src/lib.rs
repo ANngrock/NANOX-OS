@@ -14,11 +14,16 @@
 //! at +16 KiB — the loader's offsets), the 64 KiB stack, the page tables,
 //! the transition page. Everything is computed and checked before the first
 //! write, so an error leaves guest memory untouched.
+//!
+//! [`linux`] does the same for a Linux bzImage (the x86 boot protocol's 64-bit entry),
+//! so the VMM can boot Linux without firmware.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 use boot_protocol::{self as bp, elf, BootInfo};
+
+pub mod linux;
 
 /// Guest-physical memory of the guest being prepared.
 pub trait GuestMemory {
