@@ -1221,8 +1221,19 @@ pub extern "efiapi" fn efi_main(_image: *mut u8, system: *mut u8) -> usize {
     linux::case(&mut env, vmcb, msrpm, system);
     if env.failures == 0 {
         out!("NANOX:SVM-PROBE:RESULT PASS\n");
-        hw::exit(0x10)
+        finish(0x10)
     }
     out!("NANOX:SVM-PROBE:RESULT FAIL failures={}\n", env.failures);
-    hw::exit(0x11)
+    finish(0x11)
+}
+
+/// Ends the run with `value`; with fw_cfg `opt/nanox/hold` (run.py --show)
+/// it halts instead, so the last screen stays in QEMU's window until the
+/// user closes it.
+fn finish(value: u32) -> ! {
+    if fwcfg::find("opt/nanox/hold").is_ok() {
+        out!("NANOX:SVM-PROBE:HOLD close the window to end the run\n");
+        hw::halt()
+    }
+    hw::exit(value)
 }

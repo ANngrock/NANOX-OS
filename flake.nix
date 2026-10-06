@@ -40,5 +40,9 @@
           echo "NANOX M0: Rust 1.90.0; use cargo xtask doctor"
         '';
       };
+      # QEMU with a window (GTK), to watch a run rather than record it:
+      # `nix build .#qemu-display`, then run.py --show. Not in the shell: the
+      # records and replays keep the minimal, patched QEMU above.
+      packages.${system}.qemu-display = pkgs.qemu_kvm;
     };
 }

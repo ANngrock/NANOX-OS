@@ -191,6 +191,11 @@ pub fn exit(value: u32) -> ! {
     // SAFETY: the probe profile always has isa-debug-exit at 0xF4; without
     // it the OUT is ignored and the loop below halts the processor.
     unsafe { asm!("out dx, eax", in("dx") 0xF4u16, in("eax") value, options(nomem, nostack)) }
+    halt()
+}
+
+/// Stops the processor for good, leaving the display as it is.
+pub fn halt() -> ! {
     loop {
         // SAFETY: final state; interrupts masked.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) }

@@ -5,7 +5,7 @@ Run inside `nix develop` (pinned QEMU, NANOX_OVMF_CODE/NANOX_OVMF_VARS):
 
     python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH] [--repro [--runs N]]
         [--linux-kernel BZIMAGE [--linux-init ELF] [--linux-cmdline TEXT] [--linux-only]
-         [--linux-host-tick NS|off] [--linux-timeout S] [--linux-disk IMAGE]]
+         [--linux-host-tick NS|off] [--linux-timeout S] [--linux-disk IMAGE] [--show]]
 
 With --repro the svm profile runs N times (default 2) with identical inputs
 and the per-case digest (verdict, every counter and the serial bytes) of each
@@ -27,6 +27,13 @@ firmware) and a long timeout: nested paging under TCG is slow. --linux-only
 runs only that profile. The guest also has a screen (a linear framebuffer the
 kernel's console draws on); the probe dumps it at the end and it is saved as
 linux/screen.png.
+
+With --show the linux profile runs in a window instead (QEMU with GTK, from
+`nix build .#qemu-display --out-link ~/.nix-qemu-display`; on Windows 11 the
+window opens through WSLg): the NANOX screen the probe draws shows the guest
+booting in the server window, and at the end the probe halts instead of
+ending the run, so the last screen stays until the window is closed. The
+verdict then comes from the RESULT line, not from the exit status.
 
 Profiles:
   svm     qemu64 with SVM, nested paging, NRIP save: every case must pass
@@ -116,6 +123,10 @@ LINUX_HOST_TICK = option("--linux-host-tick")
 LINUX_DISK = option("--linux-disk")
 LINUX_TIMEOUT_S = int(option("--linux-timeout") or 7200)
 LINUX_PROFILE = ("linux", f"qemu64,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PASS")
+# --show: the linux profile in a window, with a QEMU that has one.
+SHOW = "--show" in sys.argv
+QEMU_DISPLAY = os.environ.get("NANOX_QEMU_DISPLAY",
+                              os.path.expanduser("~/.nix-qemu-display/bin/qemu-system-x86_64"))
 
 
 def linux_initrd(out: Path) -> Path:
@@ -154,14 +165,15 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
     shutil.copyfile(vars_src, vars_fd)
     vars_fd.chmod(0o644)
     serial = d / "serial.log"
+    show = SHOW and bool(linux)
     argv = [
-        "qemu-system-x86_64",
+        QEMU_DISPLAY if show else "qemu-system-x86_64",
         "-machine", "q35",
         "-accel", "tcg,thread=single",
         "-cpu", cpu,
         "-smp", "1",
         "-m", "1G" if linux else "256M",
-        "-display", "none",
+        "-display", "gtk" if show else "none",
         "-monitor", "none",
         "-net", "none",
         "-no-reboot",
@@ -186,6 +198,8 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
             argv += ["-fw_cfg", f"name=opt/nanox/host-tick-ns,string={LINUX_HOST_TICK}"]
         if disk:
             argv += ["-fw_cfg", f"name=opt/nanox/disk,file={disk}"]
+        if show:
+            argv += ["-fw_cfg", "name=opt/nanox/hold,string=1"]
     (d / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
     started = time.monotonic()
     try:
@@ -199,6 +213,7 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
     lines = text.splitlines()
     r = {
         "cpu": cpu,
+        "shown": show,
         "status": status,
         "seconds": round(time.monotonic() - started, 1),
         # The guest's own lines stay in serial.log.
@@ -421,6 +436,13 @@ def main() -> int:
         "qemu": qemu,
         "profiles": {},
     }
+    if SHOW:
+        if not os.path.exists(QEMU_DISPLAY):
+            print(f"--show needs a QEMU with a window at {QEMU_DISPLAY}: "
+                  "nix build .#qemu-display --out-link ~/.nix-qemu-display")
+            return 2
+        summary["qemu_display"] = subprocess.run(
+            [QEMU_DISPLAY, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
     profiles = [] if "--linux-only" in sys.argv else list(PROFILES)
     initrd = None
     disk = None
@@ -448,7 +470,9 @@ def main() -> int:
                         disk=disk if name == "linux" else None)
         r["expected_status"] = want_status
         r["expected_line"] = want_line
-        r["match"] = r["status"] == want_status and want_line in r["serial_lines"]
+        # Shown, the run ends when the window is closed: only the RESULT line counts.
+        status_ok = r["status"] == want_status or r["shown"]
+        r["match"] = status_ok and want_line in r["serial_lines"]
         ok &= r["match"]
         summary["profiles"][name] = r
         print(f"{name:7} status={r['status']} match={r['match']} ({r['seconds']} s)")
