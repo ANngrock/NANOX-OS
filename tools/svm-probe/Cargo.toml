@@ -11,6 +11,7 @@ hw-svm = { path = "../../crates/hw-svm" }
 guest-boot = { path = "../../crates/guest-boot" }
 boot-protocol = { path = "../../crates/boot-protocol" }
 vmm-devices = { path = "../../crates/vmm-devices" }
+vswitch = { path = "../../crates/vswitch" }
 
 [[bin]]
 name = "svm-probe"

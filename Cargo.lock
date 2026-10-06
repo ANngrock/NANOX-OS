@@ -279,6 +279,7 @@ dependencies = [
  "guest-boot",
  "hw-svm",
  "vmm-devices",
+ "vswitch",
 ]
 
 [[package]]

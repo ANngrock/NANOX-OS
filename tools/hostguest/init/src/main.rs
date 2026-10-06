@@ -1,7 +1,8 @@
 //! Init for the measurement boot: mounts the pseudo file systems, prints what
 //! the guest kernel reports about its machine on the console, greets the host
-//! on the agent channel (virtio-console, `/dev/hvc0`) when there is one, and
-//! powers off.
+//! on the agent channel (virtio-console, `/dev/hvc0`) when there is one,
+//! brings up `eth0` and pings the host (10.0.2.2) when there is a network card,
+//! and powers off.
 //! Raw Linux system calls, no libc: the same kind of freestanding static
 //! program a NANOX native process is.
 
@@ -17,6 +18,9 @@ const SYS_OPEN: usize = 2;
 const SYS_CLOSE: usize = 3;
 const SYS_POLL: usize = 7;
 const SYS_IOCTL: usize = 16;
+const SYS_SOCKET: usize = 41;
+const SYS_SENDTO: usize = 44;
+const SYS_RECVFROM: usize = 45;
 const SYS_DUP2: usize = 33;
 const SYS_MKDIR: usize = 83;
 const SYS_MOUNT: usize = 165;
@@ -33,15 +37,36 @@ const ECHO: u32 = 0o10;
 const POLLIN: u16 = 1;
 /// How long the host may take to answer on the agent channel.
 const AGENT_WAIT_MS: usize = 1000;
+const AF_INET: u16 = 2;
+const SOCK_DGRAM: usize = 2;
+const SOCK_RAW: usize = 3;
+const IPPROTO_ICMP: usize = 1;
+const SIOCGIFFLAGS: usize = 0x8913;
+const SIOCSIFFLAGS: usize = 0x8914;
+const SIOCSIFADDR: usize = 0x8916;
+const SIOCSIFNETMASK: usize = 0x891C;
+const IFF_UP: u8 = 1;
+/// The guest's address and the host's on the VMM's network (as QEMU's user network has them).
+const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+const NETMASK: [u8; 4] = [255, 255, 255, 0];
+const HOST_IP: [u8; 4] = [10, 0, 2, 2];
+const PING_DATA: &[u8] = b"NANOX ping";
+/// How long the host may take to answer a ping.
+const PING_WAIT_MS: usize = 1000;
 
 unsafe fn syscall(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
+    // SAFETY: the caller's arguments; the sixth is 0.
+    unsafe { syscall6(n, a, b, c, d, e, 0) }
+}
+
+unsafe fn syscall6(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> isize {
     let ret: isize;
     // SAFETY: the Linux system call ABI; the arguments are the caller's.
     unsafe {
         asm!(
             "syscall",
             inlateout("rax") n as isize => ret,
-            in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d, in("r8") e,
+            in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d, in("r8") e, in("r9") f,
             lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
@@ -207,6 +232,141 @@ fn agent() {
     unsafe { syscall(SYS_CLOSE, fd, 0, 0, 0, 0) };
 }
 
+/// `n` in decimal.
+fn write_dec(fd: usize, mut n: usize) {
+    let mut d = [0u8; 20];
+    let mut i = d.len();
+    loop {
+        i -= 1;
+        d[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    write(fd, &d[i..]);
+}
+
+/// A struct sockaddr_in: AF_INET, port 0, `addr`.
+fn sockaddr(addr: [u8; 4]) -> [u8; 16] {
+    let mut s = [0u8; 16];
+    s[..2].copy_from_slice(&AF_INET.to_le_bytes());
+    s[4..8].copy_from_slice(&addr);
+    s
+}
+
+/// A struct ifreq for `eth0`, its union holding a struct sockaddr_in of `addr`.
+fn ifreq(addr: [u8; 4]) -> [u8; 40] {
+    let mut r = [0u8; 40];
+    r[..4].copy_from_slice(b"eth0");
+    r[16..32].copy_from_slice(&sockaddr(addr));
+    r
+}
+
+/// The Internet checksum (RFC 1071).
+fn checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for pair in data.chunks(2) {
+        sum += u32::from(u16::from_be_bytes([
+            pair[0],
+            pair.get(1).copied().unwrap_or(0),
+        ]));
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// `eth0` gets [`GUEST_IP`]/24 and is brought up; one ICMP echo request goes
+/// to [`HOST_IP`] and its reply (if it comes within [`PING_WAIT_MS`]) is
+/// reported.
+fn net() {
+    write(1, b"--- net\n");
+    // SAFETY: the socket, ioctl and close system calls with buffers of the
+    // kernel's struct ifreq size; the descriptor is ours.
+    let up = unsafe {
+        let s = syscall(SYS_SOCKET, AF_INET as usize, SOCK_DGRAM, 0, 0, 0);
+        if s < 0 {
+            false
+        } else {
+            let s = s as usize;
+            let (addr, mask, mut flags) = (ifreq(GUEST_IP), ifreq(NETMASK), ifreq([0; 4]));
+            let ok = syscall(SYS_IOCTL, s, SIOCSIFADDR, addr.as_ptr() as usize, 0, 0) == 0
+                && syscall(SYS_IOCTL, s, SIOCSIFNETMASK, mask.as_ptr() as usize, 0, 0) == 0
+                && syscall(
+                    SYS_IOCTL,
+                    s,
+                    SIOCGIFFLAGS,
+                    flags.as_mut_ptr() as usize,
+                    0,
+                    0,
+                ) == 0
+                && {
+                    flags[16] |= IFF_UP;
+                    syscall(SYS_IOCTL, s, SIOCSIFFLAGS, flags.as_ptr() as usize, 0, 0) == 0
+                };
+            syscall(SYS_CLOSE, s, 0, 0, 0, 0);
+            ok
+        }
+    };
+    if !up {
+        write(1, b"(no eth0)\n");
+        return;
+    }
+    write(1, b"eth0 10.0.2.15/24 up\n");
+    // SAFETY: a raw ICMP socket (init runs as root).
+    let r = unsafe { syscall(SYS_SOCKET, AF_INET as usize, SOCK_RAW, IPPROTO_ICMP, 0, 0) };
+    if r < 0 {
+        write(1, b"(no raw socket)\n");
+        return;
+    }
+    let r = r as usize;
+    // Echo request: type 8, code 0, checksum, identifier "NX", sequence 1, data.
+    let mut req = [0u8; 8 + PING_DATA.len()];
+    req[..8].copy_from_slice(&[8, 0, 0, 0, b'N', b'X', 0, 1]);
+    req[8..].copy_from_slice(PING_DATA);
+    let sum = checksum(&req);
+    req[2..4].copy_from_slice(&sum.to_be_bytes());
+    let to = sockaddr(HOST_IP);
+    let mut pfd = [r as u32, u32::from(POLLIN)];
+    let mut buf = [0u8; 128];
+    // SAFETY: valid buffers for sendto, poll and recvfrom.
+    let n = unsafe {
+        let sent = syscall6(
+            SYS_SENDTO,
+            r,
+            req.as_ptr() as usize,
+            req.len(),
+            0,
+            to.as_ptr() as usize,
+            to.len(),
+        );
+        if sent == req.len() as isize
+            && syscall(SYS_POLL, pfd.as_mut_ptr() as usize, 1, PING_WAIT_MS, 0, 0) > 0
+        {
+            syscall(SYS_RECVFROM, r, buf.as_mut_ptr() as usize, buf.len(), 0, 0)
+        } else {
+            0
+        }
+    };
+    // SAFETY: closing the descriptor we opened.
+    unsafe { syscall(SYS_CLOSE, r, 0, 0, 0, 0) };
+    // A raw socket gets the IPv4 header, then the ICMP message.
+    let n = n.max(0) as usize;
+    let ihl = usize::from(buf[0] & 0x0F) * 4;
+    let reply = buf.get(ihl..n).unwrap_or(&[]);
+    if reply.len() == req.len() && reply[0] == 0 && reply[4..] == req[4..] && checksum(reply) == 0 {
+        write(1, b"ping 10.0.2.2: echo reply, ttl ");
+        write_dec(1, usize::from(buf[8]));
+        write(1, b", ");
+        write_dec(1, n);
+        write(1, b" bytes\n");
+    } else {
+        write(1, b"(no reply)\n");
+    }
+}
+
 #[no_mangle]
 extern "C" fn init_main() -> ! {
     mkdir("/dev");
@@ -236,6 +396,7 @@ extern "C" fn init_main() -> ! {
     cat("devices", "/proc/devices");
     pci_devices();
     agent();
+    net();
     write(1, b"NANOX_GUEST_REPORT_END\n");
     // SAFETY: the reboot system call with the documented magic numbers; power off.
     unsafe { syscall(SYS_REBOOT, 0xfee1dead, 672274793, 0x4321fedc, 0, 0) };

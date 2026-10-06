@@ -45,6 +45,7 @@ use vmm_devices::virtio_blk::{BlockBackend, SECTOR};
 use vmm_devices::virtio_console::ConsoleBackend;
 use vmm_devices::virtio_gpu::{Rect, Scanout};
 use vmm_devices::virtio_net::{NetBackend, MAX_FRAME};
+use vswitch::endpoint::Endpoint;
 
 /// Guest RAM: enough for the kernel (init_size ~62 MiB from 16 MiB), its
 /// memory map and the initramfs at the top.
@@ -185,18 +186,64 @@ impl BlockBackend for NoDisk {
     }
 }
 
-/// No network: frames the guest sends are counted and dropped.
-#[derive(Default)]
-struct NoNet {
+/// The network: the host's own address on it ([`HOST_IP`], as the gateway of
+/// QEMU's user network), which answers ARP and ping (`vswitch::endpoint`);
+/// its answers wait for the guest in a queue of [`NET_QUEUE`] frames.
+struct Net {
+    host: Endpoint,
     sent: u64,
+    frames: [[u8; MAX_FRAME]; NET_QUEUE],
+    lens: [usize; NET_QUEUE],
+    /// The oldest queued frame and how many there are.
+    head: usize,
+    queued: usize,
+    /// Answers that found the queue full.
+    dropped: u64,
 }
 
-impl NetBackend for NoNet {
-    fn send(&mut self, _: &[u8]) {
-        self.sent += 1;
+const HOST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x35, 0x02];
+const HOST_IP: [u8; 4] = [10, 0, 2, 2];
+const NET_QUEUE: usize = 4;
+
+impl Net {
+    fn new() -> Self {
+        Self {
+            host: Endpoint::new(HOST_MAC, HOST_IP),
+            sent: 0,
+            frames: [[0; MAX_FRAME]; NET_QUEUE],
+            lens: [0; NET_QUEUE],
+            head: 0,
+            queued: 0,
+            dropped: 0,
+        }
     }
-    fn recv(&mut self, _: &mut [u8; MAX_FRAME]) -> Option<usize> {
-        None
+}
+
+impl NetBackend for Net {
+    fn send(&mut self, frame: &[u8]) {
+        self.sent += 1;
+        let mut out = [0u8; MAX_FRAME];
+        let Some(n) = self.host.answer(frame, &mut out) else {
+            return;
+        };
+        if self.queued == NET_QUEUE {
+            self.dropped += 1;
+            return;
+        }
+        let at = (self.head + self.queued) % NET_QUEUE;
+        self.frames[at][..n].copy_from_slice(&out[..n]);
+        self.lens[at] = n;
+        self.queued += 1;
+    }
+    fn recv(&mut self, buf: &mut [u8; MAX_FRAME]) -> Option<usize> {
+        if self.queued == 0 {
+            return None;
+        }
+        let n = self.lens[self.head];
+        buf[..n].copy_from_slice(&self.frames[self.head][..n]);
+        self.head = (self.head + 1) % NET_QUEUE;
+        self.queued -= 1;
+        Some(n)
     }
 }
 
@@ -628,7 +675,7 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     };
     let (mut mem, mut net, mut screen, mut agent, mut input) = (
         Dma { base, size: RAM },
-        NoNet::default(),
+        Net::new(),
         NoScreen::default(),
         Agent::new(),
         NoInput,
@@ -730,7 +777,7 @@ fn progress(env: &mut Env, page: &mut [u8; 4096], o: &Outcome, slice: u64, ticks
     out!("\n");
 }
 
-fn report(o: &Outcome, m: &Machine, slices: u64, net: &NoNet, screen: &NoScreen, agent: &Agent) {
+fn report(o: &Outcome, m: &Machine, slices: u64, net: &Net, screen: &NoScreen, agent: &Agent) {
     out!(
         " verdict={:?} exits={} slices={} msr_faults={} ud={} irqs={} mmio={} virtual_ms={} serial_bytes={} truncated={} unclaimed_in={} unclaimed_out={} unclaimed_mmio={} other_messages={} pit_coalesced={} blk_requests={} net_sent={} gpu_resources={} agent_bytes={}\n",
         o.verdict,
@@ -752,6 +799,14 @@ fn report(o: &Outcome, m: &Machine, slices: u64, net: &NoNet, screen: &NoScreen,
         net.sent,
         screen.resources,
         agent.bytes
+    );
+    out!(
+        "NANOX:SVM-PROBE:LINUX-NET from_guest={} arp_replies={} echo_replies={} ignored={} dropped={}\n",
+        net.sent,
+        net.host.arp_replies,
+        net.host.echo_replies,
+        net.host.ignored,
+        net.dropped
     );
     out!(
         "NANOX:SVM-PROBE:LINUX-AGENT from_guest={} to_guest={} text=\"",
