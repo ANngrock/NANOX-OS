@@ -197,6 +197,10 @@ pub enum Step {
     Cli,
     /// PAUSE; must be intercepted.
     Pause,
+    /// RDTSC: exits if intercepted (the result goes to `rdtsc_results`), else reads the host TSC.
+    Rdtsc,
+    /// RDTSCP: exits if intercepted, else reads the host TSC.
+    Rdtscp,
 }
 
 impl Step {
@@ -209,7 +213,8 @@ impl Step {
             | Step::MsrEmulated { .. } => 2,
             Step::Vmmcall => 3,
             Step::Hlt | Step::Sti | Step::Cli => 1,
-            Step::Pause => 2,
+            Step::Pause | Step::Rdtsc => 2,
+            Step::Rdtscp => 3,
             Step::Load { .. } | Step::Store { .. } | Step::Npf { .. } => 3,
             Step::Tick | Step::SpinForever | Step::TripleFault => 2,
             Step::Mmio { len, .. } => u64::from(len),
@@ -250,6 +255,10 @@ pub struct FakeCpu {
     pub injected: Vec<u64>,
     pub cpuid_results: Vec<[u32; 4]>,
     pub rdmsr_results: Vec<u64>,
+    /// EDX:EAX of every RDTSC/RDTSCP, intercepted or not.
+    pub rdtsc_results: Vec<u64>,
+    /// The host's TSC for reads the VMM does not intercept; each read adds 1000.
+    pub host_tsc: u64,
     pub loads: Vec<u8>,
     pub vmruns: u64,
     pub msrs: HashMap<u32, u64>,
@@ -297,6 +306,8 @@ impl FakeCpu {
             injected: Vec::new(),
             cpuid_results: Vec::new(),
             rdmsr_results: Vec::new(),
+            rdtsc_results: Vec::new(),
+            host_tsc: 0x10_0000_0000,
             loads: Vec::new(),
             vmruns: 0,
             msrs: HashMap::new(),
@@ -475,6 +486,16 @@ impl FakeCpu {
             Step::MsrEmulated { write: false, .. } if !injected => self
                 .rdmsr_results
                 .push(gprs.rdx << 32 | (vmcb.rax() & 0xFFFF_FFFF)),
+            Step::Rdtsc if !injected => {
+                if vmcb.rax() >> 32 != 0 || gprs.rdx >> 32 != 0 {
+                    self.violations.push(format!(
+                        "RDTSC: upper halves {:#x} {:#x}",
+                        vmcb.rax(),
+                        gprs.rdx
+                    ));
+                }
+                self.rdtsc_results.push(gprs.rdx << 32 | vmcb.rax());
+            }
             _ => {}
         }
         self.pos = p.index + 1;
@@ -566,6 +587,35 @@ impl SvmCpu for FakeCpu {
                     Self::exit(vmcb, code::PAUSE, 0, 0, next);
                     self.pending = pend(true, false);
                     return;
+                }
+                Step::Rdtsc | Step::Rdtscp => {
+                    let (m, bit, exit) = if step == Step::Rdtsc {
+                        (
+                            ctl::INTERCEPT_MISC1,
+                            hw_svm::vmcb::misc1::RDTSC,
+                            code::RDTSC,
+                        )
+                    } else {
+                        (
+                            ctl::INTERCEPT_MISC2,
+                            hw_svm::vmcb::misc2::RDTSCP,
+                            code::RDTSCP,
+                        )
+                    };
+                    if vmcb.read_u32(m) & bit != 0 {
+                        vmcb.set_rax(0xDEAD_BEEF_DEAD_BEEF);
+                        gprs.rdx = 0xDEAD_BEEF_DEAD_BEEF;
+                        Self::exit(vmcb, exit, 0, 0, next);
+                        // RDTSCP is expected to fault (the platform hides it).
+                        self.pending = pend(true, step == Step::Rdtscp);
+                        return;
+                    }
+                    let t = self.host_tsc;
+                    self.host_tsc += 1000;
+                    vmcb.set_rax(t & 0xFFFF_FFFF);
+                    gprs.rdx = t >> 32;
+                    self.rdtsc_results.push(t);
+                    self.pos += 1;
                 }
                 Step::MsrEmulated { msr, write, value } => {
                     gprs.rcx = u64::from(msr);

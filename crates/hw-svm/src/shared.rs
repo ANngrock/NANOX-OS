@@ -346,6 +346,7 @@ fn window(vmcb: &mut Vmcb<'_>, open: bool) {
 /// Exits a vCPU handles itself.
 pub(crate) enum Own {
     Msr { write: bool },
+    Rdtsc,
     Io(IoExit),
     Hlt,
     Npf { gpa: u64, error: u64 },
@@ -389,7 +390,9 @@ pub(crate) fn common_exit<C: SvmCpu + ?Sized>(
             core.advance(vmcb, 2);
             None
         }
-        Exit::Vmmcall | Exit::SvmInstruction(_) => {
+        Exit::Rdtsc => return Err(Own::Rdtsc),
+        // RDTSCP is hidden from the guest (CPUID) where RDTSC is intercepted.
+        Exit::Vmmcall | Exit::SvmInstruction(_) | Exit::Rdtscp => {
             core.ud += 1;
             vmcb.set_event_inj(exception(UD, false));
             None

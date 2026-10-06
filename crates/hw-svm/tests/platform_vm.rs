@@ -10,9 +10,9 @@ mod common;
 use std::collections::VecDeque;
 
 use common::*;
-use hw_svm::platform_vm::{Host, InputHost, PlatformVcpu};
-use hw_svm::vmcb::{bits, ctl, save, tlb};
-use hw_svm::vmm::{Outcome, Verdict};
+use hw_svm::platform_vm::{Host, InputHost, PlatformVcpu, TSC_HZ};
+use hw_svm::vmcb::{bits, ctl, misc1, misc2, save, tlb};
+use hw_svm::vmm::{Outcome, Vcpu, Verdict};
 use hw_svm::PAGE_SIZE;
 use vmm_devices::hpet;
 use vmm_devices::machine::{slot, Machine};
@@ -827,9 +827,9 @@ fn the_interrupt_window_bits() {
     assert!(rig.cpu.interrupts.is_empty());
 }
 
-/// Intercept vector 3 (APM 15.9): INTR, NMI, SMI, INIT (bits 0-3), CPUID
-/// (18), PAUSE (23), HLT (24), IOIO_PROT (27), MSR_PROT (28), SHUTDOWN (31).
-const INTERCEPTS_3: u32 = 0x9984_000F;
+/// Intercept vector 3 (APM 15.9): INTR, NMI, SMI, INIT (bits 0-3), RDTSC (14),
+/// CPUID (18), PAUSE (23), HLT (24), IOIO_PROT (27), MSR_PROT (28), SHUTDOWN (31).
+const INTERCEPTS_3: u32 = 0x9984_400F;
 
 /// The control area: exactly the intercepts the loop handles, nested paging
 /// with the configured tables and maps, V_INTR_MASKING, no stale event.
@@ -843,8 +843,8 @@ fn the_control_area() {
     vmcb.set_event_inj(1 << 31 | 0x30);
     v.prepare(&mut vmcb);
     assert_eq!(vmcb.read_u32(ctl::INTERCEPT_MISC1), INTERCEPTS_3);
-    // Vector 4: VMRUN, VMMCALL, VMLOAD, VMSAVE, STGI, CLGI, SKINIT.
-    assert_eq!(vmcb.read_u32(ctl::INTERCEPT_MISC2), 0x7F);
+    // Vector 4: VMRUN, VMMCALL, VMLOAD, VMSAVE, STGI, CLGI, SKINIT, RDTSCP.
+    assert_eq!(vmcb.read_u32(ctl::INTERCEPT_MISC2), 0xFF);
     assert_eq!(vmcb.read_u64(ctl::VINTR), 1 << 24);
     assert_eq!(vmcb.event_inj(), 0);
     assert_eq!(vmcb.read_u32(ctl::ASID), cfg.asid);
@@ -1213,7 +1213,7 @@ fn msr_policy_for_linux() {
         wr_gp(EFER, long | sce | 1 << 40),         // a reserved bit in EDX
         wr(EFER, lme | nxe | sce),                 // LMA is the processor's
         rd(0x1B),
-        Step::Rdmsr { msr: TSC }, // no exit
+        rd(TSC), // virtual time, like RDTSC
         wr_gp(TSC, 5),
         rd(MTRR_CAP),
         wr_gp(MTRR_CAP, 0),
@@ -1231,12 +1231,13 @@ fn msr_policy_for_linux() {
     script.extend([rd(MTRR_DEF_TYPE), Step::Rdmsr { msr: 0xC001_0131 }]);
     script.push(debug_exit());
     let mut rig = Rig::platform(&script);
-    rig.cpu.msrs.insert(TSC, 0x1234_5678_9ABC);
+    rig.cpu.msrs.insert(TSC, 0x1234_5678_9ABC); // the host's, never seen by the guest
     let mut serial = [0u8; 4];
     let mut v = PlatformVcpu::new(rig.cfg, machine(), &mut serial);
     let o = run_platform(&mut rig, &mut v, &mut World::new().host());
     assert_eq!(o.verdict, PASS);
-    let mut want = vec![long, long | sce, 0xFEE0_0900, 0x1234_5678_9ABC, 0, 0];
+    let tsc = 10 * rig.cfg.exit_quantum_ns; // the tenth exit
+    let mut want = vec![long, long | sce, 0xFEE0_0900, tsc, 0, 0];
     want.push(0x806); // MTRRs on, write-back
     want.extend([0xC00, 0xC01, 0xC04, 0xC05, 0xC06, 0xC06]);
     assert_eq!(rig.cpu.rdmsr_results, want);
@@ -1385,8 +1386,8 @@ fn cpuid_for_linux() {
     let r = &rig.cpu.cpuid_results;
     assert_eq!(
         r[0],
-        [0, 0x219C_07AB, 1 << 3, 1 << 4],
-        "UMIP, CET, LA57 hidden"
+        [0, 0x219C_07AB & !(1 << 1), 1 << 3, 1 << 4],
+        "UMIP, CET, LA57 and TSC_ADJUST hidden"
     );
     assert_eq!(r[1], host7, "subleaf 1 untouched");
     assert_eq!(r[2], [0; 4], "no SME/SEV");
@@ -1456,4 +1457,88 @@ fn the_machine_is_the_callers() {
     let mut v = PlatformVcpu::new(rig.cfg, machine(), &mut serial);
     v.machine_mut().key(0x1C);
     assert!(v.machine().kbd.irq1());
+}
+
+// ---- time stamp counter -----------------------------------------------------------------
+
+#[test]
+fn rdtsc_reads_virtual_time() {
+    let script = [
+        Step::Rdtsc,
+        Step::Rdtsc,
+        out8(0x80, 1),
+        Step::Rdtsc,
+        debug_exit(),
+    ];
+    let mut rig = Rig::platform(&script);
+    rig.cfg.exit_quantum_ns = 1_234;
+    let mut serial = [0u8; 4];
+    let mut v = PlatformVcpu::new(rig.cfg, machine(), &mut serial);
+    let o = run_platform(&mut rig, &mut v, &mut World::new().host());
+    assert_eq!(o.verdict, PASS);
+    // TSC_HZ is 1 GHz: the TSC is virtual nanoseconds; every exit charges one quantum
+    assert_eq!(TSC_HZ, 1_000_000_000);
+    assert_eq!(rig.cpu.rdtsc_results, vec![1_234, 2 * 1_234, 4 * 1_234]);
+    let vmcb = rig.vmcb();
+    assert_ne!(vmcb.read_u32(ctl::INTERCEPT_MISC1) & misc1::RDTSC, 0);
+    assert_ne!(vmcb.read_u32(ctl::INTERCEPT_MISC2) & misc2::RDTSCP, 0);
+    rig.cpu.assert_clean();
+}
+
+#[test]
+fn a_tsc_beyond_32_bits_splits_into_edx_and_eax() {
+    let mut rig = Rig::platform(&[Step::Rdtsc, debug_exit()]);
+    rig.cfg.exit_quantum_ns = 0x1_2345_6789;
+    let mut serial = [0u8; 4];
+    let mut v = PlatformVcpu::new(rig.cfg, machine(), &mut serial);
+    assert_eq!(
+        run_platform(&mut rig, &mut v, &mut World::new().host()).verdict,
+        PASS
+    );
+    assert_eq!(rig.cpu.rdtsc_results, vec![0x1_2345_6789]);
+    rig.cpu.assert_clean();
+}
+
+#[test]
+fn rdtscp_faults_and_cpuid_hides_it_and_tsc_adjust() {
+    let script = [
+        Step::Rdtscp,
+        Step::Cpuid {
+            leaf: 0x8000_0001,
+            sub: 0,
+        },
+        Step::Cpuid { leaf: 7, sub: 0 },
+        debug_exit(),
+    ];
+    let mut rig = Rig::platform(&script);
+    rig.cpu
+        .host_cpuid
+        .insert((0x8000_0001, 0), [0, 0, 0x75C2_37FF, 0x2FD3_FBFF | 1 << 27]);
+    rig.cpu
+        .host_cpuid
+        .insert((7, 0), [0, 0x219C_07AB | 1 << 1, 0, 0]);
+    let mut serial = [0u8; 4];
+    let mut v = PlatformVcpu::new(rig.cfg, machine(), &mut serial);
+    let o = run_platform(&mut rig, &mut v, &mut World::new().host());
+    assert_eq!(o.verdict, PASS);
+    assert_eq!(o.ud_injected, 1, "RDTSCP: #UD");
+    assert_eq!(rig.cpu.injected, vec![6 | 3 << 8 | 1 << 31]);
+    assert_eq!(rig.cpu.cpuid_results[0][3] & 1 << 27, 0, "no RDTSCP");
+    assert_eq!(rig.cpu.cpuid_results[1][1] & 1 << 1, 0, "no TSC_ADJUST");
+    assert_eq!(rig.cpu.cpuid_results[1][1], 0x219C_07AB & !(1 << 1));
+    rig.cpu.assert_clean();
+}
+
+#[test]
+fn the_candidate_vcpu_leaves_the_tsc_alone() {
+    let mut rig = Rig::new(&[Step::Rdtsc, debug_exit()]);
+    let mut serial = [0u8; 4];
+    let mut v = Vcpu::new(rig.cfg, &mut serial);
+    assert_eq!(run(&mut rig, &mut v).verdict, PASS);
+    assert_eq!(
+        rig.cpu.rdtsc_results,
+        vec![0x10_0000_0000],
+        "the host's TSC, no exit"
+    );
+    rig.cpu.assert_clean();
 }

@@ -102,8 +102,9 @@ LINUX_CMDLINE = option("--linux-cmdline") or " ".join([
     "earlyprintk=serial,ttyS0,115200",  # output before the 8250 driver is up
     "panic=-1",  # a panic reboots at once: the VMM sees Reset, not a hang
 ])
-# Virtual time (ns) a host tick exit (~1 ms of host time) counts, or "off";
-# the probe's default when absent (fw_cfg opt/nanox/host-tick-ns).
+# Virtual time (ns) a host tick exit (~1 ms of host time) counts, or "off"
+# (the probe's default when absent: no tick, a run independent of host timing;
+# fw_cfg opt/nanox/host-tick-ns).
 LINUX_HOST_TICK = option("--linux-host-tick")
 LINUX_TIMEOUT_S = int(option("--linux-timeout") or 7200)
 LINUX_PROFILE = ("linux", f"qemu64,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PASS")

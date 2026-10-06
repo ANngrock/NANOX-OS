@@ -25,7 +25,11 @@
 //! * **Time.** One virtual clock for the LAPIC timer, HPET, PIT, RTC and ACPI
 //!   PM timer: `exit_quantum_ns` per exit, `intr_exit_ns` per host interrupt,
 //!   and a HLT with IF=1 and nothing pending skips to `Machine::next_event`;
-//!   with nothing pending or scheduled (or IF=0) the run ends `Halted`.
+//!   with nothing pending or scheduled (or IF=0) the run ends `Halted`. The
+//!   guest's TSC is that clock too ([`TSC_HZ`]): RDTSC and RDMSR of the TSC
+//!   exit and read virtual time, RDTSCP is hidden (CPUID) and faults, so a
+//!   guest calibrating its TSC against the PIT or HPET finds them in step,
+//!   and a loop that waits on the TSC moves time forward.
 //! * **Platform outputs.** A reset request (port 0x92, keyboard controller)
 //!   ends the run with `Verdict::Reset`, ACPI S5 with `PowerOff`, another
 //!   sleep state with `Sleep`. COM1's output is captured like the candidate
@@ -46,7 +50,7 @@ use crate::exit::{code, IoExit};
 use crate::npt::NeedsFlush;
 use crate::perm::MsrPermissionMap;
 use crate::shared::{self, Bus, Core, Guest, Own};
-use crate::vmcb::{bits, save, Gprs, Vmcb};
+use crate::vmcb::{bits, ctl, misc1, misc2, save, Gprs, Vmcb};
 use crate::vmm::{Outcome, Vcpu, Verdict, VmConfig};
 use crate::{Clock, SvmCpu};
 use vmm_devices::acpi_pm;
@@ -59,6 +63,9 @@ use vmm_devices::virtio_gpu::Scanout;
 use vmm_devices::virtio_net::NetBackend;
 
 pub const MSR_TSC: u32 = 0x10;
+/// The guest's TSC rate: one tick per nanosecond of virtual time, so the TSC and every timer of
+/// the machine (PIT, HPET, ACPI PM timer, local APIC) tell the same time.
+pub const TSC_HZ: u64 = 1_000_000_000;
 pub const MSR_MTRR_CAP: u32 = 0xFE;
 pub const MSR_MTRR_DEF_TYPE: u32 = 0x2FF;
 pub const MSR_EFER: u32 = 0xC000_0080;
@@ -125,9 +132,14 @@ pub fn linux_cpuid(leaf: u32, sub: u32, r: &mut [u32; 4]) {
     // No machine-check architecture: Linux would read MCG_CAP (0x179), which the VMM does not have.
     const MCE: u32 = 1 << 7;
     const MCA: u32 = 1 << 14;
+    // RDTSCP would need the guest's TSC_AUX on exit; TSC_ADJUST is not emulated.
+    const RDTSCP: u32 = 1 << 27;
+    const TSC_ADJUST: u32 = 1 << 1;
     match leaf {
         1 => r[3] &= !(MCE | MCA),
+        0x8000_0001 => r[3] &= !RDTSCP,
         7 if sub == 0 => {
+            r[1] &= !TSC_ADJUST;
             r[2] &= !(UMIP | CET_SS | LA57);
             r[3] &= !CET_IBT;
         }
@@ -167,16 +179,24 @@ impl<'s> PlatformVcpu<'s> {
         }
     }
 
-    /// Programs the control area of `vmcb` (the same intercepts as
-    /// [`Vcpu::prepare`]).
+    /// Programs the control area of `vmcb`: the intercepts of [`Vcpu::prepare`] plus RDTSC and
+    /// RDTSCP.
     pub fn prepare(&self, vmcb: &mut Vmcb<'_>) {
         self.core.prepare(vmcb);
+        // The TSC is read from virtual time: RDTSC exits, RDTSCP faults (hidden in CPUID).
+        let m1 = vmcb.read_u32(ctl::INTERCEPT_MISC1);
+        vmcb.write_u32(ctl::INTERCEPT_MISC1, m1 | misc1::RDTSC);
+        let m2 = vmcb.read_u32(ctl::INTERCEPT_MISC2);
+        vmcb.write_u32(ctl::INTERCEPT_MISC2, m2 | misc2::RDTSCP);
     }
 
-    /// Fills an MSR permission map: the candidate policy, plus reads of the
-    /// TSC without an exit (TSC_OFFSET applies to RDMSR as to RDTSC, so the
-    /// two agree; a write would set the host's TSC and stays intercepted).
-    /// Emulated on exit: IA32_APIC_BASE (the machine's local APIC), EFER
+    /// The guest's TSC: virtual time at [`TSC_HZ`].
+    pub fn tsc(&self) -> u64 {
+        (u128::from(self.core.now) * u128::from(TSC_HZ) / 1_000_000_000) as u64
+    }
+
+    /// Fills an MSR permission map: the candidate policy. Emulated on exit: the TSC (reads give
+    /// virtual time like RDTSC, writes #GP), IA32_APIC_BASE (the machine's local APIC), EFER
     /// (Linux sets SCE and NXE with RDMSR/WRMSR before it has an IDT),
     /// MTRRcap (no ranges, no fixed ranges, no WC) and MTRRdefType (a
     /// register, [`MTRR_DEF_TYPE_RESET`] at first), the K8 interrupt-pending message (reads 0,
@@ -184,7 +204,6 @@ impl<'s> PlatformVcpu<'s> {
     /// which Linux turns into a warning for its plain RDMSR/WRMSR.
     pub fn msr_policy(map: &mut MsrPermissionMap<'_>) {
         Vcpu::msr_policy(map);
-        map.allow(MSR_TSC, true, false);
     }
 
     /// Records that nested mappings were removed: the next VMRUN flushes
@@ -233,6 +252,7 @@ impl<'s> PlatformVcpu<'s> {
             lapic::MSR_APIC_BASE => Some(self.machine.lapic.read_msr()),
             MSR_EFER => Some(vmcb.read_u64(save::EFER) & !bits::EFER_SVME),
             MSR_MTRR_CAP | MSR_K8_INT_PENDING_MSG => Some(0),
+            MSR_TSC => Some(self.tsc()),
             MSR_MTRR_DEF_TYPE => Some(self.mtrr_def_type),
             _ => None,
         }
@@ -437,6 +457,13 @@ impl<'s> Guest<'s> for Running<'_, 's, '_> {
                 None
             }
             Err(Own::Hlt) => self.hlt(vmcb),
+            Err(Own::Rdtsc) => {
+                let t = self.v.tsc();
+                vmcb.set_rax(t & 0xFFFF_FFFF);
+                gprs.rdx = t >> 32;
+                self.v.core.advance(vmcb, 2);
+                None
+            }
             Err(Own::Npf { gpa, error }) => self.npf(cpu, vmcb, gprs, gpa, error),
         };
         self.v.drain_serial();

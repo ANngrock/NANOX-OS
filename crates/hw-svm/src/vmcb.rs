@@ -74,6 +74,7 @@ pub mod misc1 {
     pub const SMI: u32 = 1 << 2;
     pub const INIT: u32 = 1 << 3;
     pub const VINTR: u32 = 1 << 4;
+    pub const RDTSC: u32 = 1 << 14;
     pub const CPUID: u32 = 1 << 18;
     pub const PAUSE: u32 = 1 << 23;
     pub const HLT: u32 = 1 << 24;
@@ -91,6 +92,7 @@ pub mod misc2 {
     pub const STGI: u32 = 1 << 4;
     pub const CLGI: u32 = 1 << 5;
     pub const SKINIT: u32 = 1 << 6;
+    pub const RDTSCP: u32 = 1 << 7;
     pub const XSETBV: u32 = 1 << 13;
 }
 

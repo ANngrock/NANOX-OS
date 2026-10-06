@@ -25,9 +25,7 @@
 //! pages (`NANOX:SVM-PROBE:LINUX-EXITS`, `-PORTS`, `-MSRS`, `-CPUID`, `-MMIO`).
 
 use crate::hw::Serial;
-use crate::{
-    fwcfg, has, hw, Cpu, Env, Frames, GuestMap, GuestRam, Phys, HOST_TICK_COUNT, HOST_TICK_NS,
-};
+use crate::{fwcfg, has, hw, Cpu, Env, Frames, GuestMap, GuestRam, Phys, HOST_TICK_COUNT};
 use core::fmt::Write;
 use guest_boot::linux::{self, Acpi, LinuxConfig};
 use guest_boot::GuestMemory as _;
@@ -57,18 +55,10 @@ const ACPI_MAX: usize = 0x2000;
 /// When the runner passes no command line.
 const DEFAULT_CMDLINE: &[u8] = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 panic=-1";
 const CMDLINE_MAX: usize = 2048;
-/// Virtual time per exit. The guest's TSC is the host's and does not follow
-/// it (docs/specs/M11-WINDOW.md).
-const QUANTUM_NS: u64 = 20_000;
-/// Virtual time a host tick exit counts (fw_cfg `opt/nanox/host-tick-ns`:
-/// a number, or `off` for no host tick). Without it Linux can wait forever:
-/// when its TSC calibration fails (the TSC is host time, the references are
-/// virtual), `calibrate_delay` spins on `while (ticks == jiffies);` without
-/// a single exit, and virtual time, which only exits move, stands still. The
-/// tick (~1 ms of host time) counts as 1 ms, as for the M1 preemption case;
-/// it also ends a slice for a guest that spins, so its output and RIP still
-/// reach the log. Runs with it depend on host timing.
-const DEFAULT_TICK_NS: u64 = HOST_TICK_NS;
+/// Virtual time per exit. The guest's TSC is virtual time too (RDTSC exits), so
+/// every TSC read moves time; 2 us per exit lets Linux's PIT calibration see the
+/// 1000 polls in 10 ms it requires (docs/specs/M11-WINDOW.md).
+const QUANTUM_NS: u64 = 2_000;
 const SLICE_EXITS: u64 = 20_000;
 const MAX_EXITS: u64 = 100_000_000;
 const MAX_VIRTUAL_NS: u64 = 600_000_000_000;
@@ -570,8 +560,12 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     }
 }
 
-/// fw_cfg `opt/nanox/host-tick-ns`: None for `off`, else the virtual time a
-/// host tick counts.
+/// fw_cfg `opt/nanox/host-tick-ns`: the virtual time a host tick exit (~1 ms of
+/// host time) counts, or None (`off`, the default). With a tick the run depends
+/// on host timing, and Linux's TSC calibration against the PIT fails (a tick in
+/// the polling loop makes one step far longer than the others); without one a
+/// guest that spins without exits never ends its slice, but with the TSC
+/// intercepted a Linux guest always exits.
 fn host_tick() -> Option<u64> {
     let mut buf = [0u8; 24];
     match fwcfg::read_file("opt/nanox/host-tick-ns", &mut buf) {
@@ -580,7 +574,7 @@ fn host_tick() -> Option<u64> {
             assert!(c.is_ascii_digit(), "host-tick-ns: not a number");
             n * 10 + u64::from(c - b'0')
         })),
-        Err(_) => Some(DEFAULT_TICK_NS),
+        Err(_) => None,
     }
 }
 

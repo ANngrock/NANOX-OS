@@ -361,6 +361,8 @@ impl<'s> Guest<'s> for Vcpu<'s> {
                 None
             }
             Err(Own::Hlt) => self.hlt(vmcb),
+            // Not intercepted by this vCPU.
+            Err(Own::Rdtsc) => Some(Verdict::UnhandledExit(vmcb.exit_code())),
             Err(Own::Npf { gpa, error }) => {
                 let base = self.lapic.base();
                 let enabled = self.lapic.read_msr() & lapic::MSR_ENABLE != 0;
