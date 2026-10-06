@@ -667,6 +667,52 @@ PowerOff, вывод COM1, RSI = zero page с `HdrS` и RSDP этих табли
 обращении: скрипт их не трогает. Это проверка стыков, а не исполнение кода Linux: настоящий запуск
 требует `SvmCpu::vmrun` в ядре NANOX и железа AMD-V.
 
+### Первый запуск Linux под VMM NANOX (svm-probe, QEMU TCG; 2026-10-06)
+
+Критерий шагов выполнен на настоящей реализации SVM: **VMM NANOX загрузил ядро Linux с init
+измерения и получил `NANOX_GUEST_REPORT_END`**. Хост — не ядро NANOX (там ещё нет VMRUN), а
+UEFI-зонд `tools/svm-probe` с настоящим `SvmCpu::vmrun`, под QEMU 9.2.4 TCG с `+svm,+npt` и OVMF.
+Случай `linux` зонда берёт bzImage, initramfs и командную строку из fw_cfg (`opt/nanox/bzimage`,
+`opt/nanox/initrd`, `opt/nanox/cmdline`), 256 МиБ RAM гостя и вложенные таблицы — у прошивки
+(`AllocatePages`), строит таблицы ACPI платформы (`vmm_devices::acpi`), грузит ядро
+(`guest_boot::linux::load_linux`), ставит состояние входа (`Vmcb::setup_linux_boot`) и запускает
+`PlatformVcpu` на `Machine` (хост-устройства пока пустые). Вывод COM1 гостя идёт в журнал зонда
+строками `NANOX:SVM-PROBE:LINUX ...`; в конце — счётчики выходов, портов, MSR, листов CPUID и страниц
+MMIO, которые запрашивал гость.
+
+Команда (внутри `nix develop`): `python3 tools/svm-probe/run.py --linux-kernel <bzImage> --linux-only`
+(+ `--linux-init`, `--linux-cmdline`, `--linux-host-tick NS|off`, `--linux-timeout S`); initramfs
+собирается из `tools/hostguest/init` тем же кодом, что у измерения. Ядро — установщик Proxmox VE 9.2
+(`boot/linux26` из ISO, в репозиторий не входит): **Linux 7.0.2-6-pve**, командная строка
+`console=ttyS0 earlyprintk=serial,ttyS0,115200 panic=-1`. Результат
+`out/svm-probe-20261006T110421Z/` (первый успешный — `out/svm-probe-20261006T030734Z/`): `linux PASS
+verdict=PowerOff`, 14 с на прогон, 231 923 выхода, 9 343 прерывания, 29 765 доступов MMIO, 15 #GP на
+MSR (Linux их ожидает), 14,8 с виртуального времени; гость сам выключил машину через ACPI S5.
+
+Что увидел Linux: карту e820 загрузчика (таблицы ACPI на 0x100000 — «ACPI data»), таблицы ACPI
+`NANOX` (RSDP, XSDT, FACP, DSDT, FACS, APIC, HPET, MCFG), IOAPIC (GSI 0–23), HPET (id 0x8086a201),
+блоки PM1a, PM_TMR и GPE0, «ACPI: PM: (supports S0 S5)», маршрутизацию прерываний через IOAPIC, ECAM
+на 0xB0000000 (`PNP0C02`), окно PCI с 0xC0000000 и функции virtio-pci-modern 00:03.0, 00:04.0 и
+следующие. Отчёт init (`/proc/ioports`, `/proc/iomem` и остальное) полный, до
+`NANOX_GUEST_REPORT_END`.
+
+Найдено по дороге: время. TSC гостя — время хоста, а устройства идут по виртуальному времени
+(оно движется только на выходах). Без «тика хоста» Linux при неудачной калибровке TSC крутится в
+`calibrate_delay` (`while (ticks == jiffies);`) без единого выхода, и виртуальное время стоит:
+прогон `out/svm-probe-20261006T033019Z/` упёрся в таймаут с одним и тем же RIP. Поэтому прерывание
+хоста (~1 мс его времени) засчитывается как 1 мс виртуального (`opt/nanox/host-tick-ns`, `off` —
+отключить); с ним прогон зависит от скорости хоста. Следствия видны в журнале: «Fast TSC calibration
+failed», «Unable to calibrate against PIT», калибровка по HPET, «APIC calibration not consistent with
+PM-Timer: 86ms instead of 100ms», TSC помечен нестабильным (часы — HPET и jiffies). Обращения к
+незанятым портам (17 чтений, 49 записей: пробы Super I/O 0x2E/0x4E, COM 0x2E9/0x2F9/0x3E9, 0x87)
+отвечают «нет устройства», как задумано.
+
+**Не сделано:** запуск на железе (ноутбук с Ryzen) и под ядром NANOX как хостом (нужен
+`SvmCpu::vmrun` в ядре — зона Codex); согласованное время (смещение TSC по виртуальному времени
+или виртуальное время по TSC) — пока у гостя нестабильный TSC; хост-устройства (диск, сеть,
+дисплей, канал агента, ввод) в зонде пустые: virtio-устройства Linux находит, но данных через них
+не идёт; производительность (TCG с эмуляцией SVM) не измерялась как цель.
+
 ### Особенности Proxmox VE
 
 - Установщик и первая загрузка: UEFI или BIOS, не менее 2 ГиБ ОЗУ, диск, сетевая

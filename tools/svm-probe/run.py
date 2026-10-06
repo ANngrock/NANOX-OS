@@ -4,7 +4,8 @@
 Run inside `nix develop` (pinned QEMU, NANOX_OVMF_CODE/NANOX_OVMF_VARS):
 
     python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH] [--repro [--runs N]]
-        [--linux-kernel BZIMAGE [--linux-init ELF] [--linux-cmdline TEXT] [--linux-only]]
+        [--linux-kernel BZIMAGE [--linux-init ELF] [--linux-cmdline TEXT] [--linux-only]
+         [--linux-host-tick NS|off] [--linux-timeout S]]
 
 With --repro the svm profile runs N times (default 2) with identical inputs
 and the per-case digest (verdict, every counter and the serial bytes) of each
@@ -101,7 +102,10 @@ LINUX_CMDLINE = option("--linux-cmdline") or " ".join([
     "earlyprintk=serial,ttyS0,115200",  # output before the 8250 driver is up
     "panic=-1",  # a panic reboots at once: the VMM sees Reset, not a hang
 ])
-LINUX_TIMEOUT_S = 7200
+# Virtual time (ns) a host tick exit (~1 ms of host time) counts, or "off";
+# the probe's default when absent (fw_cfg opt/nanox/host-tick-ns).
+LINUX_HOST_TICK = option("--linux-host-tick")
+LINUX_TIMEOUT_S = int(option("--linux-timeout") or 7200)
 LINUX_PROFILE = ("linux", f"qemu64,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PASS")
 
 
@@ -153,6 +157,8 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
             # QEMU's option syntax: a comma in a value is doubled.
             "-fw_cfg", f"name=opt/nanox/cmdline,string={LINUX_CMDLINE.replace(',', ',,')}",
         ]
+        if LINUX_HOST_TICK:
+            argv += ["-fw_cfg", f"name=opt/nanox/host-tick-ns,string={LINUX_HOST_TICK}"]
     (d / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
     started = time.monotonic()
     try:
@@ -341,6 +347,7 @@ def main() -> int:
             "initrd_bytes": initrd.stat().st_size,
             "initrd_sha256": sha256(initrd),
             "cmdline": LINUX_CMDLINE,
+            "host_tick_ns": LINUX_HOST_TICK or "probe default",
         }
         profiles.append(LINUX_PROFILE)
     ok = True
