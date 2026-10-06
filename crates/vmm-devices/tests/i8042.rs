@@ -251,6 +251,31 @@ fn the_interrupt_follows_the_output_buffer_and_the_enable_bit() {
 }
 
 #[test]
+fn a_read_that_brings_the_next_byte_in_is_a_new_edge() {
+    let mut k = I8042::new();
+    data(&mut k, 0xF2); // identify: ACK and two ID bytes
+    assert!(!k.take_reloaded(), "nothing read yet");
+    assert_eq!(k.queued(), 3);
+    assert_eq!(rd(&mut k), 0xFA);
+    assert_eq!(k.queued(), 2);
+    assert!(k.irq1());
+    assert!(k.take_reloaded(), "the line dropped and rose with 0xAB");
+    assert!(!k.take_reloaded(), "taking it clears it");
+    assert_eq!(rd(&mut k), 0xAB);
+    assert!(k.take_reloaded());
+    assert_eq!(rd(&mut k), 0x83);
+    assert!(!k.take_reloaded(), "the last byte leaves the line low");
+    assert!(!k.irq1());
+    // one byte at a time is a plain rise and fall
+    k.push_scancode(0x1C);
+    rd(&mut k);
+    assert!(!k.take_reloaded());
+    // reading an empty buffer reloads nothing
+    rd(&mut k);
+    assert!(!k.take_reloaded());
+}
+
+#[test]
 fn the_output_buffer_has_sixteen_slots_and_overflow_is_counted() {
     let mut k = I8042::new();
     for _ in 0..QUEUE + 3 {

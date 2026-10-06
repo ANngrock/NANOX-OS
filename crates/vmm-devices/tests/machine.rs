@@ -227,6 +227,39 @@ fn the_keyboard_on_irq1() {
 }
 
 #[test]
+fn every_byte_of_a_keyboard_reply_interrupts() {
+    // Through the I/O APIC (edge-triggered pin 1)
+    let mut m = machine();
+    enable_lapic(&mut m);
+    route(&mut m, 1, 0x31, 0);
+    out(&mut m, 0x60, 0xF2, 0); // identify
+    for (i, want) in [0xFA, 0xAB, 0x83].into_iter().enumerate() {
+        assert_eq!(m.acknowledge(0), Some(0x31), "byte {i}");
+        eoi(&mut m, 0);
+        assert_eq!(inb(&mut m, 0x60, 0), want);
+    }
+    assert_eq!(m.pending(0), None, "three bytes, three interrupts");
+    // and through the 8259 (IRQ1 edge-triggered, the local APIC off)
+    let mut m = machine();
+    for (p, v) in [
+        (0x20, 0x11),
+        (0x21, 0x20),
+        (0x21, 0x04),
+        (0x21, 0x01),
+        (0x21, 0xFD),
+    ] {
+        out(&mut m, p, v, 0);
+    }
+    out(&mut m, 0x60, 0xF2, 0);
+    for want in [0xFA, 0xAB, 0x83] {
+        assert_eq!(m.acknowledge(0), Some(0x21));
+        out(&mut m, 0x20, 0x20, 0);
+        assert_eq!(inb(&mut m, 0x60, 0), want);
+    }
+    assert_eq!(m.pending(0), None);
+}
+
+#[test]
 fn the_rtc_periodic_interrupt_on_irq8_until_register_c_is_read() {
     let mut m = machine();
     enable_lapic(&mut m);

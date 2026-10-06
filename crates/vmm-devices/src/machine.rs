@@ -568,6 +568,11 @@ impl Machine {
         self.hpet.sync(now);
         self.lapic.update(now);
 
+        // The keyboard's buffer was read and refilled: its line went low before rising again.
+        if self.kbd.take_reloaded() {
+            self.pic.set_irq(irq::KEYBOARD, false);
+            self.ioapic.set_irq(ioapic_pin(irq::KEYBOARD), false);
+        }
         // Level lines: what the devices drive now. The 8259 takes the wired-or of an ISA device
         // and the PCI functions routed to the same line.
         let sci = self.pm.sci(now);

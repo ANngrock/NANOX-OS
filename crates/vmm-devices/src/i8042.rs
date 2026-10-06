@@ -9,7 +9,10 @@
 //! are counted and get no answer, so a driver's probe times out as on a
 //! machine without one. The controller is instantaneous: the input buffer is
 //! never full. Interrupt: [`I8042::irq1`] is high while the output buffer
-//! holds a byte and the command byte enables it. The output port carries the
+//! holds a byte and the command byte enables it; a PC's controller drops the
+//! line when its buffer is read and raises it again with the next byte, so a
+//! read that brings the next queued byte in is an edge of its own
+//! ([`I8042::take_reloaded`]). The output port carries the
 //! A20 gate (bit 1, [`I8042::a20_enabled`]) and the reset line (a command
 //! 0xFE or a write with bit 0 clear raises [`I8042::take_reset`]).
 
@@ -67,6 +70,8 @@ pub struct I8042 {
     /// Set-2 break prefix seen: the next byte is a release.
     break_pending: bool,
     reset_requested: bool,
+    /// The output buffer was read and the next queued byte took its place.
+    reloaded: bool,
     pub dropped: u64,
     pub unsupported: u32,
 }
@@ -93,6 +98,7 @@ impl I8042 {
             last_sent: 0,
             break_pending: false,
             reset_requested: false,
+            reloaded: false,
             dropped: 0,
             unsupported: 0,
         }
@@ -119,6 +125,20 @@ impl I8042 {
     /// The keyboard IRQ line.
     pub fn irq1(&self) -> bool {
         self.len > 0 && self.command & CMD_INT != 0
+    }
+
+    /// Whether the output buffer was read and refilled from the queue since the
+    /// last call: the IRQ line went low and high again, an edge that an
+    /// edge-triggered interrupt controller must see (Linux's atkbd waits for
+    /// each byte of a reply, such as the two ID bytes after the ACK, by its
+    /// interrupt). Reading clears it.
+    pub fn take_reloaded(&mut self) -> bool {
+        core::mem::take(&mut self.reloaded)
+    }
+
+    /// Bytes waiting in the output buffer (the host feeds keys when it is empty).
+    pub fn queued(&self) -> usize {
+        self.len
     }
 
     pub fn leds(&self) -> u8 {
@@ -191,6 +211,7 @@ impl I8042 {
                 self.queue.copy_within(1..self.len, 0);
                 self.len -= 1;
                 self.last_sent = b;
+                self.reloaded = self.len > 0;
                 b
             }),
             _ => None,
