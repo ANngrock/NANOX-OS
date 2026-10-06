@@ -48,9 +48,12 @@ clippy, build-none, тесты, xtask-test) и запись в PR. Критер�
   - [x] PIT каналы 0–2 и IRQ0 (частичных строк в `map` больше нет).
   - [x] Шаг 1, часть: ACPI-таблицы платформы (RSDP…DSDT).
   - [x] Свести три ветки в `claude/m10-vmm-legacy`, мутации, STATUS, пуш, PR #13.
-  - [ ] Дальше: прошивка гостя (UEFI) с этими таблицами; подключение `Machine` к VMM
-        (выходы SVM на порты и MMIO, NPT для BAR); загрузка ядра Linux до
-        `NANOX_GUEST_REPORT_END`; вложенный SVM.
+  - [x] Цикл vCPU на `Machine` (`hw-svm::platform_vm`), прямая загрузка Linux
+        (`guest-boot::linux`), `setup_linux_boot`.
+  - [x] Linux 7.0.2-6-pve под VMM NANOX до `NANOX_GUEST_REPORT_END` (svm-probe, QEMU TCG).
+  - [ ] Согласованное время гостя (TSC по виртуальному времени); хост-устройства
+        (диск, сеть, дисплей, канал агента) в зонде; запуск на железе и под ядром
+        NANOX (VMRUN в ядре — Codex); вложенный SVM.
 
 ## Нельзя закрыть здесь (причина)
 
