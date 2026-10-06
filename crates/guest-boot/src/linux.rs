@@ -95,10 +95,35 @@ pub struct LinuxConfig<'a> {
     /// (Linux only uses an ECAM window it finds reserved): at most [`MAX_RESERVED`], ascending,
     /// not overlapping, each between [`LOW_RAM_LIMIT`] and 4 GiB (never RAM).
     pub reserved: &'a [(u64, u64)],
+    /// A linear framebuffer for the guest's console (as UEFI GOP leaves one): reported in the
+    /// zero page's `screen_info`, so Linux's EFI framebuffer drivers (efifb, simpledrm) draw on
+    /// it. It must lie inside one of the `reserved` ranges, so Linux does not take it for RAM.
+    pub framebuffer: Option<Framebuffer>,
 }
 
 /// Reserved ranges a [`LinuxConfig`] may carry.
 pub const MAX_RESERVED: usize = 4;
+
+/// A linear framebuffer of 32-bit pixels, XRGB 8:8:8:8 (blue in the lowest byte).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Framebuffer {
+    /// Guest-physical address of the first pixel, page aligned, below 4 GiB.
+    pub gpa: u64,
+    pub width: u16,
+    pub height: u16,
+    /// Bytes from one line to the next (at least 4 × `width`).
+    pub stride: u16,
+}
+
+impl Framebuffer {
+    /// Bytes from the first pixel to the end of the last line.
+    pub const fn bytes(&self) -> u64 {
+        self.stride as u64 * self.height as u64
+    }
+}
+
+/// `screen_info.orig_video_isVGA` for a framebuffer the firmware set up.
+pub const VIDEO_TYPE_EFI: u8 = 0x70;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Acpi {
@@ -170,6 +195,9 @@ pub enum LinuxError {
     /// A reserved range is empty, overlaps RAM or another one, is out of order, or there are
     /// more than [`MAX_RESERVED`].
     BadReserved,
+    /// The framebuffer is empty, its lines are shorter than its width, it is not page aligned,
+    /// or it is not inside a reserved range.
+    BadFramebuffer,
 }
 
 fn u16_at(b: &[u8], o: usize) -> u16 {
@@ -336,6 +364,19 @@ fn plan(image: &[u8], initrd_len: u64, cfg: &LinuxConfig<'_>) -> Result<Plan, Li
         push(start, len, E820_RESERVED);
         floor = start + len;
     }
+    if let Some(fb) = cfg.framebuffer {
+        let covered = cfg.reserved.iter().any(|&(start, len)| {
+            fb.gpa >= start && fb.gpa.saturating_add(fb.bytes()) <= start + len
+        });
+        if fb.width == 0
+            || fb.height == 0
+            || u32::from(fb.stride) < 4 * u32::from(fb.width)
+            || fb.gpa % 0x1000 != 0
+            || !covered
+        {
+            return Err(LinuxError::BadFramebuffer);
+        }
+    }
     push(
         HIGH_RAM_BASE,
         cfg.ram_bytes.saturating_sub(LOW_RAM_LIMIT),
@@ -348,6 +389,21 @@ fn plan(image: &[u8], initrd_len: u64, cfg: &LinuxConfig<'_>) -> Result<Plan, Li
         e820,
         e820_len: n,
     })
+}
+
+/// `struct screen_info` at the start of the zero page for an EFI-style framebuffer: XRGB
+/// 8:8:8:8, the size in bytes (for this video type). A reserved range ends below 4 GiB, so the
+/// base and the size fit 32 bits.
+fn screen_info(zp: &mut [u8; 4096], fb: &Framebuffer) {
+    zp[0x0F] = VIDEO_TYPE_EFI;
+    zp[0x12..0x14].copy_from_slice(&fb.width.to_le_bytes());
+    zp[0x14..0x16].copy_from_slice(&fb.height.to_le_bytes());
+    zp[0x16..0x18].copy_from_slice(&32u16.to_le_bytes());
+    zp[0x18..0x1C].copy_from_slice(&(fb.gpa as u32).to_le_bytes());
+    zp[0x1C..0x20].copy_from_slice(&(fb.bytes() as u32).to_le_bytes());
+    zp[0x24..0x26].copy_from_slice(&fb.stride.to_le_bytes());
+    // red, green, blue, reserved: size and position of each
+    zp[0x26..0x2E].copy_from_slice(&[8, 16, 8, 8, 8, 0, 8, 24]);
 }
 
 /// A GDT descriptor: base 0, limit 0xFFFFF, granularity 4 KiB, present, DPL 0, with the given
@@ -387,6 +443,9 @@ pub fn load_linux<M: GuestMemory + ?Sized>(
         .copy_from_slice(&(initrd.len() as u32).to_le_bytes());
     if let Some(a) = cfg.acpi {
         zp[off::ACPI_RSDP_ADDR..off::ACPI_RSDP_ADDR + 8].copy_from_slice(&a.rsdp_gpa.to_le_bytes());
+    }
+    if let Some(fb) = cfg.framebuffer {
+        screen_info(&mut zp, &fb);
     }
     zp[off::E820_ENTRIES] = p.e820_len as u8;
     for (i, &(start, len, kind)) in p.e820[..p.e820_len].iter().enumerate() {

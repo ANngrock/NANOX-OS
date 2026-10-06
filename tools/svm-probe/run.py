@@ -24,7 +24,9 @@ linux_surface.py's cpio_newc) and the command line to the probe, whose
 guest prints NANOX_GUEST_REPORT_END (docs/specs/M11-WINDOW.md §5). The
 profile has 1 GiB (the case allocates 256 MiB of guest RAM from the
 firmware) and a long timeout: nested paging under TCG is slow. --linux-only
-runs only that profile.
+runs only that profile. The guest also has a screen (a linear framebuffer the
+kernel's console draws on); the probe dumps it at the end and it is saved as
+linux/screen.png.
 
 Profiles:
   svm     qemu64 with SVM, nested paging, NRIP save: every case must pass
@@ -54,9 +56,11 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -98,7 +102,9 @@ LINUX_INIT_DEFAULT = ROOT / "target/x86_64-unknown-none/release/linux-probe-init
 # The kernel command line of the linux profile, each item with its reason
 # (docs/specs/M11-WINDOW.md, "Первый запуск Linux под VMM NANOX"):
 LINUX_CMDLINE = option("--linux-cmdline") or " ".join([
-    "console=ttyS0",  # the kernel's console on COM1, which the probe prints
+    "console=tty0",  # the kernel's messages on the screen too
+    "console=ttyS0",  # the kernel's console on COM1, which the probe prints (the last
+                      # console= is /dev/console: init's output goes to COM1)
     "earlyprintk=serial,ttyS0,115200",  # output before the 8250 driver is up
     "panic=-1",  # a panic reboots at once: the VMM sees Reset, not a hang
 ])
@@ -198,13 +204,69 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
         # The guest's own lines stay in serial.log.
         "serial_lines": [l for l in lines if l.startswith("NANOX:SVM-PROBE")
                          and not l.startswith(("NANOX:SVM-PROBE:LINUX ",
-                                               "NANOX:SVM-PROBE:LINUX-PROGRESS"))],
+                                               "NANOX:SVM-PROBE:LINUX-PROGRESS",
+                                               "NANOX:SVM-PROBE:LINUX-FB "))],
     }
     if linux:
         guest = [l[len("NANOX:SVM-PROBE:LINUX "):] for l in lines
                  if l.startswith("NANOX:SVM-PROBE:LINUX ")]
         r["linux"] = linux_summary(guest, lines)
+        r["linux"]["screen"] = linux_screen(lines, d / "screen.png")
     return r
+
+
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
+
+
+def linux_screen(lines, png: Path):
+    """The guest's screen from the probe's dump (svm-probe linux.rs `dump_screen`) as a
+    PNG; its pixels are checked against the probe's hash."""
+    head = [l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-SCREEN ")]
+    if not head:
+        return None
+    m = re.fullmatch(r"NANOX:SVM-PROBE:LINUX-SCREEN width=(\d+) height=(\d+)", head[0])
+    w, h = int(m[1]), int(m[2])
+    rows = []
+    for l in lines:
+        if not l.startswith("NANOX:SVM-PROBE:LINUX-FB "):
+            continue
+        runs = l.split()[1:]
+        if runs == ["="]:
+            rows.append(rows[-1])
+            continue
+        row = b"".join(bytes.fromhex(px) * int(n, 16) for n, px in (r.split(":") for r in runs))
+        rows.append(row)
+    end = [l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-SCREEN-END ")]
+    pixels = b"".join(rows)
+    fnv = FNV_OFFSET
+    for b in pixels:
+        fnv = ((fnv ^ b) * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    complete = len(rows) == h and all(len(r) == 3 * w for r in rows) and bool(end)
+    ok = complete and end[0] == f"NANOX:SVM-PROBE:LINUX-SCREEN-END fnv={fnv:016x}"
+    if ok:
+        png.write_bytes(png_rgb(w, h, rows))
+    return {
+        "width": w,
+        "height": h,
+        "rows": len(rows),
+        "fnv": f"{fnv:016x}",
+        "match": ok,
+        "lit_pixels": sum(1 for i in range(0, len(pixels), 3) if pixels[i:i + 3] != bytes(3)),
+        "png": str(png) if ok else None,
+    }
+
+
+def png_rgb(w, h, rows):
+    """An 8-bit RGB PNG of `rows` (3 * w bytes each)."""
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data)))
+    raw = b"".join(b"\0" + r for r in rows)
+    return (bytes([0x89]) + b"PNG" + bytes([0x0D, 0x0A, 0x1A, 0x0A])
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
 
 
 def linux_summary(guest, lines):
@@ -388,6 +450,7 @@ def main() -> int:
         print(f"{name:7} status={r['status']} match={r['match']} ({r['seconds']} s)")
         if "linux" in r:
             print(f"        {r['linux']['case']}")
+            print(f"        screen: {r['linux']['screen']}")
     if initrd:
         # The archive is rebuilt from the init on every run; its hash is recorded.
         initrd.unlink()

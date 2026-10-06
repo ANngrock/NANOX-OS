@@ -136,6 +136,7 @@ fn cfg(ram: u64) -> LinuxConfig<'static> {
         cmdline: b"console=ttyS0 quiet",
         acpi: None,
         reserved: &[],
+        framebuffer: None,
     }
 }
 
@@ -1074,6 +1075,126 @@ fn bad_reserved_ranges_are_refused() {
             Err(LinuxError::BadReserved),
             "{name}"
         );
+        assert_eq!(m.writes, 0, "{name}: nothing written");
+    }
+}
+
+// ------------------------------------------------------------ framebuffer
+
+const FB_GPA: u64 = 0xFC00_0000;
+
+/// 1000 x 700, lines of 4100 bytes: every field a different number.
+fn fb() -> Framebuffer {
+    Framebuffer {
+        gpa: FB_GPA,
+        width: 1000,
+        height: 700,
+        stride: 4100,
+    }
+}
+
+fn load_fb(reserved: &[(u64, u64)], fb: Framebuffer) -> (Result<LinuxEntry, LinuxError>, Sparse) {
+    let mut m = Sparse::new();
+    let c = LinuxConfig {
+        reserved,
+        framebuffer: Some(fb),
+        ..cfg(256 * MIB)
+    };
+    let r = load_linux(&mut m, &Img::new().bytes(), &[], &c);
+    (r, m)
+}
+
+#[test]
+fn a_framebuffer_is_reported_in_screen_info() {
+    let range = [(FB_GPA, 0x40_0000)];
+    let (r, m) = load_fb(&range, fb());
+    r.unwrap();
+    let mut want = vec![0u8; 0x40];
+    want[0x0F] = VIDEO_TYPE_EFI;
+    want[0x12..0x14].copy_from_slice(&1000u16.to_le_bytes());
+    want[0x14..0x16].copy_from_slice(&700u16.to_le_bytes());
+    want[0x16..0x18].copy_from_slice(&32u16.to_le_bytes());
+    want[0x18..0x1C].copy_from_slice(&0xFC00_0000u32.to_le_bytes());
+    want[0x1C..0x20].copy_from_slice(&(4100u32 * 700).to_le_bytes());
+    want[0x24..0x26].copy_from_slice(&4100u16.to_le_bytes());
+    want[0x26..0x2E].copy_from_slice(&[8, 16, 8, 8, 8, 0, 8, 24]);
+    assert_eq!(m.bytes(BOOT_PARAMS_GPA, 0x40), want);
+    assert_eq!(VIDEO_TYPE_EFI, 0x70);
+    assert_eq!(fb().bytes(), 4100 * 700);
+    // the rest of the zero page is what it is without a framebuffer
+    let mut plain = Sparse::new();
+    let c = LinuxConfig {
+        reserved: &range,
+        ..cfg(256 * MIB)
+    };
+    load_linux(&mut plain, &Img::new().bytes(), &[], &c).unwrap();
+    assert_eq!(
+        m.bytes(BOOT_PARAMS_GPA + 0x40, 4096 - 0x40),
+        plain.bytes(BOOT_PARAMS_GPA + 0x40, 4096 - 0x40)
+    );
+    assert_eq!(plain.bytes(BOOT_PARAMS_GPA, 0x40), vec![0u8; 0x40]);
+}
+
+#[test]
+fn the_framebuffer_may_fill_its_reserved_range_or_lie_in_any_of_them() {
+    let f = fb();
+    let tight = Framebuffer { stride: 4000, ..f };
+    for (name, reserved, f) in [
+        ("exactly its range", vec![(FB_GPA, f.bytes())], f),
+        ("lines exactly 4 x width", vec![(FB_GPA, f.bytes())], tight),
+        (
+            "in the second range",
+            vec![(0xB000_0000, 0x1000_0000), (FB_GPA, f.bytes())],
+            f,
+        ),
+        (
+            "one pixel",
+            vec![(FB_GPA, 0x1000)],
+            Framebuffer {
+                width: 1,
+                height: 1,
+                stride: 4,
+                ..f
+            },
+        ),
+    ] {
+        let (r, _) = load_fb(&reserved, f);
+        assert!(r.is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn a_bad_framebuffer_is_refused() {
+    let f = fb();
+    let range = vec![(FB_GPA, 0x40_0000)];
+    let top = u64::MAX & !0xFFF;
+    for (name, reserved, f) in [
+        ("no width", range.clone(), Framebuffer { width: 0, ..f }),
+        ("no height", range.clone(), Framebuffer { height: 0, ..f }),
+        (
+            "lines too short",
+            range.clone(),
+            Framebuffer { stride: 3999, ..f },
+        ),
+        (
+            "not page aligned",
+            range.clone(),
+            Framebuffer {
+                gpa: FB_GPA + 0x800,
+                ..f
+            },
+        ),
+        ("no reserved range", vec![], f),
+        ("one byte past its range", vec![(FB_GPA, f.bytes() - 1)], f),
+        (
+            "starts below its range",
+            vec![(FB_GPA + 0x1000, 0x40_0000)],
+            f,
+        ),
+        ("overflows", range.clone(), Framebuffer { gpa: top, ..f }),
+    ] {
+        let (r, m) = load_fb(&reserved, f);
+        assert_eq!(r, Err(LinuxError::BadFramebuffer), "{name}");
         assert_eq!(m.writes, 0, "{name}: nothing written");
     }
 }

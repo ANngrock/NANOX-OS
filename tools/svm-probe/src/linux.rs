@@ -22,12 +22,15 @@
 //!
 //! At the end the case prints what the guest asked of the VMM, counted at
 //! every exit: exit codes, I/O ports, MSRs, CPUID leaves and device-memory
-//! pages (`NANOX:SVM-PROBE:LINUX-EXITS`, `-PORTS`, `-MSRS`, `-CPUID`, `-MMIO`).
+//! pages (`NANOX:SVM-PROBE:LINUX-EXITS`, `-PORTS`, `-MSRS`, `-CPUID`, `-MMIO`),
+//! and the guest's screen: a linear framebuffer ([`FB`]) as UEFI GOP would
+//! leave one, which Linux's EFI framebuffer drivers draw the console on
+//! (`NANOX:SVM-PROBE:LINUX-SCREEN`, see [`dump_screen`]).
 
 use crate::hw::Serial;
 use crate::{fwcfg, has, hw, Cpu, Env, Frames, GuestMap, GuestRam, Phys, HOST_TICK_COUNT};
 use core::fmt::Write;
-use guest_boot::linux::{self, Acpi, LinuxConfig};
+use guest_boot::linux::{self, Acpi, Framebuffer, LinuxConfig};
 use guest_boot::GuestMemory as _;
 use hw_svm::exit::code;
 use hw_svm::perm::{MsrPermissionMap, MSRPM_BYTES};
@@ -67,6 +70,19 @@ const MAX_VIRTUAL_NS: u64 = 600_000_000_000;
 const RTC_EPOCH: i64 = 1_790_000_000;
 /// The emulated local APIC timer's input clock.
 const LAPIC_BUS_HZ: u64 = 1_000_000_000;
+/// The guest's screen, 1024 x 768 XRGB: probe memory mapped at a guest-physical
+/// address in the PCI window far above the BARs (Linux assigns them from its
+/// bottom), reserved in the e820 map and reported in the zero page.
+const FB: Framebuffer = Framebuffer {
+    gpa: 0xFC00_0000,
+    width: 1024,
+    height: 768,
+    stride: 4096,
+};
+const FB_BYTES: u64 = FB.bytes();
+/// FNV-1a, 64 bits: the screen dump's check.
+const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+const FNV_PRIME: u64 = 0x100_0000_01B3;
 /// COM1 output kept for the verdict (the boot log is ~100 KiB).
 const SERIAL_BYTES: usize = 1 << 20;
 static mut SERIAL: [u8; SERIAL_BYTES] = [0; SERIAL_BYTES];
@@ -458,6 +474,11 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         return fail(env, "allocate-pages");
     };
     let base = region_buf.as_mut_ptr() as u64;
+    let Some(fb_buf) = allocate(system, FB_BYTES as usize) else {
+        return fail(env, "allocate-framebuffer");
+    };
+    fb_buf.fill(0);
+    let fb_host = fb_buf.as_mut_ptr() as u64;
     let (Ok(image), Ok(initrd)) = (
         fwcfg::read_into(image_file, image_buf),
         fwcfg::read_into(initrd_file, initrd_buf),
@@ -477,6 +498,15 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     let mut npt = Npt::new(&mut phys, &mut frames, 48).expect("nested root");
     npt.map(&mut phys, &mut frames, 0, base, RAM, NptPerms::RWX)
         .expect("map guest RAM");
+    npt.map(
+        &mut phys,
+        &mut frames,
+        FB.gpa,
+        fb_host,
+        FB_BYTES,
+        NptPerms::RW,
+    )
+    .expect("map the framebuffer");
 
     // ACPI tables, then the kernel with them.
     let mut tables = [0u8; ACPI_MAX];
@@ -495,8 +525,10 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
             region_gpa: ACPI_GPA,
             region_len: (layout.len as u64).next_multiple_of(PAGE_SIZE),
         }),
-        // Linux uses an ECAM window only when it finds it reserved.
-        reserved: &[(ECAM_BASE, ECAM_SIZE)],
+        // Linux uses an ECAM window only when it finds it reserved; the
+        // framebuffer is not RAM.
+        reserved: &[(ECAM_BASE, ECAM_SIZE), (FB.gpa, FB_BYTES)],
+        framebuffer: Some(FB),
     };
     let entry = match linux::load_linux(&mut ram, image, initrd, &cfg) {
         Ok(e) => e,
@@ -614,6 +646,10 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     env.report("CASE", "linux", ok);
     report(&o, vcpu.machine(), slices, &net, &screen, &agent);
     surface.print();
+    // SAFETY: the probe's framebuffer pages (allocated above, owned by the
+    // probe, identity-mapped); the guest no longer runs, and no other
+    // reference to them exists.
+    dump_screen(unsafe { core::slice::from_raw_parts(fb_host as *const u8, FB_BYTES as usize) });
     if !ok {
         state(env, page, s);
     }
@@ -682,6 +718,44 @@ fn report(o: &Outcome, m: &Machine, slices: u64, net: &NoNet, screen: &NoScreen,
         screen.resources,
         agent.bytes
     );
+}
+
+/// The guest's screen: `NANOX:SVM-PROBE:LINUX-SCREEN width= height=`, then
+/// one `NANOX:SVM-PROBE:LINUX-FB` line per pixel row, its runs of equal
+/// pixels as ` <count>:<rrggbb>` (hex) or ` =` for a row equal to the one
+/// before, then `NANOX:SVM-PROBE:LINUX-SCREEN-END fnv=` with the FNV-1a hash
+/// of every pixel's red, green and blue byte. run.py makes a PNG of it.
+fn dump_screen(fb: &[u8]) {
+    let (w, h) = (usize::from(FB.width), usize::from(FB.height));
+    let stride = usize::from(FB.stride);
+    let rgb =
+        |row: &[u8], x: usize| u32::from_le_bytes([row[4 * x], row[4 * x + 1], row[4 * x + 2], 0]);
+    out!("NANOX:SVM-PROBE:LINUX-SCREEN width={w} height={h}\n");
+    let mut hash = FNV_OFFSET;
+    let mut prev: Option<&[u8]> = None;
+    for y in 0..h {
+        let row = &fb[y * stride..y * stride + 4 * w];
+        for x in 0..w {
+            for b in [2, 1, 0] {
+                hash = (hash ^ u64::from(row[4 * x + b])).wrapping_mul(FNV_PRIME);
+            }
+        }
+        out!("NANOX:SVM-PROBE:LINUX-FB");
+        if prev.is_some_and(|p| (0..w).all(|x| rgb(p, x) == rgb(row, x))) {
+            out!(" =\n");
+            continue;
+        }
+        let mut x = 0;
+        while x < w {
+            let px = rgb(row, x);
+            let n = (x..w).take_while(|&i| rgb(row, i) == px).count();
+            out!(" {n:x}:{px:06x}");
+            x += n;
+        }
+        out!("\n");
+        prev = Some(row);
+    }
+    out!("NANOX:SVM-PROBE:LINUX-SCREEN-END fnv={hash:016x}\n");
 }
 
 /// The vCPU state at the end and the last guest output.

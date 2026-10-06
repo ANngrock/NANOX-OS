@@ -176,6 +176,7 @@ fn a_loaded_kernel_starts_at_its_entry_prints_and_powers_off() {
         }),
         // Linux uses an ECAM window only when it finds it reserved.
         reserved: &[(ECAM_BASE, ECAM_SIZE)],
+        framebuffer: None,
     };
     let entry = linux::load_linux(&mut RigRam { rig: &mut rig }, &image, &initrd, &cfg).unwrap();
     assert_eq!(entry.rip, 0x10_0200);
