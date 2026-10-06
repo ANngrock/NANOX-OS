@@ -414,22 +414,17 @@ pub(crate) fn common_exit<C: SvmCpu + ?Sized>(
             Err(Error::InvalidState(e)) => Verdict::Invalid(e),
             _ => Verdict::UnhandledExit(code::INVALID),
         }),
-        Exit::Exception { vector, .. } => Some(Verdict::UnhandledExit(
-            code::EXCEPTION_BASE + u64::from(vector),
-        )),
-        Exit::Other(c) => Some(Verdict::UnhandledExit(c)),
+        Exit::Exception { .. } | Exit::Other(_) => Some(Verdict::UnhandledExit(vmcb.exit_code())),
     })
 }
 
 /// The host's CPUID filtered for a guest: hypervisor present with the
 /// "NanoxVMM" leaf; no VMX, x2APIC, MONITOR/MWAIT or TSC-deadline (the
 /// emulated APIC is xAPIC with the classic timer only); no nested SVM;
-/// leaves above the host's maxima read as zero.
+/// leaves above the host's maxima read as zero (the other hypervisor leaves,
+/// 4000_0001h on, among them: no basic maximum comes near them).
 pub(crate) fn cpuid<C: SvmCpu + ?Sized>(cpu: &mut C, leaf: u32, sub: u32) -> [u32; 4] {
-    if (0x4000_0000..=0x4000_00FF).contains(&leaf) {
-        if leaf != 0x4000_0000 {
-            return [0; 4];
-        }
+    if leaf == 0x4000_0000 {
         let v = crate::vmm::VENDOR;
         let w = |i: usize| u32::from_le_bytes([v[i], v[i + 1], v[i + 2], v[i + 3]]);
         return [0x4000_0000, w(0), w(4), w(8)];

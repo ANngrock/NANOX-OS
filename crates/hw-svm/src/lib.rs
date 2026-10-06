@@ -18,7 +18,18 @@
 //!   `isa-debug-exit` port used by the M0 harness, the local APIC and PIT
 //!   channel 2 from `vmm-devices` on a virtual clock, budgets and a
 //!   verdict.
+//! * [`platform_vm`] — a vCPU loop over the whole emulated platform,
+//!   `vmm_devices::machine::Machine` (docs/specs/M11-WINDOW.md §5, the way to
+//!   a Linux guest): every port and every access to device memory go to the
+//!   machine, interrupts come from its 8259/I/O APIC/local APIC, one virtual
+//!   clock for all its timers, virtio served on notification and host input
+//!   at poll points (HLT, host interrupt) through [`platform_vm::Host`], reset
+//!   and ACPI S5 as verdicts, the CPUID/MSR additions Linux needs to boot.
 //! * [`guest`] — guest page walk and instruction fetch for MMIO emulation.
+//!
+//! The two loops share (private module `shared`) the entry/exit cycle with
+//! its budgets, the exits they handle alike, interrupt injection with the
+//! virtual-interrupt window, and MMIO emulation from the faulting instruction.
 //!
 //! The kernel implements [`SvmCpu::vmrun`] (VMLOAD/VMRUN/VMSAVE and the
 //! GPR save/restore in assembly); tests implement it with a scripted CPU.
