@@ -3,7 +3,8 @@
 //! on the agent channel (virtio-console, `/dev/hvc0`) when there is one,
 //! reports a line typed on the keyboard (the first virtual terminal), brings up
 //! `eth0` and pings the host (10.0.2.2) when there is a network card, and
-//! powers off.
+//! powers off — after an interactive busybox shell on the first virtual
+//! terminal if the command line has `nanox.shell` (run.py --show).
 //! Raw Linux system calls, no libc: the same kind of freestanding static
 //! program a NANOX native process is.
 
@@ -27,6 +28,10 @@ const SYS_MKDIR: usize = 83;
 const SYS_MOUNT: usize = 165;
 const SYS_REBOOT: usize = 169;
 const SYS_EXIT_GROUP: usize = 231;
+const SYS_FORK: usize = 57;
+const SYS_EXECVE: usize = 59;
+const SYS_WAIT4: usize = 61;
+const SYS_SETSID: usize = 112;
 const O_RDWR: usize = 2;
 const O_NOCTTY: usize = 0o400;
 const TCGETS: usize = 0x5401;
@@ -453,6 +458,136 @@ fn keyboard(tty: isize) {
     unsafe { syscall(SYS_CLOSE, fd, 0, 0, 0, 0) };
 }
 
+/// Whether the kernel command line asks for the interactive shell.
+fn shell_wanted() -> bool {
+    let mut b = [0u8; 128];
+    let p = path("/proc/cmdline", &mut b);
+    let mut line = [0u8; 1024];
+    // SAFETY: a NUL-terminated path, a valid buffer, our descriptor.
+    let n = unsafe {
+        let fd = syscall(SYS_OPEN, p, 0, 0, 0, 0);
+        if fd < 0 {
+            return false;
+        }
+        let n = syscall(
+            SYS_READ,
+            fd as usize,
+            line.as_mut_ptr() as usize,
+            line.len(),
+            0,
+            0,
+        );
+        syscall(SYS_CLOSE, fd as usize, 0, 0, 0, 0);
+        n
+    };
+    let line = &line[..n.max(0) as usize];
+    line.windows(11).any(|w| w == b"nanox.shell")
+}
+
+/// Runs the program `argv[0]` (at most seven NUL-terminated strings) in a
+/// child and waits for it. With `tty`, the child starts a session whose controlling terminal
+/// that is, on its standard input, output and error.
+fn spawn(argv: &[&[u8]], tty: Option<&[u8]>) {
+    const ENV: [&[u8]; 4] = [
+        b"HOME=/\0",
+        b"PATH=/bin\0",
+        b"TERM=linux\0",
+        b"PS1=nanox-guest:$PWD# \0",
+    ];
+    let mut args = [0usize; 8];
+    for (slot, a) in args.iter_mut().zip(argv) {
+        *slot = a.as_ptr() as usize;
+    }
+    let mut env = [0usize; ENV.len() + 1];
+    for (slot, e) in env.iter_mut().zip(ENV) {
+        *slot = e.as_ptr() as usize;
+    }
+    // SAFETY: fork, then in the child setsid, open, dup2 and execve with
+    // NUL-terminated strings and NULL-terminated pointer arrays that live on
+    // this stack (copied into the child by fork); the parent waits for its child.
+    unsafe {
+        let pid = syscall(SYS_FORK, 0, 0, 0, 0, 0);
+        if pid == 0 {
+            if let Some(t) = tty {
+                syscall(SYS_SETSID, 0, 0, 0, 0, 0);
+                // A session leader's first terminal becomes its controlling one.
+                let fd = syscall(SYS_OPEN, t.as_ptr() as usize, O_RDWR, 0, 0, 0);
+                if fd >= 0 {
+                    for to in 0..3 {
+                        syscall(SYS_DUP2, fd as usize, to, 0, 0, 0);
+                    }
+                }
+            }
+            syscall(
+                SYS_EXECVE,
+                args[0],
+                args.as_ptr() as usize,
+                env.as_ptr() as usize,
+                0,
+                0,
+            );
+            syscall(SYS_EXIT_GROUP, 127, 0, 0, 0, 0);
+        }
+        if pid > 0 {
+            let mut status = 0u32;
+            loop {
+                let r = syscall(
+                    SYS_WAIT4,
+                    pid as usize,
+                    &mut status as *mut u32 as usize,
+                    0,
+                    0,
+                    0,
+                );
+                if r == pid || r < 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The interactive shell: busybox's commands linked into /bin, the kernel's
+/// console quieted (its messages would land in the middle of what is typed;
+/// `dmesg` still has them), a greeting on the first virtual terminal, then
+/// `sh` there until it exits.
+fn shell() {
+    const BUSYBOX: &[u8] = b"/bin/busybox\0";
+    const TTY: &[u8] = b"/dev/tty1\0";
+    // SAFETY: a NUL-terminated path; the descriptor is closed at once.
+    let fd = unsafe { syscall(SYS_OPEN, BUSYBOX.as_ptr() as usize, 0, 0, 0, 0) };
+    if fd < 0 {
+        write(1, b"(no shell: /bin/busybox is missing)\n");
+        return;
+    }
+    // SAFETY: closing the descriptor we opened.
+    unsafe { syscall(SYS_CLOSE, fd as usize, 0, 0, 0, 0) };
+    spawn(&[BUSYBOX, b"--install\0", b"-s\0", b"/bin\0"], None);
+    let mut b = [0u8; 128];
+    let p = path("/proc/sys/kernel/printk", &mut b);
+    // SAFETY: a NUL-terminated path; write-only open; our descriptor.
+    unsafe {
+        let fd = syscall(SYS_OPEN, p, 1, 0, 0, 0);
+        if fd >= 0 {
+            write(fd as usize, b"1\n");
+            syscall(SYS_CLOSE, fd as usize, 0, 0, 0, 0);
+        }
+    }
+    // SAFETY: a NUL-terminated path; the descriptor is ours.
+    let tty = unsafe { syscall(SYS_OPEN, TTY.as_ptr() as usize, O_RDWR | O_NOCTTY, 0, 0, 0) };
+    if tty >= 0 {
+        write(
+            tty as usize,
+            b"\n  Linux under the NANOX VMM: a busybox shell.\n  Try: uname -a, ls /, ps, free, cat /proc/cpuinfo, ping -c 3 10.0.2.2\n  'exit' powers the guest off.\n\n",
+        );
+        // SAFETY: closing the descriptor we opened.
+        unsafe { syscall(SYS_CLOSE, tty as usize, 0, 0, 0, 0) };
+    }
+    write(1, b"NANOX_SHELL_READY\n");
+    spawn(&[b"/bin/sh\0"], Some(TTY));
+    write(1, b"NANOX_SHELL_EXIT\n");
+}
+
 #[no_mangle]
 extern "C" fn init_main() -> ! {
     mkdir("/dev");
@@ -487,6 +622,9 @@ extern "C" fn init_main() -> ! {
     keyboard(tty);
     net();
     write(1, b"NANOX_GUEST_REPORT_END\n");
+    if shell_wanted() {
+        shell();
+    }
     // SAFETY: the reboot system call with the documented magic numbers; power off.
     unsafe { syscall(SYS_REBOOT, 0xfee1dead, 672274793, 0x4321fedc, 0, 0) };
     // SAFETY: leaving the process.

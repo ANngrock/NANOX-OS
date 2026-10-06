@@ -45,6 +45,7 @@ use hw_svm::vmcb::{ctl, Gprs};
 use hw_svm::vmm::{Outcome, Verdict, VmConfig};
 use hw_svm::{Clock, Npt, NptPerms, SvmCpu, Vmcb, PAGE_SIZE};
 use vmm_devices::acpi::{self, Platform};
+use vmm_devices::i8042::set1_to_set2;
 use vmm_devices::machine::{Machine, ECAM_BASE, ECAM_SIZE};
 use vmm_devices::virtio::GuestMemory;
 use vmm_devices::virtio_blk::{BlockBackend, SECTOR};
@@ -70,6 +71,9 @@ const CMDLINE_MAX: usize = 2048;
 /// 1000 polls in 10 ms it requires (docs/specs/M11-WINDOW.md).
 const QUANTUM_NS: u64 = 2_000;
 const SLICE_EXITS: u64 = 20_000;
+/// Slices of an interactive run (run.py --show): the screen is redrawn after
+/// each, so what is typed shows soon.
+const INTERACTIVE_SLICE_EXITS: u64 = 4_000;
 const MAX_EXITS: u64 = 100_000_000;
 const MAX_VIRTUAL_NS: u64 = 600_000_000_000;
 /// The RTC's time at virtual time 0 (2026-09-21 12:53:20 UTC): fixed, so
@@ -348,6 +352,8 @@ struct Typist<'a> {
     start: &'a Cell<bool>,
     /// Keys typed so far.
     typed: usize,
+    /// In an interactive run, the probe machine's own keyboard, handed on.
+    host: Option<HostKeyboard>,
 }
 
 /// `nanox` and Enter as set-2 scancodes (the release is 0xF0 and the code).
@@ -356,14 +362,82 @@ const TYPED_TEXT: &str = "nanox";
 
 impl InputHost for Typist<'_> {
     fn poll(&mut self, m: &mut Machine, _: u64) {
-        if !self.start.get() || self.typed == TYPED.len() || m.kbd.queued() > 0 {
-            return;
+        if self.start.get() && self.typed < TYPED.len() && m.kbd.queued() == 0 {
+            let key = TYPED[self.typed];
+            for b in [key, 0xF0, key] {
+                m.key(b);
+            }
+            self.typed += 1;
         }
-        let key = TYPED[self.typed];
-        for b in [key, 0xF0, key] {
-            m.key(b);
+        if let Some(h) = self.host.as_mut() {
+            h.poll(m);
         }
-        self.typed += 1;
+    }
+}
+
+/// The probe machine's own keyboard — QEMU's i8042, what is typed into its
+/// window — handed on to the guest in an interactive run (fw_cfg
+/// `opt/nanox/interactive`, run.py --show): every byte the controller has at
+/// a poll point goes to the guest's i8042; set-1 bytes of a translating
+/// controller are turned back into set 2 (`i8042::set1_to_set2`). The probe
+/// keeps interrupts off, so the firmware's keyboard driver, which runs from
+/// the timer, never takes the bytes first.
+struct HostKeyboard {
+    /// The controller translates to set 1 (bit 6 of its command byte).
+    translated: bool,
+    /// Key bytes handed on.
+    bytes: u64,
+}
+
+const PS2_DATA: u16 = 0x60;
+const PS2_STATUS: u16 = 0x64;
+/// Status: output buffer full, and the byte is the mouse's.
+const PS2_OBF: u8 = 1;
+const PS2_AUX: u8 = 0x20;
+
+impl HostKeyboard {
+    fn open() -> Self {
+        // Drop what waits from before, then read the command byte.
+        while hw::inb(PS2_STATUS) & PS2_OBF != 0 {
+            hw::inb(PS2_DATA);
+        }
+        hw::outb(PS2_STATUS, 0x20);
+        let mut command = 0x40;
+        for _ in 0..100_000 {
+            if hw::inb(PS2_STATUS) & PS2_OBF != 0 {
+                command = hw::inb(PS2_DATA);
+                break;
+            }
+        }
+        // The keyboard interface on.
+        hw::outb(PS2_STATUS, 0xAE);
+        Self {
+            translated: command & 0x40 != 0,
+            bytes: 0,
+        }
+    }
+
+    fn poll(&mut self, m: &mut Machine) {
+        // A key is a few bytes; whatever is left waits for the next poll point.
+        for _ in 0..16 {
+            let status = hw::inb(PS2_STATUS);
+            if status & PS2_OBF == 0 {
+                return;
+            }
+            let b = hw::inb(PS2_DATA);
+            if status & PS2_AUX != 0 {
+                continue;
+            }
+            self.bytes += 1;
+            if !self.translated || matches!(b, 0xE0 | 0xE1) {
+                m.key(b);
+            } else if let Some(code) = set1_to_set2(b & 0x7F) {
+                if b & 0x80 != 0 {
+                    m.key(0xF0);
+                }
+                m.key(code);
+            }
+        }
     }
 }
 
@@ -753,6 +827,14 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     vcfg.max_exits = MAX_EXITS;
     vcfg.max_time_us = SLICE_EXITS;
     vcfg.max_virtual_ns = MAX_VIRTUAL_NS;
+    // An interactive run lasts as long as the user types, in shorter slices.
+    let interactive = fwcfg::find("opt/nanox/interactive").is_ok();
+    if interactive {
+        vcfg.max_exits = u64::MAX;
+        vcfg.max_virtual_ns = u64::MAX;
+        vcfg.max_time_us = INTERACTIVE_SLICE_EXITS;
+        out!("NANOX:SVM-PROBE:LINUX-INTERACTIVE the probe's keyboard goes to the guest\n");
+    }
     if let Some(ns) = tick {
         vcfg.intr_exit_ns = ns;
     }
@@ -790,6 +872,7 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         Typist {
             start: &typing,
             typed: 0,
+            host: interactive.then(HostKeyboard::open),
         },
     );
     let mut host = Host {
@@ -825,7 +908,9 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
             break o;
         }
         slices += 1;
-        progress(env, page, &o, slices, surface.exits.reads_of(code::INTR));
+        if !interactive {
+            progress(env, page, &o, slices, surface.exits.reads_of(code::INTR));
+        }
         if let Some(d) = display.as_mut() {
             d.draw(
                 &guest_screen(fb_host),
@@ -846,9 +931,10 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     env.report("CASE", "linux", ok);
     report(&o, vcpu.machine(), slices, &net, &screen, &agent);
     out!(
-        "NANOX:SVM-PROBE:LINUX-KEYBOARD text={TYPED_TEXT} keys={}/{} dropped={}\n",
+        "NANOX:SVM-PROBE:LINUX-KEYBOARD text={TYPED_TEXT} keys={}/{} host_bytes={} dropped={}\n",
         input.typed,
         TYPED.len(),
+        input.host.as_ref().map_or(0, |h| h.bytes),
         vcpu.machine().kbd.dropped
     );
     surface.print();

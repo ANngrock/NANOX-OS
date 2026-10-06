@@ -43,6 +43,15 @@ const XLATE: [u8; 128] = [
     0x52, 0x53, 0x50, 0x4c, 0x4d, 0x48, 0x01, 0x45, 0x57, 0x4e, 0x51, 0x4a, 0x37, 0x49, 0x46, 0x54,
 ];
 
+/// The set-2 make code the controller's translation turns into the set-1 `code`
+/// (below 0x80): the inverse of the translation, for a host that receives set-1
+/// bytes from a translating controller of its own and hands them on to
+/// [`I8042::push_scancode`] (a release is 0xF0 and this code). None for a code
+/// no set-2 key produces.
+pub fn set1_to_set2(code: u8) -> Option<u8> {
+    (0u8..0x80).find(|&b| XLATE[usize::from(b)] == code)
+}
+
 /// What the next byte written to port 0x60 means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Next {

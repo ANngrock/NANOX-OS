@@ -6,8 +6,9 @@ use core::arch::{asm, global_asm};
 use core::fmt;
 
 pub fn outb(port: u16, value: u8) {
-    // SAFETY: CPL 0; port I/O has no memory operands. Only the fixed COM1
-    // and isa-debug-exit ports of the probe profile are used.
+    // SAFETY: CPL 0; port I/O has no memory operands. Only the fixed COM1,
+    // isa-debug-exit and (in an interactive run) PS/2 controller ports of the
+    // probe profile are used.
     unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
 }
 

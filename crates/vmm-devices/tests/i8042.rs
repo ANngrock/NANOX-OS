@@ -276,6 +276,30 @@ fn a_read_that_brings_the_next_byte_in_is_a_new_edge() {
 }
 
 #[test]
+fn set_1_bytes_go_back_to_set_2_and_through_the_translation_unchanged() {
+    let mut mapped = 0;
+    for code in 1u8..0x80 {
+        let Some(s2) = set1_to_set2(code) else {
+            continue;
+        };
+        mapped += 1;
+        assert!(s2 < 0x80, "{code:#x}");
+        // press and release, as a host forwarding its own keyboard does
+        let mut k = I8042::new();
+        k.push_scancode(s2);
+        k.push_scancode(0xF0);
+        k.push_scancode(s2);
+        assert_eq!(drain(&mut k), [code, code | 0x80], "{code:#x} via {s2:#x}");
+    }
+    // every set-1 key code of a PC keyboard has a set-2 key
+    assert!(mapped >= 0x58, "{mapped}");
+    assert_eq!(set1_to_set2(0x1E), Some(0x1C), "a");
+    assert_eq!(set1_to_set2(0x1C), Some(0x5A), "Enter");
+    assert_eq!(set1_to_set2(0x01), Some(0x76), "Esc");
+    assert_eq!(set1_to_set2(0x80), None);
+}
+
+#[test]
 fn the_output_buffer_has_sixteen_slots_and_overflow_is_counted() {
     let mut k = I8042::new();
     for _ in 0..QUEUE + 3 {
