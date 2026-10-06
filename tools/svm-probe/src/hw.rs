@@ -104,6 +104,88 @@ pub fn allocate_pages(system: *mut u8, pages: usize) -> Option<u64> {
     (status == 0).then_some(addr)
 }
 
+/// The firmware's display (UEFI 2.10 §12.9, Graphics Output Protocol): the
+/// mode in use and its linear framebuffer.
+#[derive(Clone, Copy, Debug)]
+pub struct Gop {
+    pub base: u64,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    /// EFI_GRAPHICS_PIXEL_FORMAT.
+    pub format: u32,
+}
+
+/// EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID 9042a9de-23dc-4a38-96fb-7aded080516a, as laid out in memory.
+const GOP_GUID: [u8; 16] = [
+    0xde, 0xa9, 0x42, 0x90, 0xdc, 0x23, 0x38, 0x4a, 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a,
+];
+/// PixelBlueGreenRedReserved8BitPerColor.
+const GOP_BGRX8: u32 = 1;
+
+/// Finds the display (EFI_BOOT_SERVICES.LocateProtocol at 0x140), switches
+/// it to the largest blue-green-red mode that fits `max_w` × `max_h` (if
+/// there is one) and returns the mode in use; None without a display. The
+/// mode information QueryMode allocates stays with the firmware (a few dozen
+/// bytes per mode, once per run).
+pub fn gop(system: *mut u8, max_w: u32, max_h: u32) -> Option<Gop> {
+    type LocateProtocol = unsafe extern "efiapi" fn(*const u8, *const u8, *mut *mut u8) -> usize;
+    type QueryMode = unsafe extern "efiapi" fn(*mut u8, u32, *mut usize, *mut *const u8) -> usize;
+    type SetMode = unsafe extern "efiapi" fn(*mut u8, u32) -> usize;
+    let mut gop: *mut u8 = core::ptr::null_mut();
+    // SAFETY: `system` is the EFI_SYSTEM_TABLE and boot services are active
+    // (see `allocate_pages`); LocateProtocol writes the interface pointer.
+    let status = unsafe {
+        let boot = *(system.add(0x60) as *const *const u8);
+        let locate: LocateProtocol = core::mem::transmute(*(boot.add(0x140) as *const usize));
+        locate(GOP_GUID.as_ptr(), core::ptr::null(), &mut gop)
+    };
+    if status != 0 || gop.is_null() {
+        return None;
+    }
+    // SAFETY: `gop` is the EFI_GRAPHICS_OUTPUT_PROTOCOL the firmware handed
+    // out: QueryMode at 0, SetMode at 8, Mode at 0x18; EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE
+    // has MaxMode at 0, Info at 8, FrameBufferBase at 24 and FrameBufferSize at 32;
+    // EFI_GRAPHICS_OUTPUT_MODE_INFORMATION has the resolution at 4 and 8, the
+    // pixel format at 12 and PixelsPerScanLine at 32.
+    unsafe {
+        let query: QueryMode = core::mem::transmute(*(gop as *const usize));
+        let set: SetMode = core::mem::transmute(*(gop.add(8) as *const usize));
+        let mode = *(gop.add(0x18) as *const *const u8);
+        let max_mode = *(mode as *const u32);
+        let mut best: Option<(u32, u64)> = None;
+        for m in 0..max_mode {
+            let (mut size, mut info) = (0usize, core::ptr::null::<u8>());
+            if query(gop, m, &mut size, &mut info) != 0 || info.is_null() {
+                continue;
+            }
+            let w = *(info.add(4) as *const u32);
+            let h = *(info.add(8) as *const u32);
+            let area = u64::from(w) * u64::from(h);
+            let fits = *(info.add(12) as *const u32) == GOP_BGRX8 && w <= max_w && h <= max_h;
+            if fits && best.is_none_or(|(_, a)| area > a) {
+                best = Some((m, area));
+            }
+        }
+        if let Some((m, _)) = best {
+            if set(gop, m) != 0 {
+                return None;
+            }
+        }
+        let info = *(mode.add(8) as *const *const u8);
+        let word = |at: usize| *(info.add(at) as *const u32);
+        Some(Gop {
+            base: *(mode.add(24) as *const u64),
+            size: *(mode.add(32) as *const usize) as u64,
+            width: word(4),
+            height: word(8),
+            format: word(12),
+            stride: word(32),
+        })
+    }
+}
+
 /// Ends the QEMU run through isa-debug-exit: status `(value << 1) | 1`.
 pub fn exit(value: u32) -> ! {
     // SAFETY: the probe profile always has isa-debug-exit at 0xF4; without

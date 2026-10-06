@@ -87,6 +87,7 @@ macro_rules! out {
 }
 
 mod linux;
+mod screen;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {

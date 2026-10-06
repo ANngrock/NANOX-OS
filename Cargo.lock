@@ -16,6 +16,13 @@ name = "boot-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "canvas"
+version = "0.1.0"
+dependencies = [
+ "fb-console",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -276,8 +283,11 @@ name = "svm-probe"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
+ "canvas",
+ "fb-console",
  "guest-boot",
  "hw-svm",
+ "serverwin",
  "vmm-devices",
  "vswitch",
 ]

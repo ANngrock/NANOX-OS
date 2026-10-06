@@ -25,10 +25,15 @@
 //! pages (`NANOX:SVM-PROBE:LINUX-EXITS`, `-PORTS`, `-MSRS`, `-CPUID`, `-MMIO`),
 //! and the guest's screen: a linear framebuffer ([`FB`]) as UEFI GOP would
 //! leave one, which Linux's EFI framebuffer drivers draw the console on
-//! (`NANOX:SVM-PROBE:LINUX-SCREEN`, see [`dump_screen`]).
+//! (`NANOX:SVM-PROBE:LINUX-SCREEN`, see [`dump_screen`]). While the guest
+//! runs, the firmware's own display shows the NANOX screen with the server
+//! window and the guest's screen in it (`crate::screen`), dumped at the end
+//! as `NANOX:SVM-PROBE:NANOX-SCREEN`.
 
 use crate::hw::Serial;
+use crate::screen::{Display, Status};
 use crate::{fwcfg, has, hw, Cpu, Env, Frames, GuestMap, GuestRam, Phys, HOST_TICK_COUNT};
+use canvas::View;
 use core::cell::Cell;
 use core::fmt::Write;
 use guest_boot::linux::{self, Acpi, Framebuffer, LinuxConfig};
@@ -82,6 +87,9 @@ const FB: Framebuffer = Framebuffer {
     stride: 4096,
 };
 const FB_BYTES: u64 = FB.bytes();
+/// The largest display mode the NANOX screen takes: the window (4/5 of the
+/// screen, `serverwin`) then shows the guest's 1024 x 768 almost unscaled.
+const DISPLAY_MAX: (u32, u32) = (1280, 1024);
 /// FNV-1a, 64 bits: the screen dump's check.
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x100_0000_01B3;
@@ -539,6 +547,51 @@ fn stream(serial: &[u8], from: usize, all: bool) -> usize {
     start
 }
 
+/// `n` pixels of firmware memory, or None if they cannot be had.
+fn allocate_pixels(system: *mut u8, n: usize) -> Option<&'static mut [u32]> {
+    let bytes = allocate(system, n.checked_mul(4)?)?;
+    // SAFETY: fresh page-aligned firmware pages of `4 * n` bytes, owned by
+    // the probe; the byte slice is consumed here, so this is the only
+    // reference to them.
+    Some(unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut u32, n) })
+}
+
+/// The guest's framebuffer as pixels. Only for use while the guest does not
+/// run, and dropped before it runs again.
+fn guest_screen(fb_host: u64) -> View<'static> {
+    // SAFETY: the probe's framebuffer pages (allocated in `case`, owned by the
+    // probe, identity-mapped, page-aligned); the guest writes them only while
+    // it runs, and the caller drops the view before it runs again.
+    let px = unsafe { core::slice::from_raw_parts(fb_host as *const u32, (FB_BYTES / 4) as usize) };
+    View::new(
+        px,
+        usize::from(FB.width),
+        usize::from(FB.height),
+        usize::from(FB.stride) / 4,
+    )
+    .expect("the framebuffer holds its rows")
+}
+
+/// What the NANOX screen shows about the run.
+fn status<'a>(o: &Outcome, m: &Machine, serial: &'a [u8], running: bool) -> Status<'a> {
+    const VERSION: &[u8] = b"Linux version ";
+    let kernel = serial
+        .windows(VERSION.len())
+        .position(|w| w == VERSION)
+        .map(|at| &serial[at + VERSION.len()..])
+        .map(|rest| &rest[..rest.iter().position(|&b| b == b' ').unwrap_or(rest.len())]);
+    Status {
+        kernel,
+        running,
+        virtual_ms: o.virtual_ns / 1_000_000,
+        exits: o.exits,
+        irqs: o.irqs,
+        disk_requests: m.blk.requests,
+        net: (m.net.sent, m.net.received),
+        agent: (m.console.bytes_out, m.console.bytes_in),
+    }
+}
+
 /// `bytes` of firmware memory as a slice, or None if it cannot be had.
 fn allocate(system: *mut u8, bytes: usize) -> Option<&'static mut [u8]> {
     let pages = bytes.div_ceil(PAGE_SIZE as usize).max(1);
@@ -598,6 +651,23 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         return fail(env, "allocate-framebuffer");
     };
     fb_buf.fill(0);
+    // The NANOX screen on the firmware's display, if there is one.
+    let gop = hw::gop(system, DISPLAY_MAX.0, DISPLAY_MAX.1);
+    let mut display = gop.and_then(|g| {
+        out!(
+            "NANOX:SVM-PROBE:DISPLAY width={} height={} stride={} format={} base={:#x}\n",
+            g.width,
+            g.height,
+            g.stride,
+            g.format,
+            g.base
+        );
+        let shadow = allocate_pixels(system, g.width as usize * g.height as usize)?;
+        Display::open(g, shadow)
+    });
+    if display.is_none() {
+        out!("NANOX:SVM-PROBE:DISPLAY none\n");
+    }
     let fb_host = fb_buf.as_mut_ptr() as u64;
     let (Ok(image), Ok(initrd)) = (
         fwcfg::read_into(image_file, image_buf),
@@ -756,6 +826,12 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         }
         slices += 1;
         progress(env, page, &o, slices, surface.exits.reads_of(code::INTR));
+        if let Some(d) = display.as_mut() {
+            d.draw(
+                &guest_screen(fb_host),
+                &status(&o, vcpu.machine(), vcpu.serial(), true),
+            );
+        }
     };
     env.cpu.host_irq = false;
     env.host_tick.stop();
@@ -776,10 +852,14 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         vcpu.machine().kbd.dropped
     );
     surface.print();
-    // SAFETY: the probe's framebuffer pages (allocated above, owned by the
-    // probe, identity-mapped); the guest no longer runs, and no other
-    // reference to them exists.
-    dump_screen(unsafe { core::slice::from_raw_parts(fb_host as *const u8, FB_BYTES as usize) });
+    dump_screen("LINUX", &guest_screen(fb_host));
+    if let Some(d) = display.as_mut() {
+        d.draw(
+            &guest_screen(fb_host),
+            &status(&o, vcpu.machine(), s, false),
+        );
+        dump_screen("NANOX", &d.view());
+    }
     if !ok {
         state(env, page, s);
     }
@@ -879,27 +959,27 @@ fn report(o: &Outcome, m: &Machine, slices: u64, net: &Net, screen: &NoScreen, a
     out!("\"\n");
 }
 
-/// The guest's screen: `NANOX:SVM-PROBE:LINUX-SCREEN width= height=`, then
-/// one `NANOX:SVM-PROBE:LINUX-FB` line per pixel row, its runs of equal
-/// pixels as ` <count>:<rrggbb>` (hex) or ` =` for a row equal to the one
-/// before, then `NANOX:SVM-PROBE:LINUX-SCREEN-END fnv=` with the FNV-1a hash
-/// of every pixel's red, green and blue byte. run.py makes a PNG of it.
-fn dump_screen(fb: &[u8]) {
-    let (w, h) = (usize::from(FB.width), usize::from(FB.height));
-    let stride = usize::from(FB.stride);
-    let rgb =
-        |row: &[u8], x: usize| u32::from_le_bytes([row[4 * x], row[4 * x + 1], row[4 * x + 2], 0]);
-    out!("NANOX:SVM-PROBE:LINUX-SCREEN width={w} height={h}\n");
+/// A screen of XRGB pixels in the log (`tag` is LINUX for the guest's,
+/// NANOX for the probe's display): `NANOX:SVM-PROBE:<tag>-SCREEN width=
+/// height=`, then one `NANOX:SVM-PROBE:<tag>-FB` line per pixel row, its runs
+/// of equal pixels as ` <count>:<rrggbb>` (hex) or ` =` for a row equal to
+/// the one before, then `NANOX:SVM-PROBE:<tag>-SCREEN-END fnv=` with the
+/// FNV-1a hash of every pixel's red, green and blue byte. run.py makes a PNG
+/// of it.
+fn dump_screen(tag: &str, v: &View<'_>) {
+    let (w, h) = (v.width(), v.height());
+    let rgb = |row: &[u32], x: usize| row[x] & 0xFF_FFFF;
+    out!("NANOX:SVM-PROBE:{tag}-SCREEN width={w} height={h}\n");
     let mut hash = FNV_OFFSET;
-    let mut prev: Option<&[u8]> = None;
+    let mut prev: Option<&[u32]> = None;
     for y in 0..h {
-        let row = &fb[y * stride..y * stride + 4 * w];
-        for x in 0..w {
-            for b in [2, 1, 0] {
-                hash = (hash ^ u64::from(row[4 * x + b])).wrapping_mul(FNV_PRIME);
+        let row = v.row(y);
+        for &p in row {
+            for shift in [16, 8, 0] {
+                hash = (hash ^ u64::from((p >> shift) & 0xFF)).wrapping_mul(FNV_PRIME);
             }
         }
-        out!("NANOX:SVM-PROBE:LINUX-FB");
+        out!("NANOX:SVM-PROBE:{tag}-FB");
         if prev.is_some_and(|p| (0..w).all(|x| rgb(p, x) == rgb(row, x))) {
             out!(" =\n");
             continue;
@@ -914,7 +994,7 @@ fn dump_screen(fb: &[u8]) {
         out!("\n");
         prev = Some(row);
     }
-    out!("NANOX:SVM-PROBE:LINUX-SCREEN-END fnv={hash:016x}\n");
+    out!("NANOX:SVM-PROBE:{tag}-SCREEN-END fnv={hash:016x}\n");
 }
 
 /// The vCPU state at the end and the last guest output.

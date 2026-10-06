@@ -205,13 +205,15 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
         "serial_lines": [l for l in lines if l.startswith("NANOX:SVM-PROBE")
                          and not l.startswith(("NANOX:SVM-PROBE:LINUX ",
                                                "NANOX:SVM-PROBE:LINUX-PROGRESS",
-                                               "NANOX:SVM-PROBE:LINUX-FB "))],
+                                               "NANOX:SVM-PROBE:LINUX-FB ",
+                                               "NANOX:SVM-PROBE:NANOX-FB "))],
     }
     if linux:
         guest = [l[len("NANOX:SVM-PROBE:LINUX "):] for l in lines
                  if l.startswith("NANOX:SVM-PROBE:LINUX ")]
         r["linux"] = linux_summary(guest, lines)
         r["linux"]["screen"] = linux_screen(lines, d / "screen.png")
+        r["linux"]["nanox_screen"] = linux_screen(lines, d / "nanox-screen.png", "NANOX")
     return r
 
 
@@ -219,17 +221,18 @@ FNV_OFFSET = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
 
 
-def linux_screen(lines, png: Path):
-    """The guest's screen from the probe's dump (svm-probe linux.rs `dump_screen`) as a
-    PNG; its pixels are checked against the probe's hash."""
-    head = [l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-SCREEN ")]
+def linux_screen(lines, png: Path, tag="LINUX"):
+    """A screen from the probe's dump (svm-probe linux.rs `dump_screen`; LINUX is the
+    guest's, NANOX the probe's display) as a PNG; its pixels are checked against the
+    probe's hash."""
+    head = [l for l in lines if l.startswith(f"NANOX:SVM-PROBE:{tag}-SCREEN ")]
     if not head:
         return None
-    m = re.fullmatch(r"NANOX:SVM-PROBE:LINUX-SCREEN width=(\d+) height=(\d+)", head[0])
+    m = re.fullmatch(rf"NANOX:SVM-PROBE:{tag}-SCREEN width=(\d+) height=(\d+)", head[0])
     w, h = int(m[1]), int(m[2])
     rows = []
     for l in lines:
-        if not l.startswith("NANOX:SVM-PROBE:LINUX-FB "):
+        if not l.startswith(f"NANOX:SVM-PROBE:{tag}-FB "):
             continue
         runs = l.split()[1:]
         if runs == ["="]:
@@ -237,13 +240,13 @@ def linux_screen(lines, png: Path):
             continue
         row = b"".join(bytes.fromhex(px) * int(n, 16) for n, px in (r.split(":") for r in runs))
         rows.append(row)
-    end = [l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-SCREEN-END ")]
+    end = [l for l in lines if l.startswith(f"NANOX:SVM-PROBE:{tag}-SCREEN-END ")]
     pixels = b"".join(rows)
     fnv = FNV_OFFSET
     for b in pixels:
         fnv = ((fnv ^ b) * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
     complete = len(rows) == h and all(len(r) == 3 * w for r in rows) and bool(end)
-    ok = complete and end[0] == f"NANOX:SVM-PROBE:LINUX-SCREEN-END fnv={fnv:016x}"
+    ok = complete and end[0] == f"NANOX:SVM-PROBE:{tag}-SCREEN-END fnv={fnv:016x}"
     if ok:
         png.write_bytes(png_rgb(w, h, rows))
     return {
@@ -452,6 +455,7 @@ def main() -> int:
         if "linux" in r:
             print(f"        {r['linux']['case']}")
             print(f"        screen: {r['linux']['screen']}")
+            print(f"        nanox screen: {r['linux']['nanox_screen']}")
     if initrd:
         # The archive is rebuilt from the init on every run; its hash is recorded.
         initrd.unlink()
