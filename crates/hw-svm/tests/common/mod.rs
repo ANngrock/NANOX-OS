@@ -308,6 +308,15 @@ impl FakeCpu {
         }
     }
 
+    /// Lays the script out from `entry` instead of [`ENTRY`] (a guest that starts elsewhere).
+    pub fn start_at(&mut self, entry: u64) {
+        let mut rip = entry;
+        for s in &mut self.steps {
+            s.0 = rip;
+            rip += s.1.len();
+        }
+    }
+
     /// RIP of script step `index`.
     pub fn rip_of(&self, index: usize) -> u64 {
         self.steps[index].0
@@ -792,6 +801,25 @@ impl Rig {
             ram,
             clock: FakeClock { now: 0, step: 1 },
             prepared: false,
+        }
+    }
+
+    /// Maps more guest RAM: pages `RAM_PAGES..pages` at their identity GPAs (filled with zeros).
+    pub fn map_ram(&mut self, pages: u64) {
+        for i in self.ram.len() as u64..pages {
+            let f = self.cpu.frames.alloc_frame().unwrap();
+            self.cpu.mem.write_bytes(f, &[0; 4096]);
+            self.npt
+                .map(
+                    &mut self.cpu.mem,
+                    &mut self.cpu.frames,
+                    i * PAGE_SIZE,
+                    f,
+                    PAGE_SIZE,
+                    RW,
+                )
+                .expect("map RAM");
+            self.ram.push(f);
         }
     }
 
