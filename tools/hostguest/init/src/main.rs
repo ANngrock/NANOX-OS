@@ -1,8 +1,9 @@
 //! Init for the measurement boot: mounts the pseudo file systems, prints what
 //! the guest kernel reports about its machine on the console, greets the host
 //! on the agent channel (virtio-console, `/dev/hvc0`) when there is one,
-//! brings up `eth0` and pings the host (10.0.2.2) when there is a network card,
-//! and powers off.
+//! reports a line typed on the keyboard (the first virtual terminal), brings up
+//! `eth0` and pings the host (10.0.2.2) when there is a network card, and
+//! powers off.
 //! Raw Linux system calls, no libc: the same kind of freestanding static
 //! program a NANOX native process is.
 
@@ -37,6 +38,8 @@ const ECHO: u32 = 0o10;
 const POLLIN: u16 = 1;
 /// How long the host may take to answer on the agent channel.
 const AGENT_WAIT_MS: usize = 1000;
+/// How long a line may take to be typed.
+const TYPING_WAIT_MS: usize = 2000;
 const AF_INET: u16 = 2;
 const SOCK_DGRAM: usize = 2;
 const SOCK_RAW: usize = 3;
@@ -53,6 +56,11 @@ const HOST_IP: [u8; 4] = [10, 0, 2, 2];
 const PING_DATA: &[u8] = b"NANOX ping";
 /// How long the host may take to answer a ping.
 const PING_WAIT_MS: usize = 1000;
+/// How long the link may take to come up after `eth0` does: Linux starts the
+/// interface's packet queue from its link-watch work, which runs at most once
+/// a second, and drops what is sent before (the first ARP request would be
+/// lost and repeated only a second later).
+const LINK_WAIT_MS: usize = 2000;
 
 unsafe fn syscall(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
     // SAFETY: the caller's arguments; the sixth is 0.
@@ -278,6 +286,32 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Whether `eth0`'s operational state becomes "up" within [`LINK_WAIT_MS`].
+fn link_up() -> bool {
+    let mut b = [0u8; 128];
+    let p = path("/sys/class/net/eth0/operstate", &mut b);
+    for _ in 0..LINK_WAIT_MS / 10 {
+        let mut state = [0u8; 16];
+        // SAFETY: a NUL-terminated path, a valid buffer, our descriptor; a
+        // poll without descriptors sleeps 10 ms.
+        let n = unsafe {
+            let fd = syscall(SYS_OPEN, p, 0, 0, 0, 0);
+            if fd < 0 {
+                return false;
+            }
+            let n = syscall(SYS_READ, fd as usize, state.as_mut_ptr() as usize, 16, 0, 0);
+            syscall(SYS_CLOSE, fd as usize, 0, 0, 0, 0);
+            n
+        };
+        if n >= 2 && state.starts_with(b"up") {
+            return true;
+        }
+        // SAFETY: as above.
+        unsafe { syscall(SYS_POLL, 0, 0, 10, 0, 0) };
+    }
+    false
+}
+
 /// `eth0` gets [`GUEST_IP`]/24 and is brought up; one ICMP echo request goes
 /// to [`HOST_IP`] and its reply (if it comes within [`PING_WAIT_MS`]) is
 /// reported.
@@ -315,6 +349,10 @@ fn net() {
         return;
     }
     write(1, b"eth0 10.0.2.15/24 up\n");
+    if !link_up() {
+        write(1, b"(link down)\n");
+        return;
+    }
     // SAFETY: a raw ICMP socket (init runs as root).
     let r = unsafe { syscall(SYS_SOCKET, AF_INET as usize, SOCK_RAW, IPPROTO_ICMP, 0, 0) };
     if r < 0 {
@@ -331,9 +369,9 @@ fn net() {
     let to = sockaddr(HOST_IP);
     let mut pfd = [r as u32, u32::from(POLLIN)];
     let mut buf = [0u8; 128];
-    // SAFETY: valid buffers for sendto, poll and recvfrom.
-    let n = unsafe {
-        let sent = syscall6(
+    // SAFETY: a valid buffer and address for sendto.
+    let sent = unsafe {
+        syscall6(
             SYS_SENDTO,
             r,
             req.as_ptr() as usize,
@@ -341,7 +379,15 @@ fn net() {
             0,
             to.as_ptr() as usize,
             to.len(),
-        );
+        )
+    };
+    if sent != req.len() as isize {
+        write(1, b"(send failed: errno ");
+        write_dec(1, sent.unsigned_abs());
+        write(1, b")\n");
+    }
+    // SAFETY: one pollfd and a valid buffer for recvfrom.
+    let n = unsafe {
         if sent == req.len() as isize
             && syscall(SYS_POLL, pfd.as_mut_ptr() as usize, 1, PING_WAIT_MS, 0, 0) > 0
         {
@@ -364,7 +410,47 @@ fn net() {
         write(1, b" bytes\n");
     } else {
         write(1, b"(no reply)\n");
+        cat("net/dev", "/proc/net/dev");
+        cat("net/arp", "/proc/net/arp");
     }
+}
+
+/// The first virtual terminal (the screen's console and the keyboard's), opened
+/// before the host is greeted: the host types on it once it has answered.
+fn open_tty() -> isize {
+    let mut b = [0u8; 128];
+    let p = path("/dev/tty1", &mut b);
+    // SAFETY: a NUL-terminated path.
+    unsafe { syscall(SYS_OPEN, p, O_RDWR | O_NOCTTY, 0, 0, 0) }
+}
+
+/// A line typed on the keyboard, if one comes within [`TYPING_WAIT_MS`]; the
+/// terminal echoes it on the screen.
+fn keyboard(tty: isize) {
+    write(1, b"--- keyboard\n");
+    if tty < 0 {
+        write(1, b"(not available)\n");
+        return;
+    }
+    let fd = tty as usize;
+    let mut pfd = [fd as u32, u32::from(POLLIN)];
+    let mut line = [0u8; 128];
+    // SAFETY: one pollfd and a valid buffer; the canonical tty returns one line per read.
+    let n = unsafe {
+        if syscall(SYS_POLL, pfd.as_mut_ptr() as usize, 1, TYPING_WAIT_MS, 0, 0) > 0 {
+            syscall(SYS_READ, fd, line.as_mut_ptr() as usize, line.len(), 0, 0)
+        } else {
+            0
+        }
+    };
+    if n > 0 {
+        write(1, b"typed: ");
+        write(1, &line[..n as usize]);
+    } else {
+        write(1, b"(nothing typed)\n");
+    }
+    // SAFETY: closing the descriptor we opened.
+    unsafe { syscall(SYS_CLOSE, fd, 0, 0, 0, 0) };
 }
 
 #[no_mangle]
@@ -394,8 +480,11 @@ extern "C" fn init_main() -> ! {
         "/sys/devices/system/clocksource/clocksource0/current_clocksource",
     );
     cat("devices", "/proc/devices");
+    cat("input", "/proc/bus/input/devices");
     pci_devices();
+    let tty = open_tty();
     agent();
+    keyboard(tty);
     net();
     write(1, b"NANOX_GUEST_REPORT_END\n");
     // SAFETY: the reboot system call with the documented magic numbers; power off.

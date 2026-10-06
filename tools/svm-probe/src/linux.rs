@@ -29,6 +29,7 @@
 
 use crate::hw::Serial;
 use crate::{fwcfg, has, hw, Cpu, Env, Frames, GuestMap, GuestRam, Phys, HOST_TICK_COUNT};
+use core::cell::Cell;
 use core::fmt::Write;
 use guest_boot::linux::{self, Acpi, Framebuffer, LinuxConfig};
 use guest_boot::GuestMemory as _;
@@ -199,7 +200,13 @@ struct Net {
     queued: usize,
     /// Answers that found the queue full.
     dropped: u64,
+    /// The start of the first [`NET_KEEP`] frames the guest sent and their lengths.
+    kept: [[u8; NET_KEEP_BYTES]; NET_KEEP],
+    kept_lens: [usize; NET_KEEP],
 }
+
+const NET_KEEP: usize = 8;
+const NET_KEEP_BYTES: usize = 64;
 
 const HOST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x35, 0x02];
 const HOST_IP: [u8; 4] = [10, 0, 2, 2];
@@ -215,12 +222,19 @@ impl Net {
             head: 0,
             queued: 0,
             dropped: 0,
+            kept: [[0; NET_KEEP_BYTES]; NET_KEEP],
+            kept_lens: [0; NET_KEEP],
         }
     }
 }
 
 impl NetBackend for Net {
     fn send(&mut self, frame: &[u8]) {
+        if let Some(k) = self.kept.get_mut(self.sent as usize) {
+            let n = frame.len().min(NET_KEEP_BYTES);
+            k[..n].copy_from_slice(&frame[..n]);
+            self.kept_lens[self.sent as usize] = frame.len();
+        }
         self.sent += 1;
         let mut out = [0u8; MAX_FRAME];
         let Some(n) = self.host.answer(frame, &mut out) else {
@@ -266,23 +280,26 @@ impl Scanout for NoScreen {
 
 /// The agent channel's host end: what the guest sends is counted and its first
 /// [`AGENT_KEEP`] bytes kept; once the guest has sent a whole line, the host
-/// answers with [`AGENT_ANSWER`] (the init's greeting, tools/hostguest/init).
-struct Agent {
+/// answers with [`AGENT_ANSWER`] (the init's greeting, tools/hostguest/init)
+/// and starts typing on the keyboard ([`Typist`]).
+struct Agent<'a> {
     bytes: u64,
     kept: [u8; AGENT_KEEP],
     /// How much of the answer the guest has taken; None before the first line.
     answered: Option<usize>,
+    typing: &'a Cell<bool>,
 }
 
 const AGENT_KEEP: usize = 256;
 const AGENT_ANSWER: &[u8] = b"NANOX_HOST_HELLO from the NANOX VMM\n";
 
-impl Agent {
-    fn new() -> Self {
+impl<'a> Agent<'a> {
+    fn new(typing: &'a Cell<bool>) -> Self {
         Self {
             bytes: 0,
             kept: [0; AGENT_KEEP],
             answered: None,
+            typing,
         }
     }
 
@@ -291,7 +308,7 @@ impl Agent {
     }
 }
 
-impl ConsoleBackend for Agent {
+impl ConsoleBackend for Agent<'_> {
     fn write(&mut self, data: &[u8]) {
         for &b in data {
             if let Some(k) = self.kept.get_mut(self.bytes as usize) {
@@ -300,6 +317,7 @@ impl ConsoleBackend for Agent {
             self.bytes += 1;
             if b == b'\n' && self.answered.is_none() {
                 self.answered = Some(0);
+                self.typing.set(true);
             }
         }
     }
@@ -314,11 +332,31 @@ impl ConsoleBackend for Agent {
     }
 }
 
-/// No host input.
-struct NoInput;
+/// The keyboard's host end: once the agent channel has answered the guest
+/// (`start`, set by [`Agent`]), it types [`TYPED`] on the PS/2 keyboard, one
+/// key (press and release) whenever the controller's buffer is empty at a poll
+/// point. The init reads the line from the first virtual terminal.
+struct Typist<'a> {
+    start: &'a Cell<bool>,
+    /// Keys typed so far.
+    typed: usize,
+}
 
-impl InputHost for NoInput {
-    fn poll(&mut self, _: &mut Machine, _: u64) {}
+/// `nanox` and Enter as set-2 scancodes (the release is 0xF0 and the code).
+const TYPED: [u8; 6] = [0x31, 0x1C, 0x31, 0x44, 0x22, 0x5A];
+const TYPED_TEXT: &str = "nanox";
+
+impl InputHost for Typist<'_> {
+    fn poll(&mut self, m: &mut Machine, _: u64) {
+        if !self.start.get() || self.typed == TYPED.len() || m.kbd.queued() > 0 {
+            return;
+        }
+        let key = TYPED[self.typed];
+        for b in [key, 0xF0, key] {
+            m.key(b);
+        }
+        self.typed += 1;
+    }
 }
 
 /// The probe has no wall clock: its "microseconds" count the loop's
@@ -673,12 +711,16 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         Some(d) => d,
         None => &mut no_disk,
     };
+    let typing = Cell::new(false);
     let (mut mem, mut net, mut screen, mut agent, mut input) = (
         Dma { base, size: RAM },
         Net::new(),
         NoScreen::default(),
-        Agent::new(),
-        NoInput,
+        Agent::new(&typing),
+        Typist {
+            start: &typing,
+            typed: 0,
+        },
     );
     let mut host = Host {
         mem: &mut mem,
@@ -727,6 +769,12 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     let ok = has(s, b"NANOX_GUEST_REPORT_END") && ended;
     env.report("CASE", "linux", ok);
     report(&o, vcpu.machine(), slices, &net, &screen, &agent);
+    out!(
+        "NANOX:SVM-PROBE:LINUX-KEYBOARD text={TYPED_TEXT} keys={}/{} dropped={}\n",
+        input.typed,
+        TYPED.len(),
+        vcpu.machine().kbd.dropped
+    );
     surface.print();
     // SAFETY: the probe's framebuffer pages (allocated above, owned by the
     // probe, identity-mapped); the guest no longer runs, and no other
@@ -777,7 +825,7 @@ fn progress(env: &mut Env, page: &mut [u8; 4096], o: &Outcome, slice: u64, ticks
     out!("\n");
 }
 
-fn report(o: &Outcome, m: &Machine, slices: u64, net: &Net, screen: &NoScreen, agent: &Agent) {
+fn report(o: &Outcome, m: &Machine, slices: u64, net: &Net, screen: &NoScreen, agent: &Agent<'_>) {
     out!(
         " verdict={:?} exits={} slices={} msr_faults={} ud={} irqs={} mmio={} virtual_ms={} serial_bytes={} truncated={} unclaimed_in={} unclaimed_out={} unclaimed_mmio={} other_messages={} pit_coalesced={} blk_requests={} net_sent={} gpu_resources={} agent_bytes={}\n",
         o.verdict,
@@ -808,6 +856,14 @@ fn report(o: &Outcome, m: &Machine, slices: u64, net: &Net, screen: &NoScreen, a
         net.host.ignored,
         net.dropped
     );
+    for (i, k) in net.kept.iter().enumerate().take(net.sent as usize) {
+        let len = net.kept_lens[i];
+        out!("NANOX:SVM-PROBE:LINUX-NET-FRAME {i} len={len} ");
+        for b in &k[..len.min(NET_KEEP_BYTES)] {
+            out!("{b:02x}");
+        }
+        out!("\n");
+    }
     out!(
         "NANOX:SVM-PROBE:LINUX-AGENT from_guest={} to_guest={} text=\"",
         agent.bytes,
