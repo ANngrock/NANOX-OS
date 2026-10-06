@@ -278,6 +278,7 @@ dependencies = [
  "boot-protocol",
  "guest-boot",
  "hw-svm",
+ "vmm-devices",
 ]
 
 [[package]]

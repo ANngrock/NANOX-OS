@@ -4,6 +4,8 @@
 Run inside `nix develop` (pinned QEMU, NANOX_OVMF_CODE/NANOX_OVMF_VARS):
 
     python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH] [--repro [--runs N]]
+        [--linux-kernel BZIMAGE [--linux-init ELF] [--linux-cmdline TEXT] [--linux-only]
+         [--linux-host-tick NS|off] [--linux-timeout S]]
 
 With --repro the svm profile runs N times (default 2) with identical inputs
 and the per-case digest (verdict, every counter and the serial bytes) of each
@@ -13,6 +15,16 @@ run is compared: every case except the host-timed ones must be identical
 With --m1-kernel, an M1 kernel ELF (built from codex/m1-m8-continuation)
 is also handed over (fw_cfg opt/nanox/kernel-m1.elf) and booted with the M1
 handoff in its nine test scenarios.
+
+With --linux-kernel, a fourth profile, linux, hands a Linux bzImage (fw_cfg
+opt/nanox/bzimage), an initramfs with the measurement init
+(tools/hostguest/init, built by tools/native/build.py; the archive is made by
+linux_surface.py's cpio_newc) and the command line to the probe, whose
+`linux` case boots it on the whole emulated platform and passes when the
+guest prints NANOX_GUEST_REPORT_END (docs/specs/M11-WINDOW.md §5). The
+profile has 1 GiB (the case allocates 256 MiB of guest RAM from the
+firmware) and a long timeout: nested paging under TCG is slow. --linux-only
+runs only that profile.
 
 Profiles:
   svm     qemu64 with SVM, nested paging, NRIP save: every case must pass
@@ -80,9 +92,35 @@ def option(name):
 
 
 M1_KERNEL = option("--m1-kernel")
+LINUX_KERNEL = option("--linux-kernel")
+LINUX_INIT = option("--linux-init")
+LINUX_INIT_DEFAULT = ROOT / "target/x86_64-unknown-none/release/linux-probe-init"
+# The kernel command line of the linux profile, each item with its reason
+# (docs/specs/M11-WINDOW.md, "Первый запуск Linux под VMM NANOX"):
+LINUX_CMDLINE = option("--linux-cmdline") or " ".join([
+    "console=ttyS0",  # the kernel's console on COM1, which the probe prints
+    "earlyprintk=serial,ttyS0,115200",  # output before the 8250 driver is up
+    "panic=-1",  # a panic reboots at once: the VMM sees Reset, not a hang
+])
+# Virtual time (ns) a host tick exit (~1 ms of host time) counts, or "off";
+# the probe's default when absent (fw_cfg opt/nanox/host-tick-ns).
+LINUX_HOST_TICK = option("--linux-host-tick")
+LINUX_TIMEOUT_S = int(option("--linux-timeout") or 7200)
+LINUX_PROFILE = ("linux", f"qemu64,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PASS")
 
 
-def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path):
+def linux_initrd(out: Path) -> Path:
+    """The measurement initramfs: /init only, as linux_surface.py makes it."""
+    sys.path.insert(0, str(ROOT / "tools/hostguest"))
+    import linux_surface  # noqa: E402
+
+    init = Path(LINUX_INIT) if LINUX_INIT else LINUX_INIT_DEFAULT
+    img = out / "initrd.img"
+    img.write_bytes(linux_surface.cpio_newc([("init", 0o100755, init.read_bytes())]))
+    return img
+
+
+def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linux=None):
     d = out / name
     esp = d / "esp/EFI/BOOT"
     esp.mkdir(parents=True)
@@ -97,7 +135,7 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path):
         "-accel", "tcg,thread=single",
         "-cpu", cpu,
         "-smp", "1",
-        "-m", "256M",
+        "-m", "1G" if linux else "256M",
         "-display", "none",
         "-monitor", "none",
         "-net", "none",
@@ -112,20 +150,54 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path):
     # The M1 scenarios are long under TCG: run them in one SVM profile.
     if M1_KERNEL and name == "svm":
         argv += ["-fw_cfg", f"name=opt/nanox/kernel-m1.elf,file={M1_KERNEL}"]
+    if linux:
+        argv += [
+            "-fw_cfg", f"name=opt/nanox/bzimage,file={LINUX_KERNEL}",
+            "-fw_cfg", f"name=opt/nanox/initrd,file={linux}",
+            # QEMU's option syntax: a comma in a value is doubled.
+            "-fw_cfg", f"name=opt/nanox/cmdline,string={LINUX_CMDLINE.replace(',', ',,')}",
+        ]
+        if LINUX_HOST_TICK:
+            argv += ["-fw_cfg", f"name=opt/nanox/host-tick-ns,string={LINUX_HOST_TICK}"]
     (d / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
     started = time.monotonic()
     try:
-        p = subprocess.run(argv, capture_output=True, timeout=TIMEOUT_S)
+        p = subprocess.run(argv, capture_output=True,
+                           timeout=LINUX_TIMEOUT_S if linux else TIMEOUT_S)
         status, stderr = p.returncode, p.stderr
     except subprocess.TimeoutExpired as e:
         status, stderr = "timeout", e.stderr or b""
     (d / "stderr.log").write_bytes(stderr)
     text = serial.read_text(errors="replace") if serial.exists() else ""
-    return {
+    lines = text.splitlines()
+    r = {
         "cpu": cpu,
         "status": status,
         "seconds": round(time.monotonic() - started, 1),
-        "serial_lines": [l for l in text.splitlines() if l.startswith("NANOX:SVM-PROBE")],
+        # The guest's own lines stay in serial.log.
+        "serial_lines": [l for l in lines if l.startswith("NANOX:SVM-PROBE")
+                         and not l.startswith(("NANOX:SVM-PROBE:LINUX ",
+                                               "NANOX:SVM-PROBE:LINUX-PROGRESS"))],
+    }
+    if linux:
+        guest = [l[len("NANOX:SVM-PROBE:LINUX "):] for l in lines
+                 if l.startswith("NANOX:SVM-PROBE:LINUX ")]
+        r["linux"] = linux_summary(guest, lines)
+    return r
+
+
+def linux_summary(guest, lines):
+    """What the Linux guest printed: its report, and how far it got."""
+    begin = next((i for i, l in enumerate(guest) if "NANOX_GUEST_REPORT_BEGIN" in l), None)
+    end = next((i for i, l in enumerate(guest) if "NANOX_GUEST_REPORT_END" in l), None)
+    progress = [l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-PROGRESS")]
+    return {
+        "guest_lines": len(guest),
+        "report_complete": begin is not None and end is not None and end > begin,
+        "report": guest[begin:end + 1] if begin is not None and end is not None else None,
+        "last_guest_lines": guest[-20:],
+        "last_progress": progress[-1] if progress else None,
+        "case": next((l for l in lines if l.startswith("NANOX:SVM-PROBE:CASE linux ")), None),
     }
 
 
@@ -240,6 +312,9 @@ def main() -> int:
              "-p", "svm-probe", "--target", "x86_64-unknown-uefi"],
             cwd=ROOT, check=True,
         )
+        if LINUX_KERNEL and not LINUX_INIT:
+            subprocess.run([sys.executable, "tools/native/build.py", "--package",
+                            "linux-probe-init"], cwd=ROOT, check=True)
     if "--repro" in sys.argv:
         return repro(int(option("--runs") or 2))
     code = Path(os.environ["NANOX_OVMF_CODE"])
@@ -259,23 +334,46 @@ def main() -> int:
         "qemu": qemu,
         "profiles": {},
     }
+    profiles = [] if "--linux-only" in sys.argv else list(PROFILES)
+    initrd = None
+    if LINUX_KERNEL:
+        initrd = linux_initrd(out)
+        init = Path(LINUX_INIT) if LINUX_INIT else LINUX_INIT_DEFAULT
+        summary["linux"] = {
+            "kernel": LINUX_KERNEL,
+            "kernel_sha256": sha256(Path(LINUX_KERNEL)),
+            "init": str(init),
+            "init_sha256": sha256(init),
+            "initrd_bytes": initrd.stat().st_size,
+            "initrd_sha256": sha256(initrd),
+            "cmdline": LINUX_CMDLINE,
+            "host_tick_ns": LINUX_HOST_TICK or "probe default",
+        }
+        profiles.append(LINUX_PROFILE)
     ok = True
-    for name, cpu, want_status, want_line in PROFILES:
-        r = run_profile(out, name, cpu, code, vars_src)
+    for name, cpu, want_status, want_line in profiles:
+        r = run_profile(out, name, cpu, code, vars_src,
+                        linux=initrd if name == "linux" else None)
         r["expected_status"] = want_status
         r["expected_line"] = want_line
         r["match"] = r["status"] == want_status and want_line in r["serial_lines"]
         ok &= r["match"]
         summary["profiles"][name] = r
         print(f"{name:7} status={r['status']} match={r['match']} ({r['seconds']} s)")
-    cmp = compare_m0(summary["profiles"]["svm"]["serial_lines"], kernel_sha)
-    summary["m0_comparison"] = cmp
-    for case, c in cmp.items():
-        if c["compared"]:
-            ok &= c["equal"]
-            print(f"{case:9} vs QEMU {c['record']}: equal={c['equal']}")
-        else:
-            print(f"{case:9} not compared: {c['reason']}")
+        if "linux" in r:
+            print(f"        {r['linux']['case']}")
+    if initrd:
+        # The archive is rebuilt from the init on every run; its hash is recorded.
+        initrd.unlink()
+    if "svm" in summary["profiles"]:
+        cmp = compare_m0(summary["profiles"]["svm"]["serial_lines"], kernel_sha)
+        summary["m0_comparison"] = cmp
+        for case, c in cmp.items():
+            if c["compared"]:
+                ok &= c["equal"]
+                print(f"{case:9} vs QEMU {c['record']}: equal={c['equal']}")
+            else:
+                print(f"{case:9} not compared: {c['reason']}")
     summary["match"] = ok
     (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     print(f"records: {out}")
