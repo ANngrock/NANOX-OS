@@ -480,7 +480,7 @@ impl Machine {
     }
 
     /// Which virtio device (its slot) decodes `addr` in its BAR 0, and the offset in it.
-    fn virtio_hit(&self, addr: u64) -> Option<(u8, u64)> {
+    pub fn virtio_hit(&self, addr: u64) -> Option<(u8, u64)> {
         self.virtio_functions()
             .into_iter()
             .find_map(|(dev, t)| match t.cfg.memory_hit(addr) {
