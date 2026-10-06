@@ -217,18 +217,53 @@ impl Scanout for NoScreen {
     fn present(&mut self, _: u32, _: u32, _: Rect) {}
 }
 
-/// The agent channel: bytes from the guest are counted, none go to it.
-#[derive(Default)]
-struct NoAgent {
+/// The agent channel's host end: what the guest sends is counted and its first
+/// [`AGENT_KEEP`] bytes kept; once the guest has sent a whole line, the host
+/// answers with [`AGENT_ANSWER`] (the init's greeting, tools/hostguest/init).
+struct Agent {
     bytes: u64,
+    kept: [u8; AGENT_KEEP],
+    /// How much of the answer the guest has taken; None before the first line.
+    answered: Option<usize>,
 }
 
-impl ConsoleBackend for NoAgent {
-    fn write(&mut self, data: &[u8]) {
-        self.bytes += data.len() as u64;
+const AGENT_KEEP: usize = 256;
+const AGENT_ANSWER: &[u8] = b"NANOX_HOST_HELLO from the NANOX VMM\n";
+
+impl Agent {
+    fn new() -> Self {
+        Self {
+            bytes: 0,
+            kept: [0; AGENT_KEEP],
+            answered: None,
+        }
     }
-    fn read(&mut self, _: &mut [u8]) -> usize {
-        0
+
+    fn kept(&self) -> &[u8] {
+        &self.kept[..(self.bytes as usize).min(AGENT_KEEP)]
+    }
+}
+
+impl ConsoleBackend for Agent {
+    fn write(&mut self, data: &[u8]) {
+        for &b in data {
+            if let Some(k) = self.kept.get_mut(self.bytes as usize) {
+                *k = b;
+            }
+            self.bytes += 1;
+            if b == b'\n' && self.answered.is_none() {
+                self.answered = Some(0);
+            }
+        }
+    }
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        let Some(at) = self.answered else {
+            return 0;
+        };
+        let n = (AGENT_ANSWER.len() - at).min(buf.len());
+        buf[..n].copy_from_slice(&AGENT_ANSWER[at..at + n]);
+        self.answered = Some(at + n);
+        n
     }
 }
 
@@ -595,7 +630,7 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         Dma { base, size: RAM },
         NoNet::default(),
         NoScreen::default(),
-        NoAgent::default(),
+        Agent::new(),
         NoInput,
     );
     let mut host = Host {
@@ -695,7 +730,7 @@ fn progress(env: &mut Env, page: &mut [u8; 4096], o: &Outcome, slice: u64, ticks
     out!("\n");
 }
 
-fn report(o: &Outcome, m: &Machine, slices: u64, net: &NoNet, screen: &NoScreen, agent: &NoAgent) {
+fn report(o: &Outcome, m: &Machine, slices: u64, net: &NoNet, screen: &NoScreen, agent: &Agent) {
     out!(
         " verdict={:?} exits={} slices={} msr_faults={} ud={} irqs={} mmio={} virtual_ms={} serial_bytes={} truncated={} unclaimed_in={} unclaimed_out={} unclaimed_mmio={} other_messages={} pit_coalesced={} blk_requests={} net_sent={} gpu_resources={} agent_bytes={}\n",
         o.verdict,
@@ -718,6 +753,19 @@ fn report(o: &Outcome, m: &Machine, slices: u64, net: &NoNet, screen: &NoScreen,
         screen.resources,
         agent.bytes
     );
+    out!(
+        "NANOX:SVM-PROBE:LINUX-AGENT from_guest={} to_guest={} text=\"",
+        agent.bytes,
+        agent.answered.unwrap_or(0)
+    );
+    for &b in agent.kept() {
+        match b {
+            b'\n' => out!("\\n"),
+            b' '..=b'~' if b != b'"' && b != b'\\' => Serial::byte(b),
+            _ => out!("\\x{b:02x}"),
+        }
+    }
+    out!("\"\n");
 }
 
 /// The guest's screen: `NANOX:SVM-PROBE:LINUX-SCREEN width= height=`, then

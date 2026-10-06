@@ -1,5 +1,7 @@
 //! Init for the measurement boot: mounts the pseudo file systems, prints what
-//! the guest kernel reports about its machine on the console, and powers off.
+//! the guest kernel reports about its machine on the console, greets the host
+//! on the agent channel (virtio-console, `/dev/hvc0`) when there is one, and
+//! powers off.
 //! Raw Linux system calls, no libc: the same kind of freestanding static
 //! program a NANOX native process is.
 
@@ -13,11 +15,24 @@ const SYS_READ: usize = 0;
 const SYS_WRITE: usize = 1;
 const SYS_OPEN: usize = 2;
 const SYS_CLOSE: usize = 3;
+const SYS_POLL: usize = 7;
+const SYS_IOCTL: usize = 16;
 const SYS_DUP2: usize = 33;
 const SYS_MKDIR: usize = 83;
 const SYS_MOUNT: usize = 165;
 const SYS_REBOOT: usize = 169;
 const SYS_EXIT_GROUP: usize = 231;
+const O_RDWR: usize = 2;
+const O_NOCTTY: usize = 0o400;
+const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+/// `c_oflag`: output processing (`\n` to `\r\n`).
+const OPOST: u32 = 0o1;
+/// `c_lflag`: echo of the input.
+const ECHO: u32 = 0o10;
+const POLLIN: u16 = 1;
+/// How long the host may take to answer on the agent channel.
+const AGENT_WAIT_MS: usize = 1000;
 
 unsafe fn syscall(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
     let ret: isize;
@@ -146,6 +161,52 @@ fn pci_devices() {
     }
 }
 
+/// The agent channel (virtio-console port 0, `/dev/hvc0`): one line to the
+/// host, and its answer line (if it comes within [`AGENT_WAIT_MS`]) on the console.
+fn agent() {
+    write(1, b"--- agent\n");
+    let mut b = [0u8; 128];
+    let p = path("/dev/hvc0", &mut b);
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { syscall(SYS_OPEN, p, O_RDWR | O_NOCTTY, 0, 0, 0) };
+    if fd < 0 {
+        write(1, b"(not available)\n");
+        return;
+    }
+    let fd = fd as usize;
+    // The kernel's struct termios: four flag words, the line discipline and 19
+    // control characters. Raw output and no echo: the host gets exactly the
+    // bytes written, and its answer is not sent back to it.
+    let mut t = [0u32; 9];
+    // SAFETY: a buffer of the kernel's termios size for TCGETS and TCSETS.
+    unsafe {
+        if syscall(SYS_IOCTL, fd, TCGETS, t.as_mut_ptr() as usize, 0, 0) == 0 {
+            t[1] &= !OPOST;
+            t[3] &= !ECHO;
+            syscall(SYS_IOCTL, fd, TCSETS, t.as_ptr() as usize, 0, 0);
+        }
+    }
+    write(fd, b"NANOX_AGENT_HELLO\n");
+    // struct pollfd: fd, events, revents.
+    let mut pfd = [fd as u32, u32::from(POLLIN)];
+    // SAFETY: one pollfd; the canonical tty returns one line per read.
+    let ready = unsafe { syscall(SYS_POLL, pfd.as_mut_ptr() as usize, 1, AGENT_WAIT_MS, 0, 0) };
+    let mut line = [0u8; 128];
+    let n = if ready > 0 {
+        // SAFETY: a valid buffer.
+        unsafe { syscall(SYS_READ, fd, line.as_mut_ptr() as usize, line.len(), 0, 0) }
+    } else {
+        0
+    };
+    if n > 0 {
+        write(1, &line[..n as usize]);
+    } else {
+        write(1, b"(no answer)\n");
+    }
+    // SAFETY: closing the descriptor we opened.
+    unsafe { syscall(SYS_CLOSE, fd, 0, 0, 0, 0) };
+}
+
 #[no_mangle]
 extern "C" fn init_main() -> ! {
     mkdir("/dev");
@@ -174,6 +235,7 @@ extern "C" fn init_main() -> ! {
     );
     cat("devices", "/proc/devices");
     pci_devices();
+    agent();
     write(1, b"NANOX_GUEST_REPORT_END\n");
     // SAFETY: the reboot system call with the documented magic numbers; power off.
     unsafe { syscall(SYS_REBOOT, 0xfee1dead, 672274793, 0x4321fedc, 0, 0) };

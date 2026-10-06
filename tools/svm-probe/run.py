@@ -281,6 +281,7 @@ def linux_summary(guest, lines):
         "last_guest_lines": guest[-20:],
         "last_progress": progress[-1] if progress else None,
         "case": next((l for l in lines if l.startswith("NANOX:SVM-PROBE:CASE linux ")), None),
+        "agent": next((l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-AGENT ")), None),
     }
 
 
