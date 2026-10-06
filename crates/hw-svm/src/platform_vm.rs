@@ -62,6 +62,9 @@ pub const MSR_TSC: u32 = 0x10;
 pub const MSR_MTRR_CAP: u32 = 0xFE;
 pub const MSR_MTRR_DEF_TYPE: u32 = 0x2FF;
 pub const MSR_EFER: u32 = 0xC000_0080;
+/// AMD K8 interrupt-pending message register: Linux reads it on family 0Fh processors (erratum
+/// 400, C1E) with a plain RDMSR. Reads as 0: no message, C1E off.
+pub const MSR_K8_INT_PENDING_MSG: u32 = 0xC001_0055;
 /// IA32_MTRR_DEF_TYPE as firmware leaves it: MTRRs enabled, default type
 /// write-back. With no variable or fixed ranges offered it is the type of
 /// all memory.
@@ -119,7 +122,11 @@ pub fn linux_cpuid(leaf: u32, sub: u32, r: &mut [u32; 4]) {
     const CET_SS: u32 = 1 << 7;
     const LA57: u32 = 1 << 16;
     const CET_IBT: u32 = 1 << 20;
+    // No machine-check architecture: Linux would read MCG_CAP (0x179), which the VMM does not have.
+    const MCE: u32 = 1 << 7;
+    const MCA: u32 = 1 << 14;
     match leaf {
+        1 => r[3] &= !(MCE | MCA),
         7 if sub == 0 => {
             r[2] &= !(UMIP | CET_SS | LA57);
             r[3] &= !CET_IBT;
@@ -172,7 +179,8 @@ impl<'s> PlatformVcpu<'s> {
     /// Emulated on exit: IA32_APIC_BASE (the machine's local APIC), EFER
     /// (Linux sets SCE and NXE with RDMSR/WRMSR before it has an IDT),
     /// MTRRcap (no ranges, no fixed ranges, no WC) and MTRRdefType (a
-    /// register, [`MTRR_DEF_TYPE_RESET`] at first). Every other MSR gets #GP,
+    /// register, [`MTRR_DEF_TYPE_RESET`] at first), the K8 interrupt-pending message (reads 0,
+    /// writes #GP). Every other MSR gets #GP,
     /// which Linux turns into a warning for its plain RDMSR/WRMSR.
     pub fn msr_policy(map: &mut MsrPermissionMap<'_>) {
         Vcpu::msr_policy(map);
@@ -224,7 +232,7 @@ impl<'s> PlatformVcpu<'s> {
         match msr {
             lapic::MSR_APIC_BASE => Some(self.machine.lapic.read_msr()),
             MSR_EFER => Some(vmcb.read_u64(save::EFER) & !bits::EFER_SVME),
-            MSR_MTRR_CAP => Some(0),
+            MSR_MTRR_CAP | MSR_K8_INT_PENDING_MSG => Some(0),
             MSR_MTRR_DEF_TYPE => Some(self.mtrr_def_type),
             _ => None,
         }

@@ -91,7 +91,14 @@ pub struct LinuxConfig<'a> {
     /// (reported as ACPI memory in the e820 map). The region must lie in the RAM between
     /// 1 MiB and 4 GiB, contain the 20-byte RSDP and not overlap the kernel or the initrd.
     pub acpi: Option<Acpi>,
+    /// Device ranges to report as reserved in the e820 map, e.g. the PCI configuration window
+    /// (Linux only uses an ECAM window it finds reserved): at most [`MAX_RESERVED`], ascending,
+    /// not overlapping, each between [`LOW_RAM_LIMIT`] and 4 GiB (never RAM).
+    pub reserved: &'a [(u64, u64)],
 }
+
+/// Reserved ranges a [`LinuxConfig`] may carry.
+pub const MAX_RESERVED: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Acpi {
@@ -160,6 +167,9 @@ pub enum LinuxError {
     /// The ACPI region overlaps something the loader places, or is not RAM, or the RSDP
     /// is not inside it.
     BadAcpiRegion,
+    /// A reserved range is empty, overlaps RAM or another one, is out of order, or there are
+    /// more than [`MAX_RESERVED`].
+    BadReserved,
 }
 
 fn u16_at(b: &[u8], o: usize) -> u16 {
@@ -230,7 +240,7 @@ struct Plan {
     hdr: SetupHeader,
     load: u64,
     initrd: u64,
-    e820: [(u64, u64, u32); 8],
+    e820: [(u64, u64, u32); 8 + MAX_RESERVED],
     e820_len: usize,
 }
 
@@ -278,7 +288,7 @@ fn plan(image: &[u8], initrd_len: u64, cfg: &LinuxConfig<'_>) -> Result<Plan, Li
     };
     // The e820 map: conventional memory, the EBDA and the BIOS area, low RAM (with the ACPI
     // region cut out), RAM above 4 GiB.
-    let mut e820 = [(0u64, 0u64, 0u32); 8];
+    let mut e820 = [(0u64, 0u64, 0u32); 8 + MAX_RESERVED];
     let mut n = 0;
     let mut push = |start: u64, len: u64, kind: u32| {
         if len > 0 {
@@ -310,6 +320,21 @@ fn plan(image: &[u8], initrd_len: u64, cfg: &LinuxConfig<'_>) -> Result<Plan, Li
             push(after, low_end - after, E820_RAM);
         }
         None => push(MIN_LOAD_ADDRESS, low_end - MIN_LOAD_ADDRESS, E820_RAM),
+    }
+    // Device ranges between the low RAM and 4 GiB, in order.
+    if cfg.reserved.len() > MAX_RESERVED {
+        return Err(LinuxError::BadReserved);
+    }
+    let mut floor = LOW_RAM_LIMIT;
+    for &(start, len) in cfg.reserved {
+        let fits = start
+            .checked_add(len)
+            .is_some_and(|end| end <= HIGH_RAM_BASE);
+        if len == 0 || start < floor || !fits {
+            return Err(LinuxError::BadReserved);
+        }
+        push(start, len, E820_RESERVED);
+        floor = start + len;
     }
     push(
         HIGH_RAM_BASE,

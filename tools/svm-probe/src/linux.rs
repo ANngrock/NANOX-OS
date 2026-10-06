@@ -38,7 +38,7 @@ use hw_svm::vmcb::{ctl, Gprs};
 use hw_svm::vmm::{Outcome, Verdict, VmConfig};
 use hw_svm::{Clock, Npt, NptPerms, SvmCpu, Vmcb, PAGE_SIZE};
 use vmm_devices::acpi::{self, Platform};
-use vmm_devices::machine::Machine;
+use vmm_devices::machine::{Machine, ECAM_BASE, ECAM_SIZE};
 use vmm_devices::virtio::GuestMemory;
 use vmm_devices::virtio_blk::{BlockBackend, SECTOR};
 use vmm_devices::virtio_console::ConsoleBackend;
@@ -455,6 +455,8 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
             region_gpa: ACPI_GPA,
             region_len: (layout.len as u64).next_multiple_of(PAGE_SIZE),
         }),
+        // Linux uses an ECAM window only when it finds it reserved.
+        reserved: &[(ECAM_BASE, ECAM_SIZE)],
     };
     let entry = match linux::load_linux(&mut ram, image, initrd, &cfg) {
         Ok(e) => e,

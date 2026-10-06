@@ -135,6 +135,7 @@ fn cfg(ram: u64) -> LinuxConfig<'static> {
         ram_bytes: ram,
         cmdline: b"console=ttyS0 quiet",
         acpi: None,
+        reserved: &[],
     }
 }
 
@@ -989,4 +990,90 @@ fn a_one_byte_ram_entry_is_still_an_entry() {
     };
     load_linux(&mut m, &Img::new().bytes(), &[], &c).unwrap();
     assert_eq!(e820(&m).last(), Some(&(256 * MIB - 1, 1, E820_RAM)));
+}
+
+// ------------------------------------------------------------ reserved ranges
+
+#[test]
+fn reserved_device_ranges_go_into_the_e820_map_in_order() {
+    let ecam = (0xB000_0000u64, 0x1000_0000u64);
+    let mut m = Sparse::new();
+    let c = LinuxConfig {
+        reserved: &[ecam, (0xFEC0_0000, 0x1000)],
+        ..cfg(8 << 30)
+    };
+    let e = load_linux(&mut m, &Img::new().bytes(), &[], &c).unwrap();
+    assert_eq!(
+        e820(&m),
+        [
+            (0, 0x9_FC00, E820_RAM),
+            (0x9_FC00, 0x400, E820_RESERVED),
+            (0xF_0000, 0x1_0000, E820_RESERVED),
+            (MIB, LOW_RAM_LIMIT - MIB, E820_RAM),
+            (0xB000_0000, 0x1000_0000, E820_RESERVED),
+            (0xFEC0_0000, 0x1000, E820_RESERVED),
+            (1 << 32, (8 << 30) - LOW_RAM_LIMIT, E820_RAM),
+        ]
+    );
+    assert_eq!(e.e820_entries, 7);
+    // as many as allowed, back to back, the last one ending exactly at 4 GiB
+    let four = [
+        (0xB000_0000, 0x1000),
+        (0xB000_1000, 0x1000),
+        (0xC000_0000, 0x10),
+        (0xFFFF_F000, 0x1000),
+    ];
+    let mut m = Sparse::new();
+    assert!(load_linux(
+        &mut m,
+        &Img::new().bytes(),
+        &[],
+        &LinuxConfig {
+            reserved: &four,
+            ..cfg(256 * MIB)
+        }
+    )
+    .is_ok());
+    assert_eq!(e820(&m).len(), 4 + 4);
+    assert_eq!(MAX_RESERVED, 4);
+}
+
+#[test]
+fn bad_reserved_ranges_are_refused() {
+    let five = [
+        (0xB000_0000, 1),
+        (0xB000_0001, 1),
+        (0xB000_0002, 1),
+        (0xB000_0003, 1),
+        (0xB000_0004, 1),
+    ];
+    for (name, r) in [
+        ("empty", vec![(0xB000_0000u64, 0u64)]),
+        ("in the low RAM", vec![(LOW_RAM_LIMIT - 0x1000, 0x2000)]),
+        ("below the RAM limit", vec![(0x8000_0000, 0x1000)]),
+        ("beyond 4 GiB", vec![(0xFFFF_F000, 0x1001)]),
+        ("at 4 GiB", vec![(1 << 32, 0x1000)]),
+        ("overflows", vec![(0xB000_0000, u64::MAX)]),
+        (
+            "out of order",
+            vec![(0xC000_0000, 0x1000), (0xB000_0000, 0x1000)],
+        ),
+        (
+            "overlapping",
+            vec![(0xB000_0000, 0x2000), (0xB000_1000, 0x1000)],
+        ),
+        ("too many", five.to_vec()),
+    ] {
+        let c = LinuxConfig {
+            reserved: &r,
+            ..cfg(256 * MIB)
+        };
+        let mut m = Sparse::new();
+        assert_eq!(
+            load_linux(&mut m, &Img::new().bytes(), &[], &c),
+            Err(LinuxError::BadReserved),
+            "{name}"
+        );
+        assert_eq!(m.writes, 0, "{name}: nothing written");
+    }
 }

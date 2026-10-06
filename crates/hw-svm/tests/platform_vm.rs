@@ -1197,6 +1197,7 @@ const EFER: u32 = 0xC000_0080;
 const TSC: u32 = 0x10;
 const MTRR_CAP: u32 = 0xFE;
 const MTRR_DEF_TYPE: u32 = 0x2FF;
+const INT_PENDING_MSG: u32 = 0xC001_0055;
 
 #[test]
 fn msr_policy_for_linux() {
@@ -1216,6 +1217,8 @@ fn msr_policy_for_linux() {
         wr_gp(TSC, 5),
         rd(MTRR_CAP),
         wr_gp(MTRR_CAP, 0),
+        rd(INT_PENDING_MSG),
+        wr_gp(INT_PENDING_MSG, 0),
         rd(MTRR_DEF_TYPE),
     ];
     // Every valid default type, with FE and E; reserved types and bits.
@@ -1233,11 +1236,11 @@ fn msr_policy_for_linux() {
     let mut v = PlatformVcpu::new(rig.cfg, machine(), &mut serial);
     let o = run_platform(&mut rig, &mut v, &mut World::new().host());
     assert_eq!(o.verdict, PASS);
-    let mut want = vec![long, long | sce, 0xFEE0_0900, 0x1234_5678_9ABC, 0];
+    let mut want = vec![long, long | sce, 0xFEE0_0900, 0x1234_5678_9ABC, 0, 0];
     want.push(0x806); // MTRRs on, write-back
     want.extend([0xC00, 0xC01, 0xC04, 0xC05, 0xC06, 0xC06]);
     assert_eq!(rig.cpu.rdmsr_results, want);
-    assert_eq!(o.msr_faults, 4 + 1 + 1 + 7 + 1);
+    assert_eq!(o.msr_faults, 4 + 1 + 1 + 1 + 7 + 1);
     assert_eq!(
         rig.vmcb().read_u64(save::EFER),
         long | sce | bits::EFER_SVME,
@@ -1389,8 +1392,13 @@ fn cpuid_for_linux() {
     assert_eq!(r[2], [0; 4], "no SME/SEV");
     assert_eq!(
         r[3],
-        [0x00A5_0F00, 0x0010_0800, 0x7ED8_3203 | 1 << 31, 0x178B_FBFF],
-        "hypervisor present; VMX, MONITOR, x2APIC, TSC-deadline hidden"
+        [
+            0x00A5_0F00,
+            0x0010_0800,
+            0x7ED8_3203 | 1 << 31,
+            0x178B_FBFF & !(1 << 7 | 1 << 14)
+        ],
+        "hypervisor present; VMX, MONITOR, x2APIC, TSC-deadline, MCE and MCA hidden"
     );
     // "NanoxVMM": the hypervisor's highest leaf, then the signature.
     let sig = [0x6F6E_614E, 0x4D4D_5678, 0];

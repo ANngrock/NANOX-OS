@@ -15,7 +15,7 @@ use hw_svm::vmcb::{save, Vmcb};
 use hw_svm::vmm::Verdict;
 use vmm_devices::acpi::{self as tables, Platform};
 use vmm_devices::acpi_pm::{PM1_CONTROL, SLEEP_S5};
-use vmm_devices::machine::Machine;
+use vmm_devices::machine::{Machine, ECAM_BASE, ECAM_SIZE};
 use vmm_devices::virtio::GuestMemory as Dma;
 use vmm_devices::virtio_blk::{BlockBackend, SECTOR};
 use vmm_devices::virtio_console::ConsoleBackend;
@@ -174,6 +174,8 @@ fn a_loaded_kernel_starts_at_its_entry_prints_and_powers_off() {
             region_gpa: ACPI_AT,
             region_len: layout.len as u64,
         }),
+        // Linux uses an ECAM window only when it finds it reserved.
+        reserved: &[(ECAM_BASE, ECAM_SIZE)],
     };
     let entry = linux::load_linux(&mut RigRam { rig: &mut rig }, &image, &initrd, &cfg).unwrap();
     assert_eq!(entry.rip, 0x10_0200);
