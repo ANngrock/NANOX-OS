@@ -116,6 +116,44 @@ impl GuestMemory for Dma {
 /// No disk: virtio-blk has capacity 0 and refuses every request.
 struct NoDisk;
 
+/// A disk image in memory (fw_cfg `opt/nanox/disk`): whole sectors, reads and writes counted.
+struct MemDisk {
+    data: &'static mut [u8],
+    reads: u64,
+    writes: u64,
+}
+
+impl BlockBackend for MemDisk {
+    fn sectors(&self) -> u64 {
+        (self.data.len() / SECTOR) as u64
+    }
+    fn read(&mut self, sector: u64, buf: &mut [u8; SECTOR]) -> bool {
+        let at = sector as usize * SECTOR;
+        match self.data.get(at..at + SECTOR) {
+            Some(s) => {
+                buf.copy_from_slice(s);
+                self.reads += 1;
+                true
+            }
+            None => false,
+        }
+    }
+    fn write(&mut self, sector: u64, data: &[u8; SECTOR]) -> bool {
+        let at = sector as usize * SECTOR;
+        match self.data.get_mut(at..at + SECTOR) {
+            Some(s) => {
+                s.copy_from_slice(data);
+                self.writes += 1;
+                true
+            }
+            None => false,
+        }
+    }
+    fn flush(&mut self) -> bool {
+        true
+    }
+}
+
 impl BlockBackend for NoDisk {
     fn sectors(&self) -> u64 {
         0
@@ -398,6 +436,18 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         Err(_) => DEFAULT_CMDLINE,
     };
     let tick = host_tick();
+    // An optional disk image for virtio-blk.
+    let mut disk_image: Option<&'static mut [u8]> = None;
+    if let Ok(f) = fwcfg::find("opt/nanox/disk") {
+        let Some(buf) = allocate(system, f.size) else {
+            return fail(env, "allocate-disk");
+        };
+        if fwcfg::read_into(f, buf).is_err() {
+            return fail(env, "fw-cfg-disk");
+        }
+        out!("NANOX:SVM-PROBE:LINUX-DISK bytes={}\n", f.size);
+        disk_image = Some(buf);
+    }
     let ram_pages = (RAM / PAGE_SIZE) as usize;
     let region = (ram_pages + NPT_PAGES) * PAGE_SIZE as usize;
     let (Some(region_buf), Some(image_buf), Some(initrd_buf)) = (
@@ -499,9 +549,18 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     };
     env.cpu.ram = GuestMap::Contig { base, size: RAM };
 
-    let (mut mem, mut disk, mut net, mut screen, mut agent, mut input) = (
+    let mut no_disk = NoDisk;
+    let mut mem_disk = disk_image.map(|data| MemDisk {
+        data,
+        reads: 0,
+        writes: 0,
+    });
+    let disk: &mut dyn BlockBackend = match mem_disk.as_mut() {
+        Some(d) => d,
+        None => &mut no_disk,
+    };
+    let (mut mem, mut net, mut screen, mut agent, mut input) = (
         Dma { base, size: RAM },
-        NoDisk,
         NoNet::default(),
         NoScreen::default(),
         NoAgent::default(),
@@ -509,7 +568,7 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     );
     let mut host = Host {
         mem: &mut mem,
-        disk: &mut disk,
+        disk,
         net: &mut net,
         display: &mut screen,
         console: &mut agent,

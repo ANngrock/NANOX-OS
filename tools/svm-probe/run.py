@@ -5,7 +5,7 @@ Run inside `nix develop` (pinned QEMU, NANOX_OVMF_CODE/NANOX_OVMF_VARS):
 
     python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH] [--repro [--runs N]]
         [--linux-kernel BZIMAGE [--linux-init ELF] [--linux-cmdline TEXT] [--linux-only]
-         [--linux-host-tick NS|off] [--linux-timeout S]]
+         [--linux-host-tick NS|off] [--linux-timeout S] [--linux-disk IMAGE]]
 
 With --repro the svm profile runs N times (default 2) with identical inputs
 and the per-case digest (verdict, every counter and the serial bytes) of each
@@ -106,6 +106,8 @@ LINUX_CMDLINE = option("--linux-cmdline") or " ".join([
 # (the probe's default when absent: no tick, a run independent of host timing;
 # fw_cfg opt/nanox/host-tick-ns).
 LINUX_HOST_TICK = option("--linux-host-tick")
+# A disk image for the guest's virtio-blk; without one a small test disk is made.
+LINUX_DISK = option("--linux-disk")
 LINUX_TIMEOUT_S = int(option("--linux-timeout") or 7200)
 LINUX_PROFILE = ("linux", f"qemu64,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PASS")
 
@@ -121,7 +123,23 @@ def linux_initrd(out: Path) -> Path:
     return img
 
 
-def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linux=None):
+def linux_test_disk(out: Path) -> Path:
+    """A 4 MiB disk with an MBR and one Linux partition from sector 2048, whose first
+    sector carries a marker: Linux reads the table and prints `vda: vda1`."""
+    sectors = 8192
+    disk = bytearray(sectors * 512)
+    entry = bytes([0x00, 0, 0, 0, 0x83, 0, 0, 0])
+    entry += (2048).to_bytes(4, "little") + (sectors - 2048).to_bytes(4, "little")
+    disk[446:462] = entry
+    disk[510:512] = bytes([0x55, 0xAA])
+    marker = b"NANOX virtio-blk test disk" + bytes([0x0A])
+    disk[2048 * 512:2048 * 512 + len(marker)] = marker
+    img = out / "disk.img"
+    img.write_bytes(bytes(disk))
+    return img
+
+
+def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linux=None, disk=None):
     d = out / name
     esp = d / "esp/EFI/BOOT"
     esp.mkdir(parents=True)
@@ -160,6 +178,8 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
         ]
         if LINUX_HOST_TICK:
             argv += ["-fw_cfg", f"name=opt/nanox/host-tick-ns,string={LINUX_HOST_TICK}"]
+        if disk:
+            argv += ["-fw_cfg", f"name=opt/nanox/disk,file={disk}"]
     (d / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
     started = time.monotonic()
     try:
@@ -337,8 +357,10 @@ def main() -> int:
     }
     profiles = [] if "--linux-only" in sys.argv else list(PROFILES)
     initrd = None
+    disk = None
     if LINUX_KERNEL:
         initrd = linux_initrd(out)
+        disk = Path(LINUX_DISK) if LINUX_DISK else linux_test_disk(out)
         init = Path(LINUX_INIT) if LINUX_INIT else LINUX_INIT_DEFAULT
         summary["linux"] = {
             "kernel": LINUX_KERNEL,
@@ -349,12 +371,15 @@ def main() -> int:
             "initrd_sha256": sha256(initrd),
             "cmdline": LINUX_CMDLINE,
             "host_tick_ns": LINUX_HOST_TICK or "probe default",
+            "disk": str(disk),
+            "disk_sha256": sha256(disk),
         }
         profiles.append(LINUX_PROFILE)
     ok = True
     for name, cpu, want_status, want_line in profiles:
         r = run_profile(out, name, cpu, code, vars_src,
-                        linux=initrd if name == "linux" else None)
+                        linux=initrd if name == "linux" else None,
+                        disk=disk if name == "linux" else None)
         r["expected_status"] = want_status
         r["expected_line"] = want_line
         r["match"] = r["status"] == want_status and want_line in r["serial_lines"]
