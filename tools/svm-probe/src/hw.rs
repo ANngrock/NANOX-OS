@@ -16,6 +16,15 @@ pub fn outw(port: u16, value: u16) {
     unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) }
 }
 
+/// OUT of a 32-bit value that starts a device's DMA (the fw_cfg DMA address
+/// register): without `nomem`, so the compiler keeps the memory the device
+/// reads and writes in place around it.
+pub fn outl(port: u16, value: u32) {
+    // SAFETY: as in `outb`; the only DMA started is fw_cfg's, into a buffer
+    // the caller owns.
+    unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nostack)) }
+}
+
 pub fn inb(port: u16) -> u8 {
     let value;
     // SAFETY: as in `outb`.
@@ -70,6 +79,29 @@ pub fn cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
 pub fn interrupts_off() {
     // SAFETY: the probe never returns to firmware and needs no interrupts.
     unsafe { asm!("cli", options(nomem, nostack)) }
+}
+
+/// `pages` 4 KiB pages of EfiLoaderData anywhere, from the firmware's boot
+/// services (UEFI 2.10 §7.2 AllocatePages; EFI_SYSTEM_TABLE.BootServices at
+/// 0x60, EFI_BOOT_SERVICES.AllocatePages at 0x28): the `linux` case needs
+/// hundreds of MiB, which a static pool would add to the image every profile
+/// loads. OVMF identity-maps all memory, so the address is also a pointer.
+/// Interrupts stay off: AllocatePages raises the TPL to TPL_NOTIFY only, and
+/// returning from it re-enables interrupts only below TPL_HIGH_LEVEL.
+pub fn allocate_pages(system: *mut u8, pages: usize) -> Option<u64> {
+    type AllocatePages = unsafe extern "efiapi" fn(u32, u32, usize, *mut u64) -> usize;
+    const ALLOCATE_ANY_PAGES: u32 = 0;
+    const EFI_LOADER_DATA: u32 = 2;
+    let mut addr = 0u64;
+    // SAFETY: `system` is the EFI_SYSTEM_TABLE the firmware passed to
+    // efi_main; boot services are still active (the probe never calls
+    // ExitBootServices), so the table and the function are valid.
+    let status = unsafe {
+        let boot = *(system.add(0x60) as *const *const u8);
+        let f: AllocatePages = core::mem::transmute(*(boot.add(0x28) as *const usize));
+        f(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, &mut addr)
+    };
+    (status == 0).then_some(addr)
 }
 
 /// Ends the QEMU run through isa-debug-exit: status `(value << 1) | 1`.
