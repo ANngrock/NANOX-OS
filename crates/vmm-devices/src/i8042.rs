@@ -5,13 +5,18 @@
 //! and what the host feeds it afterwards ([`I8042::push_scancode`], set 2,
 //! translated to set 1 when the command byte asks for it, as a PC does).
 //!
-//! There is no mouse: the auxiliary port is disabled, commands sent to it
-//! are counted and get no answer, so a driver's probe times out as on a
-//! machine without one. The controller is instantaneous: the input buffer is
-//! never full. Interrupt: [`I8042::irq1`] is high while the output buffer
-//! holds a byte and the command byte enables it; a PC's controller drops the
-//! line when its buffer is read and raises it again with the next byte, so a
-//! read that brings the next queued byte in is an edge of its own
+//! The auxiliary port has a PS/2 mouse (what Linux's psmouse meets: reset,
+//! identify, rate, resolution, scaling, status, stream and remote mode,
+//! reporting on and off, and the IntelliMouse wheel, switched on by the rates
+//! 200, 100, 80), fed by the host ([`I8042::push_mouse`]); the controller's
+//! loopback (0xD3) and aux test (0xA9) answer as on a PC. The keyboard's and
+//! the mouse's bytes share the output buffer in order; the status says whose
+//! the next one is (AUXB). The controller is instantaneous: the input buffer
+//! is never full. Interrupts: [`I8042::irq1`] is high while the output buffer
+//! holds a keyboard byte, [`I8042::irq12`] while it holds a mouse byte, each
+//! when the command byte enables it; a PC's controller drops the line when its
+//! buffer is read and raises it again with the next byte, so a read that
+//! brings the next queued byte in is an edge of its own
 //! ([`I8042::take_reloaded`]). The output port carries the
 //! A20 gate (bit 1, [`I8042::a20_enabled`]) and the reset line (a command
 //! 0xFE or a write with bit 0 clear raises [`I8042::take_reset`]).
@@ -24,10 +29,21 @@ const STATUS_OBF: u8 = 1;
 const STATUS_SYS: u8 = 4;
 const STATUS_COMMAND: u8 = 8;
 const STATUS_UNLOCKED: u8 = 0x10;
+/// The byte in the output buffer is the mouse's.
+const STATUS_AUXB: u8 = 0x20;
 const CMD_INT: u8 = 1;
+const CMD_INT2: u8 = 2;
 const CMD_SYS: u8 = 4;
 const CMD_KBD_OFF: u8 = 0x10;
+const CMD_AUX_OFF: u8 = 0x20;
 const CMD_XLAT: u8 = 0x40;
+/// Mouse buttons for [`I8042::push_mouse`].
+pub const MOUSE_LEFT: u8 = 1;
+pub const MOUSE_RIGHT: u8 = 2;
+pub const MOUSE_MIDDLE: u8 = 4;
+/// The mouse's identity: a plain PS/2 mouse, or an IntelliMouse with a wheel.
+pub const MOUSE_ID: u8 = 0;
+pub const MOUSE_ID_WHEEL: u8 = 3;
 const ACK: u8 = 0xFA;
 const RESEND: u8 = 0xFE;
 
@@ -63,13 +79,48 @@ enum Next {
     KeyboardArg(u8),
 }
 
+/// The PS/2 mouse behind the auxiliary port.
+#[derive(Clone, Debug)]
+struct Mouse {
+    reporting: bool,
+    remote: bool,
+    scaling2: bool,
+    rate: u8,
+    resolution: u8,
+    id: u8,
+    /// The last three sample rates set (the IntelliMouse knock).
+    rates: [u8; 3],
+    /// The argument of command 0xF3 or 0xE8 comes next.
+    arg: Option<u8>,
+    buttons: u8,
+}
+
+impl Mouse {
+    const fn new() -> Self {
+        Self {
+            reporting: false,
+            remote: false,
+            scaling2: false,
+            rate: 100,
+            resolution: 2,
+            id: MOUSE_ID,
+            rates: [0; 3],
+            arg: None,
+            buttons: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct I8042 {
     command: u8,
     output_port: u8,
     queue: [u8; QUEUE],
+    /// Whether each queued byte is the mouse's.
+    from_aux: [bool; QUEUE],
     len: usize,
     last_was_command: bool,
+    mouse: Mouse,
     next: Next,
     scanning: bool,
     scancode_set: u8,
@@ -97,8 +148,10 @@ impl I8042 {
             command: CMD_INT | CMD_SYS | CMD_XLAT,
             output_port: 0x03,
             queue: [0; QUEUE],
+            from_aux: [false; QUEUE],
             len: 0,
             last_was_command: false,
+            mouse: Mouse::new(),
             next: Next::Keyboard,
             scanning: true,
             scancode_set: 2,
@@ -131,9 +184,45 @@ impl I8042 {
         core::mem::take(&mut self.reset_requested)
     }
 
-    /// The keyboard IRQ line.
+    /// The keyboard IRQ line: a keyboard byte waits and the command byte enables it.
     pub fn irq1(&self) -> bool {
-        self.len > 0 && self.command & CMD_INT != 0
+        self.len > 0 && !self.from_aux[0] && self.command & CMD_INT != 0
+    }
+
+    /// The mouse IRQ line: a mouse byte waits and the command byte enables it.
+    pub fn irq12(&self) -> bool {
+        self.len > 0 && self.from_aux[0] && self.command & CMD_INT2 != 0
+    }
+
+    /// The mouse's identity as the guest last set it ([`MOUSE_ID`] or [`MOUSE_ID_WHEEL`]).
+    pub fn mouse_id(&self) -> u8 {
+        self.mouse.id
+    }
+
+    /// The host moves the mouse by (`dx`, `dy`) — right and up are positive,
+    /// as PS/2 counts them — with `buttons` held ([`MOUSE_LEFT`] and the
+    /// others) and the wheel turned `wheel` notches (positive: towards the
+    /// user). Becomes one packet (three bytes, four with the wheel) if the
+    /// guest has reporting on in stream mode and the port enabled, and the
+    /// whole packet fits the buffer; else it is counted in `dropped`.
+    /// Movements beyond ±255 (±8 notches) are cut to the range.
+    pub fn push_mouse(&mut self, dx: i32, dy: i32, buttons: u8, wheel: i32) {
+        let m = &self.mouse;
+        let size = if m.id == MOUSE_ID_WHEEL { 4 } else { 3 };
+        if !m.reporting || m.remote || self.command & CMD_AUX_OFF != 0 || QUEUE - self.len < size {
+            self.dropped += 1;
+            return;
+        }
+        let (dx, dy) = (dx.clamp(-255, 255), dy.clamp(-255, 255));
+        let buttons = buttons & 7;
+        self.mouse.buttons = buttons;
+        let first = 0x08 | buttons | u8::from(dx < 0) << 4 | u8::from(dy < 0) << 5;
+        for b in [first, dx as u8, dy as u8] {
+            self.enqueue_aux(b);
+        }
+        if size == 4 {
+            self.enqueue_aux(wheel.clamp(-8, 7) as u8 & 0x0F);
+        }
     }
 
     /// Whether the output buffer was read and refilled from the queue since the
@@ -159,11 +248,20 @@ impl I8042 {
     }
 
     fn enqueue(&mut self, b: u8) {
+        self.enqueue_from(b, false);
+    }
+
+    fn enqueue_aux(&mut self, b: u8) {
+        self.enqueue_from(b, true);
+    }
+
+    fn enqueue_from(&mut self, b: u8, aux: bool) {
         if self.len == QUEUE {
             self.dropped += 1;
             return;
         }
         self.queue[self.len] = b;
+        self.from_aux[self.len] = aux;
         self.len += 1;
     }
 
@@ -204,6 +302,9 @@ impl I8042 {
                 let mut s = STATUS_UNLOCKED;
                 if self.len > 0 {
                     s |= STATUS_OBF;
+                    if self.from_aux[0] {
+                        s |= STATUS_AUXB;
+                    }
                 }
                 if self.command & CMD_SYS != 0 {
                     s |= STATUS_SYS;
@@ -218,6 +319,7 @@ impl I8042 {
             } else {
                 let b = self.queue[0];
                 self.queue.copy_within(1..self.len, 0);
+                self.from_aux.copy_within(1..self.len, 0);
                 self.len -= 1;
                 self.last_sent = b;
                 self.reloaded = self.len > 0;
@@ -253,8 +355,9 @@ impl I8042 {
             0x20 => self.enqueue(self.command),
             0x21..=0x3F => self.enqueue(0),
             0x60..=0x7F => self.next = Next::Controller(c),
-            0xA7 | 0xA8 => {} // the auxiliary port stays disabled: there is none
-            0xA9 => self.enqueue(0x00), // "test passed": the port is not there to fail
+            0xA7 => self.command |= CMD_AUX_OFF,
+            0xA8 => self.command &= !CMD_AUX_OFF,
+            0xA9 => self.enqueue(0x00), // aux interface test passed
             0xAA => {
                 self.command = CMD_INT | CMD_SYS | CMD_XLAT;
                 self.len = 0;
@@ -290,8 +393,93 @@ impl I8042 {
                 }
             }
             0xD2 => self.enqueue(v),
-            0xD3 => {}                  // would appear as mouse data
-            _ => self.unsupported += 1, // 0xD4: a byte for the mouse that is not there
+            // Loopback: as if the mouse had sent it.
+            0xD3 => self.enqueue_aux(v),
+            0xD4 => self.mouse_command(v),
+            _ => self.unsupported += 1,
+        }
+    }
+
+    /// A byte the guest sends the mouse (controller command 0xD4).
+    fn mouse_command(&mut self, v: u8) {
+        if let Some(c) = self.mouse.arg.take() {
+            match c {
+                0xF3 => {
+                    let m = &mut self.mouse;
+                    m.rate = v;
+                    m.rates = [m.rates[1], m.rates[2], v];
+                    if m.id == MOUSE_ID && m.rates == [200, 100, 80] {
+                        m.id = MOUSE_ID_WHEEL;
+                    }
+                }
+                _ => self.mouse.resolution = v & 3,
+            }
+            self.enqueue_aux(ACK);
+            return;
+        }
+        match v {
+            0xFF => {
+                self.mouse = Mouse::new();
+                for b in [ACK, 0xAA, MOUSE_ID] {
+                    self.enqueue_aux(b);
+                }
+            }
+            0xF6 => {
+                let id = self.mouse.id;
+                self.mouse = Mouse { id, ..Mouse::new() };
+                self.enqueue_aux(ACK);
+            }
+            0xF5 | 0xF4 => {
+                self.mouse.reporting = v == 0xF4;
+                self.enqueue_aux(ACK);
+            }
+            0xF3 | 0xE8 => {
+                self.mouse.arg = Some(v);
+                self.enqueue_aux(ACK);
+            }
+            0xF2 => {
+                let id = self.mouse.id;
+                self.enqueue_aux(ACK);
+                self.enqueue_aux(id);
+            }
+            0xF0 | 0xEA => {
+                self.mouse.remote = v == 0xF0;
+                self.enqueue_aux(ACK);
+            }
+            0xE6 | 0xE7 => {
+                self.mouse.scaling2 = v == 0xE7;
+                self.enqueue_aux(ACK);
+            }
+            0xE9 => {
+                let m = &self.mouse;
+                let flags = u8::from(m.remote) << 6
+                    | u8::from(m.reporting) << 5
+                    | u8::from(m.scaling2) << 4
+                    | (m.buttons & 1) << 2
+                    | (m.buttons & 4) >> 1
+                    | (m.buttons & 2) >> 1;
+                let (resolution, rate) = (m.resolution, m.rate);
+                for b in [ACK, flags, resolution, rate] {
+                    self.enqueue_aux(b);
+                }
+            }
+            0xEB => {
+                // Read data (remote mode): no movement since the last packet.
+                let first = 0x08 | self.mouse.buttons;
+                self.enqueue_aux(ACK);
+                for b in [first, 0, 0] {
+                    self.enqueue_aux(b);
+                }
+                if self.mouse.id == MOUSE_ID_WHEEL {
+                    self.enqueue_aux(0);
+                }
+            }
+            // Wrap mode is not modeled; set and reset are acknowledged.
+            0xEC | 0xEE => self.enqueue_aux(ACK),
+            _ => {
+                self.unsupported += 1;
+                self.enqueue_aux(RESEND);
+            }
         }
     }
 

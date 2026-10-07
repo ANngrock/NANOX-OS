@@ -451,6 +451,7 @@ const PNP0A08: u32 = 0x080A_D041;
 const PNP0A03: u32 = 0x030A_D041;
 const PNP0501: u32 = 0x0105_D041;
 const PNP0303: u32 = 0x0303_D041;
+const PNP0F13: u32 = 0x130F_D041;
 const PNP0B00: u32 = 0x000B_D041;
 const PNP0103: u32 = 0x0301_D041;
 const PNP0C02: u32 = 0x020C_D041;
@@ -701,6 +702,9 @@ fn dsdt_table(w: &mut W, cfg: &Platform) {
         io(w, i8042::PORT_STATUS, 1);
         irq_line(w, irq::KEYBOARD);
     });
+    // The PS/2 mouse on the controller's auxiliary port: Linux's i8042 PnP
+    // probe takes the aux port as absent without it.
+    simple_device(w, b"PS2M", PNP0F13, |w| irq_line(w, irq::MOUSE));
     simple_device(w, b"RTC_", PNP0B00, |w| {
         io(w, rtc::PORT_INDEX, rtc::PORT_DATA + 1 - rtc::PORT_INDEX);
         irq_line(w, irq::RTC);

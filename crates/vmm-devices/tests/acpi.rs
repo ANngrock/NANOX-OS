@@ -1165,6 +1165,7 @@ fn the_legacy_devices_claim_what_the_models_decode() {
     assert!(matches!(kbd[0], Res::Io { min, .. } if min == u64::from(i8042::PORT_DATA)));
     assert!(matches!(kbd[1], Res::Io { min, .. } if min == u64::from(i8042::PORT_STATUS)));
     assert_eq!(kbd[2], Res::Irq(1 << irq::KEYBOARD));
+    assert_eq!(dev("PCI0.PS2M", "PNP0F13"), [Res::Irq(1 << irq::MOUSE)]);
 
     let rtc = dev("PCI0.RTC_", "PNP0B00");
     claims(&rtc[0], Rtc::owns);
@@ -1199,12 +1200,13 @@ fn the_legacy_devices_claim_what_the_models_decode() {
             "\\_SB_.PCI0",
             "\\_SB_.PCI0.COM1",
             "\\_SB_.PCI0.KBD_",
+            "\\_SB_.PCI0.PS2M",
             "\\_SB_.PCI0.RTC_"
         ]
     );
-    // PCI0: _HID _CID _SEG _BBN _UID _CRS _PRT; _HID and _CRS of five devices; the processor's
+    // PCI0: _HID _CID _SEG _BBN _UID _CRS _PRT; _HID and _CRS of six devices; the processor's
     // _HID and _UID; _S0_ and _S5_.
-    assert_eq!(ns.objs.len(), 7 + 2 * 5 + 2 + 2, "no other names");
+    assert_eq!(ns.objs.len(), 7 + 2 * 6 + 2 + 2, "no other names");
 }
 
 #[test]
@@ -1337,6 +1339,7 @@ fn the_eisa_ids_are_the_compressed_text_of_the_device_names() {
     // Known values (iasl prints EisaId ("PNP0A08") for 0x080AD041), then every id the DSDT uses.
     assert_eq!(eisa("PNP0A08"), 0x080A_D041);
     assert_eq!(eisa("PNP0303"), 0x0303_D041);
+    assert_eq!(eisa("PNP0F13"), 0x130F_D041);
     let (b, l) = tables();
     let ns = namespace(&b, &l);
     for (path, id) in [
@@ -1344,6 +1347,7 @@ fn the_eisa_ids_are_the_compressed_text_of_the_device_names() {
         ("PCI0._CID", "PNP0A03"),
         ("PCI0.COM1._HID", "PNP0501"),
         ("PCI0.KBD_._HID", "PNP0303"),
+        ("PCI0.PS2M._HID", "PNP0F13"),
         ("PCI0.RTC_._HID", "PNP0B00"),
         ("HPET._HID", "PNP0103"),
         ("MBRD._HID", "PNP0C02"),

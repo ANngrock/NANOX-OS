@@ -353,16 +353,194 @@ fn controller_commands_that_feed_the_output_buffer() {
     assert_eq!(drain(&mut k), [0x80]);
 }
 
-#[test]
-fn there_is_no_mouse() {
+/// A byte for the mouse (controller command 0xD4).
+fn mouse(k: &mut I8042, v: u8) {
+    cmd(k, 0xD4);
+    data(k, v);
+}
+
+/// What the output buffer holds, each byte with its AUXB status bit.
+fn drain_tagged(k: &mut I8042) -> Vec<(u8, bool)> {
+    let mut v = Vec::new();
+    loop {
+        let s = status(k);
+        if s & 1 == 0 {
+            return v;
+        }
+        v.push((rd(k), s & 0x20 != 0));
+    }
+}
+
+fn aux(bytes: &[u8]) -> Vec<(u8, bool)> {
+    bytes.iter().map(|&b| (b, true)).collect()
+}
+
+/// Mouse reporting on, the replies drained.
+fn reporting_mouse() -> I8042 {
     let mut k = I8042::new();
+    mouse(&mut k, 0xF4);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA]));
+    k
+}
+
+#[test]
+fn the_aux_port_as_linux_checks_it() {
+    let mut k = I8042::new();
+    // loopback: the byte comes back as the mouse's
+    cmd(&mut k, 0xD3);
+    data(&mut k, 0x5A);
+    assert_eq!(drain_tagged(&mut k), aux(&[0x5A]));
+    // the aux test passes
+    cmd(&mut k, 0xA9);
+    assert_eq!(drain_tagged(&mut k), [(0x00, false)]);
+    // disable and enable show in bit 5 of the command byte
+    cmd(&mut k, 0xA7);
+    cmd(&mut k, 0x20);
+    assert_eq!(rd(&mut k) & 0x20, 0x20);
     cmd(&mut k, 0xA8);
-    cmd(&mut k, 0xD4);
-    data(&mut k, 0xFF);
-    assert_eq!(drain(&mut k), [], "no reply: a probe times out");
+    cmd(&mut k, 0x20);
+    assert_eq!(rd(&mut k) & 0x20, 0);
+    // an unknown controller command is counted
+    cmd(&mut k, 0xB5);
     assert_eq!(k.unsupported, 1);
-    cmd(&mut k, 0xB5); // an unknown controller command
-    assert_eq!(k.unsupported, 2);
+}
+
+#[test]
+fn a_mouse_byte_raises_irq12_and_a_keyboard_byte_irq1() {
+    let mut k = I8042::new();
+    cmd(&mut k, 0x60);
+    data(&mut k, 0x47); // both interrupts on
+    cmd(&mut k, 0xD3);
+    data(&mut k, 0xA5);
+    assert!(k.irq12() && !k.irq1());
+    k.push_scancode(0x1C);
+    assert_eq!(rd(&mut k), 0xA5);
+    assert!(k.irq1() && !k.irq12(), "the keyboard's byte is next");
+    assert!(k.take_reloaded(), "an edge for it");
+    assert_eq!(rd(&mut k), 0x1E);
+    assert!(!k.irq1() && !k.irq12());
+    // without INT2 a mouse byte does not interrupt, but polling sees it
+    cmd(&mut k, 0x60);
+    data(&mut k, 0x45);
+    cmd(&mut k, 0xD3);
+    data(&mut k, 1);
+    assert!(!k.irq12());
+    assert_eq!(status(&mut k) & 0x21, 0x21);
+}
+
+#[test]
+fn the_mouse_resets_identifies_and_reports() {
+    let mut k = I8042::new();
+    mouse(&mut k, 0xFF);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA, 0xAA, 0x00]));
+    mouse(&mut k, 0xF2);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA, MOUSE_ID]));
+    // not reporting yet: the movement is dropped
+    k.push_mouse(5, -3, MOUSE_LEFT, 0);
+    assert_eq!(drain_tagged(&mut k), []);
+    assert_eq!(k.dropped, 1);
+    mouse(&mut k, 0xF4);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA]));
+    k.push_mouse(5, -3, MOUSE_LEFT, 0);
+    assert_eq!(drain_tagged(&mut k), aux(&[0x08 | 1 | 0x20, 5, 0xFD]));
+    k.push_mouse(-300, 300, MOUSE_RIGHT | MOUSE_MIDDLE, 2);
+    assert_eq!(
+        drain_tagged(&mut k),
+        aux(&[0x08 | 6 | 0x10, 0x01, 0xFF]),
+        "cut to -255 and 255; no wheel byte without the wheel"
+    );
+    mouse(&mut k, 0xF5);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA]));
+    k.push_mouse(1, 1, 0, 0);
+    assert_eq!(drain_tagged(&mut k), []);
+}
+
+#[test]
+fn the_intellimouse_knock_turns_the_wheel_on() {
+    let mut k = reporting_mouse();
+    for rate in [200, 100, 80] {
+        mouse(&mut k, 0xF3);
+        mouse(&mut k, rate);
+    }
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA; 6]));
+    mouse(&mut k, 0xF2);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA, MOUSE_ID_WHEEL]));
+    assert_eq!(k.mouse_id(), MOUSE_ID_WHEEL);
+    k.push_mouse(1, 2, 0, -1);
+    assert_eq!(drain_tagged(&mut k), aux(&[0x08, 1, 2, 0x0F]));
+    k.push_mouse(0, 0, 0, 20);
+    assert_eq!(drain_tagged(&mut k), aux(&[0x08, 0, 0, 0x07]), "cut to 7");
+    // another order of rates does not; defaults keep the identity, reset does not
+    let mut k = reporting_mouse();
+    for rate in [100, 200, 80] {
+        mouse(&mut k, 0xF3);
+        mouse(&mut k, rate);
+    }
+    mouse(&mut k, 0xF2);
+    assert_eq!(drain_tagged(&mut k)[6..], aux(&[0xFA, MOUSE_ID]));
+    let mut k = reporting_mouse();
+    for rate in [200, 100, 80] {
+        mouse(&mut k, 0xF3);
+        mouse(&mut k, rate);
+    }
+    mouse(&mut k, 0xF6);
+    assert_eq!(k.mouse_id(), MOUSE_ID_WHEEL);
+    mouse(&mut k, 0xFF);
+    assert_eq!(k.mouse_id(), MOUSE_ID);
+}
+
+#[test]
+fn status_rate_resolution_scaling_and_remote_mode() {
+    let mut k = I8042::new();
+    mouse(&mut k, 0xE9);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA, 0x00, 2, 100]));
+    mouse(&mut k, 0xF3);
+    mouse(&mut k, 40);
+    mouse(&mut k, 0xE8);
+    mouse(&mut k, 7); // two bits
+    mouse(&mut k, 0xE7);
+    mouse(&mut k, 0xF4);
+    drain_tagged(&mut k);
+    k.push_mouse(0, 0, MOUSE_LEFT | MOUSE_RIGHT, 0);
+    drain_tagged(&mut k);
+    mouse(&mut k, 0xE9);
+    // reporting, 2:1 scaling, left and right held
+    assert_eq!(
+        drain_tagged(&mut k),
+        aux(&[0xFA, 0x20 | 0x10 | 0x05, 3, 40])
+    );
+    mouse(&mut k, 0xE6);
+    mouse(&mut k, 0xF0);
+    drain_tagged(&mut k);
+    k.push_mouse(3, 3, 0, 0);
+    assert_eq!(drain_tagged(&mut k), [], "remote mode: no stream");
+    mouse(&mut k, 0xE9);
+    assert_eq!(drain_tagged(&mut k)[1], (0x40 | 0x20 | 0x05, true));
+    mouse(&mut k, 0xEB);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA, 0x08 | 3, 0, 0]));
+    mouse(&mut k, 0xEA);
+    mouse(&mut k, 0xEE);
+    mouse(&mut k, 0xEC);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFA, 0xFA, 0xFA]));
+    mouse(&mut k, 0x42);
+    assert_eq!(drain_tagged(&mut k), aux(&[0xFE]));
+    assert_eq!(k.unsupported, 1);
+}
+
+#[test]
+fn a_packet_goes_whole_or_not_at_all() {
+    let mut k = reporting_mouse();
+    // the aux port disabled: dropped
+    cmd(&mut k, 0xA7);
+    k.push_mouse(1, 1, 0, 0);
+    assert_eq!(drain_tagged(&mut k), []);
+    cmd(&mut k, 0xA8);
+    // 16 slots: five packets of three fit, the sixth does not
+    for _ in 0..6 {
+        k.push_mouse(1, 1, 0, 0);
+    }
+    assert_eq!(k.queued(), 15);
+    assert_eq!(k.dropped, 2);
 }
 
 #[test]

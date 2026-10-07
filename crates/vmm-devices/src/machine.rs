@@ -28,7 +28,7 @@
 //!   devices as memory the guest placed. Their INTA goes to I/O APIC pin 16 +
 //!   slot % 4 (active low: 19, 16, 17, 18, 19 and 16; functions on one pin are
 //!   wired-or) and to the 8259 line in the interrupt-line register (11, 10, 5,
-//!   3, 14 and 12: lines no ISA device or the SCI uses, and none shared between
+//!   3, 14 and 6: lines no ISA device or the SCI uses, and none shared between
 //!   the functions). Their DMA runs in `service_blk` / `service_net` /
 //!   `service_gpu` / `service_console` / `service_input`.
 //!
@@ -69,15 +69,15 @@ pub mod slot {
 }
 /// The ISA lines the PCI devices' INTA is routed to on the 8259 (the interrupt line register tells the guest).
 /// IRQ 5 is the display's and IRQ 3 the agent channel's: no ISA device of this platform uses them
-/// (they have 1, 4, 8 and the SCI on 9; COM2 is not modeled). The keyboard has IRQ 14 (there is no
-/// IDE controller) and the tablet IRQ 12 (the PS/2 mouse's on a PC; the i8042 here has no auxiliary
-/// port); 7 and 15 are left alone, the 8259s report spurious interrupts there.
+/// (they have 1, 4, 8, 12 and the SCI on 9; COM2 is not modeled). The keyboard has IRQ 14 (there is
+/// no IDE controller) and the tablet IRQ 6 (there is no floppy controller); 7 and 15 are left alone,
+/// the 8259s report spurious interrupts there.
 const BLK_PIC_LINE: u8 = 11;
 const NET_PIC_LINE: u8 = 10;
 const GPU_PIC_LINE: u8 = 5;
 const CONSOLE_PIC_LINE: u8 = 3;
 const KEYBOARD_PIC_LINE: u8 = 14;
-const TABLET_PIC_LINE: u8 = 12;
+const TABLET_PIC_LINE: u8 = 6;
 /// Where a PCI device's INTx lands on the I/O APIC: pins 16..20, rotated by the slot (the q35 swizzle).
 pub fn pci_pin(dev: u8) -> u8 {
     16 + dev % 4
@@ -93,6 +93,7 @@ pub mod irq {
     pub const COM1: u8 = 4;
     pub const RTC: u8 = 8;
     pub const SCI: u8 = 9;
+    pub const MOUSE: u8 = 12;
 }
 
 /// Where an ISA IRQ is wired on the I/O APIC.
@@ -568,16 +569,20 @@ impl Machine {
         self.hpet.sync(now);
         self.lapic.update(now);
 
-        // The keyboard's buffer was read and refilled: its line went low before rising again.
+        // The keyboard controller's buffer was read and refilled: its lines went low before one
+        // of them rises again.
         if self.kbd.take_reloaded() {
-            self.pic.set_irq(irq::KEYBOARD, false);
-            self.ioapic.set_irq(ioapic_pin(irq::KEYBOARD), false);
+            for n in [irq::KEYBOARD, irq::MOUSE] {
+                self.pic.set_irq(n, false);
+                self.ioapic.set_irq(ioapic_pin(n), false);
+            }
         }
         // Level lines: what the devices drive now. The 8259 takes the wired-or of an ISA device
         // and the PCI functions routed to the same line.
         let sci = self.pm.sci(now);
-        let isa: [(u8, bool); 4] = [
+        let isa: [(u8, bool); 5] = [
             (irq::KEYBOARD, self.kbd.irq1()),
+            (irq::MOUSE, self.kbd.irq12()),
             (irq::COM1, self.uart.irq()),
             (irq::RTC, self.rtc.irq(now)),
             (irq::SCI, sci),

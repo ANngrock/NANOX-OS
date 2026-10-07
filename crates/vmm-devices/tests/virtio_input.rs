@@ -976,10 +976,10 @@ fn bus_bring_up(m: &mut Machine, dev: u8, bar: u64, ev: &Q, st: &Q) {
 }
 
 #[test]
-fn on_the_bus_the_keyboard_is_slot_7_on_irq_14_and_the_tablet_slot_8_on_irq_12() {
+fn on_the_bus_the_keyboard_is_slot_7_on_irq_14_and_the_tablet_slot_8_on_irq_6() {
     let mut m = Machine::new(0, 100_000_000);
     assert_eq!((slot::KEYBOARD, slot::TABLET), (7, 8));
-    for (dev, line) in [(7u8, 14u32), (8, 12)] {
+    for (dev, line) in [(7u8, 14u32), (8, 6)] {
         assert_eq!(cfg_read(&mut m, dev, 0, 4), 0x1052_1AF4);
         assert_eq!(cfg_read(&mut m, dev, 0x3C, 1), line, "8259 line");
     }
@@ -998,7 +998,7 @@ fn on_the_bus_the_keyboard_is_slot_7_on_irq_14_and_the_tablet_slot_8_on_irq_12()
     m.mmio_write(TAB_BAR + 0x2001, 1, u64::from(ABS_X), 0);
     assert_eq!(m.mmio_read(TAB_BAR + 0x200C, 4, 0), 1023, "1024 columns");
     assert_eq!(m.unclaimed_mmio, 0);
-    // the 8259: IRQ 12 and 14 level-triggered and unmasked, with the cascade
+    // the 8259: IRQ 6 and 14 level-triggered and unmasked, with the cascade
     for (cmd, data, icw3, base) in [(0x20u16, 0x21u16, 4u8, 0x20u8), (0xA0, 0xA1, 2, 0x28)] {
         m.io_out(cmd, 1, 0x11, 0);
         m.io_out(data, 1, u32::from(base), 0);
@@ -1006,9 +1006,10 @@ fn on_the_bus_the_keyboard_is_slot_7_on_irq_14_and_the_tablet_slot_8_on_irq_12()
         m.io_out(data, 1, 1, 0);
         m.io_out(data, 1, 0xFF, 0);
     }
-    m.io_out(0x4D1, 1, 0x50, 0);
-    m.io_out(0x21, 1, 0xFB, 0);
-    m.io_out(0xA1, 1, 0xAF, 0);
+    m.io_out(0x4D0, 1, 0x40, 0);
+    m.io_out(0x4D1, 1, 0x40, 0);
+    m.io_out(0x21, 1, 0xBB, 0);
+    m.io_out(0xA1, 1, 0xBF, 0);
     let mut ram = Ram(vec![0; 0x40000]);
     let (mut kev, mut kst, mut tev, mut tst) = (kev, kst, tev, tst);
     assert!(ram.write(0x22000, &[0x11, 0, 1, 0, 1, 0, 0, 0]));
@@ -1030,7 +1031,8 @@ fn on_the_bus_the_keyboard_is_slot_7_on_irq_14_and_the_tablet_slot_8_on_irq_12()
     m.io_out(0xA0, 1, 0x20, 0);
     m.io_out(0x20, 1, 0x20, 0);
     assert_eq!(m.pending(0), None, "the ISR read dropped the line");
-    // both devices in one call; the tablet's IRQ 12 outranks the keyboard's 14
+    // both devices in one call; the keyboard's IRQ 14, through the cascade on IRQ 2, outranks the
+    // tablet's 6
     for i in 2..4 {
         kev.add(&mut ram, &[(0x20000 + 16 * i, 8, true)]);
     }
@@ -1043,7 +1045,11 @@ fn on_the_bus_the_keyboard_is_slot_7_on_irq_14_and_the_tablet_slot_8_on_irq_12()
     assert!(m.tablet.move_to(512, 384));
     assert_eq!(m.service_input(&mut ram, 0), (5, 2));
     assert!(m.pic.int_pending(), "and again");
-    assert_eq!(m.pending(0), Some(0x2C), "IRQ 12");
+    assert_eq!(m.acknowledge(0), Some(0x2E), "IRQ 14 first");
+    assert_eq!(m.mmio_read(KBD_BAR + 0x1000, 1, 0), 1);
+    m.io_out(0xA0, 1, 0x20, 0);
+    m.io_out(0x20, 1, 0x20, 0);
+    assert_eq!(m.pending(0), Some(0x26), "then IRQ 6");
     assert_eq!(kev.take_used(&ram), [(0, 8), (1, 8), (2, 8), (3, 8)]);
     assert_eq!(tev.take_used(&ram), [(0, 8), (1, 8), (2, 8)]);
     assert_eq!(kst.take_used(&ram), [(0, 0), (1, 0)]);

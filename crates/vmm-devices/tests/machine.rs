@@ -260,6 +260,27 @@ fn every_byte_of_a_keyboard_reply_interrupts() {
 }
 
 #[test]
+fn the_mouse_on_irq12() {
+    let mut m = machine();
+    enable_lapic(&mut m);
+    route(&mut m, 12, 0x3C, 0);
+    out(&mut m, 0x64, 0x60, 0);
+    out(&mut m, 0x60, 0x47, 0); // keyboard and mouse interrupts on
+    out(&mut m, 0x64, 0xD4, 0);
+    out(&mut m, 0x60, 0xF4, 0); // reporting on: the ACK interrupts
+    assert_eq!(m.acknowledge(0), Some(0x3C));
+    eoi(&mut m, 0);
+    assert_eq!(inb(&mut m, 0x60, 0), 0xFA);
+    m.kbd.push_mouse(4, 4, 0, 0);
+    for want in [0x08, 4, 4] {
+        assert_eq!(m.acknowledge(0), Some(0x3C), "every byte of the packet");
+        eoi(&mut m, 0);
+        assert_eq!(inb(&mut m, 0x60, 0), want);
+    }
+    assert_eq!(m.pending(0), None);
+}
+
+#[test]
 fn the_rtc_periodic_interrupt_on_irq8_until_register_c_is_read() {
     let mut m = machine();
     enable_lapic(&mut m);
