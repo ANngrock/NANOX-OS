@@ -12,6 +12,7 @@ pub mod code {
     pub const INIT: u64 = 0x63;
     /// Virtual interrupt window (V_IRQ became deliverable).
     pub const VINTR: u64 = 0x64;
+    pub const RDTSC: u64 = 0x6E;
     pub const CPUID: u64 = 0x72;
     pub const PAUSE: u64 = 0x77;
     pub const HLT: u64 = 0x78;
@@ -25,6 +26,7 @@ pub mod code {
     pub const STGI: u64 = 0x84;
     pub const CLGI: u64 = 0x85;
     pub const SKINIT: u64 = 0x86;
+    pub const RDTSCP: u64 = 0x87;
     pub const NPF: u64 = 0x400;
     /// VMRUN refused the guest state.
     pub const INVALID: u64 = u64::MAX;
@@ -59,6 +61,9 @@ pub enum Exit {
     /// The guest can take an interrupt now (window requested by the VMM).
     Vintr,
     Cpuid,
+    /// RDTSC and RDTSCP, when intercepted (the platform vCPU's time is virtual).
+    Rdtsc,
+    Rdtscp,
     /// PAUSE (spin-wait hint): intercepted so busy-waiting guests advance
     /// virtual time.
     Pause,
@@ -98,6 +103,8 @@ impl Exit {
             code::INIT => Exit::Init,
             code::VINTR => Exit::Vintr,
             code::CPUID => Exit::Cpuid,
+            code::RDTSC => Exit::Rdtsc,
+            code::RDTSCP => Exit::Rdtscp,
             code::PAUSE => Exit::Pause,
             code::HLT => Exit::Hlt,
             code::IOIO => {

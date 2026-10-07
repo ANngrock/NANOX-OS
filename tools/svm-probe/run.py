@@ -4,6 +4,10 @@
 Run inside `nix develop` (pinned QEMU, NANOX_OVMF_CODE/NANOX_OVMF_VARS):
 
     python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH] [--repro [--runs N]]
+        [--linux-kernel BZIMAGE [--linux-init ELF] [--linux-cmdline TEXT] [--linux-only]
+         [--linux-host-tick NS|off] [--linux-timeout S] [--linux-disk IMAGE]
+         [--show | --shell-test | --shell-script FILE | --interactive] [--linux-busybox BUSYBOX]
+         [--linux-ram MIB] [--kvm] [--linux-initrd INITRD]]
 
 With --repro the svm profile runs N times (default 2) with identical inputs
 and the per-case digest (verdict, every counter and the serial bytes) of each
@@ -13,6 +17,64 @@ run is compared: every case except the host-timed ones must be identical
 With --m1-kernel, an M1 kernel ELF (built from codex/m1-m8-continuation)
 is also handed over (fw_cfg opt/nanox/kernel-m1.elf) and booted with the M1
 handoff in its nine test scenarios.
+
+With --linux-kernel, a fourth profile, linux, hands a Linux bzImage (fw_cfg
+opt/nanox/bzimage), an initramfs with the measurement init
+(tools/hostguest/init, built by tools/native/build.py; the archive is made by
+linux_surface.py's cpio_newc) and the command line to the probe, whose
+`linux` case boots it on the whole emulated platform and passes when the
+guest prints NANOX_GUEST_REPORT_END (docs/specs/M11-WINDOW.md §5). The
+profile has 1 GiB (the case allocates 256 MiB of guest RAM from the
+firmware) and a long timeout: nested paging under TCG is slow. --linux-only
+runs only that profile. The guest also has a screen (a linear framebuffer the
+kernel's console draws on); the probe dumps it at the end and it is saved as
+linux/screen.png.
+
+With --show the linux profile runs in a window instead (QEMU with GTK, from
+`nix build .#qemu-display --out-link ~/.nix-qemu-display`; on Windows 11 the
+window opens through WSLg): the NANOX screen the probe draws shows the guest
+booting in the server window, and at the end the probe halts instead of
+ending the run, so the last screen stays until the window is closed. The
+verdict then comes from the RESULT line, not from the exit status, and
+there is no timeout: the run lasts until the window is closed.
+
+--shell-script FILE types the lines of FILE into the guest's shell the way
+--shell-test types its own (diagnostics: a command can write what it finds
+to /dev/ttyS0); a line ending in `#wait MARK` waits for MARK on the guest's
+serial port before the next one; `exit` is added at the end.
+
+--linux-initrd INITRD boots a distribution as it comes: its own initramfs
+instead of the measurement init (and no busybox or nanox.shell); the run
+then passes only by the probe's RESULT line, as nothing prints the report.
+--interactive is --show without the window: the probe's keyboard and
+mouse go to the guest, no limits, the guest's time paced to real time.
+
+--linux-ram MIB gives the guest that much RAM (fw_cfg opt/nanox/ram-mib; the
+probe's default is 256 MiB); above 2.75 GiB it continues at 4 GiB. The probe
+allocates it in 64 MiB pieces wherever the firmware has them; the machine
+gets 2 GiB more than the guest plus the disk image, which the probe holds
+in memory.
+
+--kvm runs the linux profile on KVM (`-accel kvm -cpu host`) instead of TCG:
+the probe's VMRUN then runs on the processor's own SVM, nested under the
+WSL/Linux kernel's KVM, so the guest runs at close to the machine's speed.
+It needs /dev/kvm (membership of group kvm; without it in the current
+session QEMU is started through `sg kvm`). The records are not comparable
+with TCG ones: under KVM the processor model is the host's.
+
+--show is also interactive: the initramfs gets a static busybox (from
+`nix build .#guest-busybox --out-link ~/.nix-guest-busybox`, or
+--linux-busybox), the command line `nanox.shell`, and after its report the
+init starts a busybox shell on the guest's first virtual terminal; the
+probe hands what is typed into the window on to the guest's keyboard
+(fw_cfg opt/nanox/interactive) and runs without limits. `exit` in the
+shell powers the guest off. --shell-test checks that path without a
+window: QEMU's own keyboard gets commands through QMP (send-key) once the
+shell is up: one writes a line to the guest's serial port, one sleeps 3 s
+first (real time: the probe keeps the guest's virtual time from running
+ahead of its own clock, so at least 3 s must pass between the Enter and
+the line), then `exit`. The run passes when both lines arrive in time and
+the guest powers off.
 
 Profiles:
   svm     qemu64 with SVM, nested paging, NRIP save: every case must pass
@@ -42,9 +104,11 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,9 +144,205 @@ def option(name):
 
 
 M1_KERNEL = option("--m1-kernel")
+LINUX_KERNEL = option("--linux-kernel")
+LINUX_INIT = option("--linux-init")
+LINUX_INIT_DEFAULT = ROOT / "target/x86_64-unknown-none/release/linux-probe-init"
+# The kernel command line of the linux profile, each item with its reason
+# (docs/specs/M11-WINDOW.md, "Первый запуск Linux под VMM NANOX"):
+LINUX_CMDLINE = option("--linux-cmdline") or " ".join([
+    "console=tty0",  # the kernel's messages on the screen too
+    "console=ttyS0",  # the kernel's console on COM1, which the probe prints (the last
+                      # console= is /dev/console: init's output goes to COM1)
+    "earlyprintk=serial,ttyS0,115200",  # output before the 8250 driver is up
+    "panic=-1",  # a panic reboots at once: the VMM sees Reset, not a hang
+])
+# Virtual time (ns) a host tick exit (~1 ms of host time) counts, or "off"
+# (the probe's default when absent: no tick, a run independent of host timing;
+# fw_cfg opt/nanox/host-tick-ns).
+LINUX_HOST_TICK = option("--linux-host-tick")
+# A disk image for the guest's virtio-blk; without one a small test disk is made.
+# Up to DIRECT_DISK bytes it goes through fw_cfg into the probe's memory; a larger
+# one (an installer or live ISO) is the machine's own virtio-blk, read-only, which
+# the probe drives (svm-probe host_disk.rs).
+LINUX_DISK = option("--linux-disk")
+DIRECT_DISK = 64 << 20
+LINUX_TIMEOUT_S = int(option("--linux-timeout") or 7200)
+LINUX_RAM_MIB = int(option("--linux-ram")) if option("--linux-ram") else None
+KVM = "--kvm" in sys.argv
+LINUX_PROFILE = ("linux", f"qemu64,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PASS")
+# --show: the linux profile in a window, with a QEMU that has one.
+SHOW = "--show" in sys.argv
+# --shell-test: the interactive shell driven through QMP, without a window.
+SHELL_SCRIPT = option("--shell-script")
+SHELL_TESTING = "--shell-test" in sys.argv or bool(SHELL_SCRIPT)
+INTERACTIVE = SHOW or SHELL_TESTING or "--interactive" in sys.argv
+# A distribution's own initramfs, used as it is.
+LINUX_INITRD = option("--linux-initrd")
+LINUX_BUSYBOX = option("--linux-busybox") or os.path.expanduser(
+    "~/.nix-guest-busybox/bin/busybox")
+if INTERACTIVE and not LINUX_INITRD:
+    LINUX_CMDLINE += " nanox.shell"
+# What --shell-test types, line by line, each with the mark it waits for on the
+# guest's serial port and the least real time that must pass from its Enter to the mark.
+SHELL_TEST = [
+    ("echo NANOX_SHELL_OK $(uname -r) $(ls /bin | wc -l) > /dev/ttyS0\n", "NANOX_SHELL_OK", 0),
+    ("sleep 3; echo NANOX_SHELL_SLEPT > /dev/ttyS0\n", "NANOX_SHELL_SLEPT", 3),
+    ("exit\n", None, 0),
+]
+SHELL_TEST_WAIT_S = 120
+if SHELL_SCRIPT:
+    SHELL_TEST = []
+    for script_line in Path(SHELL_SCRIPT).read_text().splitlines():
+        if script_line.strip():
+            text, _, mark = script_line.partition("#wait ")
+            SHELL_TEST.append((text.rstrip() + "\n", mark.strip() or None, 0))
+    if not SHELL_TEST or SHELL_TEST[-1][0].strip() != "exit":
+        SHELL_TEST.append(("exit\n", None, 0))
+QEMU_DISPLAY = os.environ.get("NANOX_QEMU_DISPLAY",
+                              os.path.expanduser("~/.nix-qemu-display/bin/qemu-system-x86_64"))
 
 
-def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path):
+def linux_initrd(out: Path) -> Path:
+    """The measurement initramfs: /init only, as linux_surface.py makes it; for an
+    interactive run also /bin/busybox."""
+    sys.path.insert(0, str(ROOT / "tools/hostguest"))
+    import linux_surface  # noqa: E402
+
+    if LINUX_INITRD:
+        return Path(LINUX_INITRD)
+    init = Path(LINUX_INIT) if LINUX_INIT else LINUX_INIT_DEFAULT
+    files = [("init", 0o100755, init.read_bytes())]
+    if INTERACTIVE:
+        files += [("bin", 0o040755, b""),
+                  ("bin/busybox", 0o100755, Path(LINUX_BUSYBOX).read_bytes())]
+    img = out / "initrd.img"
+    img.write_bytes(linux_surface.cpio_newc(files))
+    return img
+
+
+# QMP key names of the characters --shell-test types (a list: shift first).
+QCODES = {" ": ["spc"], "\n": ["ret"], "-": ["minus"], "/": ["slash"], ".": ["dot"],
+          ";": ["semicolon"], "=": ["equal"], "'": ["apostrophe"], ",": ["comma"],
+          "[": ["bracket_left"], "]": ["bracket_right"], "\\": ["backslash"],
+          "`": ["grave_accent"], "&": ["shift", "7"], "*": ["shift", "8"],
+          "+": ["shift", "equal"], '"': ["shift", "apostrophe"], ":": ["shift", "semicolon"],
+          "<": ["shift", "comma"], "{": ["shift", "bracket_left"],
+          "}": ["shift", "bracket_right"], "!": ["shift", "1"], "@": ["shift", "2"],
+          "#": ["shift", "3"], "%": ["shift", "5"], "^": ["shift", "6"],
+          "?": ["shift", "slash"], "~": ["shift", "grave_accent"],
+          ">": ["shift", "dot"], "$": ["shift", "4"], "(": ["shift", "9"],
+          ")": ["shift", "0"], "|": ["shift", "backslash"], "_": ["shift", "minus"]}
+
+
+def qcodes(c: str):
+    if c in QCODES:
+        return QCODES[c]
+    if c.isupper():
+        return ["shift", c.lower()]
+    return [c]
+
+
+def wait_for_mark(serial: Path, mark: bytes, wait_s: float):
+    """Seconds until `mark` is on the serial port, or None after `wait_s`."""
+    start = time.monotonic()
+    while time.monotonic() - start < wait_s:
+        if serial.exists() and mark in serial.read_bytes():
+            return time.monotonic() - start
+        time.sleep(0.05)
+    return None
+
+
+def type_through_qmp(sock_path: Path, serial: Path, steps, wait_s: float):
+    """Waits for the guest's shell (NANOX_SHELL_READY on the serial port), then types
+    each step's line on QEMU's own keyboard through QMP and waits for its mark; returns
+    the seconds from each Enter to its mark (None: no mark, or it never came), or None
+    if the shell never came up."""
+    import socket
+
+    if wait_for_mark(serial, b"NANOX_SHELL_READY", wait_s) is None:
+        return None
+    time.sleep(3)  # the shell starts after the marker
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(str(sock_path))
+    f = s.makefile("rw")
+    f.readline()  # greeting
+
+    def call(cmd, args=None):
+        f.write(json.dumps({"execute": cmd, **({"arguments": args} if args else {})}) + "\n")
+        f.flush()
+        while True:
+            reply = json.loads(f.readline())
+            if "return" in reply or "error" in reply:
+                return reply
+
+    call("qmp_capabilities")
+    seconds = []
+    for n, (text, mark, _) in enumerate(steps):
+        if n == len(steps) - 1:
+            # Before the last line: the mouse moves and clicks (the probe hands
+            # the machine's PS/2 mouse on; it counts the packets).
+            for events in MOUSE_EVENTS:
+                call("input-send-event", {"events": events})
+                time.sleep(0.2)
+        for c in text:
+            keys = [{"type": "qcode", "data": k} for k in qcodes(c)]
+            call("send-key", {"keys": keys, "hold-time": 40})
+            time.sleep(0.12)
+        t = wait_for_mark(serial, mark.encode(), SHELL_TEST_WAIT_S) if mark else None
+        seconds.append(None if t is None else round(t, 2))
+    s.close()
+    return seconds
+
+
+# What --shell-test does with the mouse: a move, a click.
+MOUSE_EVENTS = [
+    [{"type": "rel", "data": {"axis": "x", "value": 30}},
+     {"type": "rel", "data": {"axis": "y", "value": -12}}],
+    [{"type": "btn", "data": {"down": True, "button": "left"}}],
+    [{"type": "btn", "data": {"down": False, "button": "left"}}],
+]
+
+
+def linux_test_disk(out: Path) -> Path:
+    """A 4 MiB disk with an MBR and one Linux partition from sector 2048, whose first
+    sector carries a marker: Linux reads the table and prints `vda: vda1`."""
+    sectors = 8192
+    disk = bytearray(sectors * 512)
+    entry = bytes([0x00, 0, 0, 0, 0x83, 0, 0, 0])
+    entry += (2048).to_bytes(4, "little") + (sectors - 2048).to_bytes(4, "little")
+    disk[446:462] = entry
+    disk[510:512] = bytes([0x55, 0xAA])
+    marker = b"NANOX virtio-blk test disk" + bytes([0x0A])
+    disk[2048 * 512:2048 * 512 + len(marker)] = marker
+    img = out / "disk.img"
+    img.write_bytes(bytes(disk))
+    return img
+
+
+def direct_disk(disk) -> bool:
+    """Whether the image is the machine's own disk rather than fw_cfg data."""
+    return bool(disk) and Path(disk).stat().st_size > DIRECT_DISK
+
+
+def esp_drive(esp: Path, pinned: bool):
+    """The probe's ESP. With another disk on the machine it is the first boot
+    device (OVMF would otherwise boot the other disk's loader)."""
+    if not pinned:
+        return ["-drive", f"format=raw,file=fat:rw:{esp}"]
+    return ["-drive", f"if=none,id=esp,format=raw,file=fat:rw:{esp}",
+            "-device", "ide-hd,drive=esp,bus=ide.0,bootindex=0"]
+
+
+def machine_memory(disk) -> str:
+    """The probe machine's RAM for the linux profile: 1 GiB, or with --linux-ram the
+    guest's RAM, 2 GiB more and the disk image the probe holds in memory."""
+    if LINUX_RAM_MIB is None:
+        return "1G"
+    disk_mib = -(-Path(disk).stat().st_size // (1 << 20)) if disk and not direct_disk(disk) else 0
+    return f"{LINUX_RAM_MIB + 2048 + disk_mib}M"
+
+
+def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linux=None, disk=None):
     d = out / name
     esp = d / "esp/EFI/BOOT"
     esp.mkdir(parents=True)
@@ -91,14 +351,16 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path):
     shutil.copyfile(vars_src, vars_fd)
     vars_fd.chmod(0o644)
     serial = d / "serial.log"
+    show = SHOW and bool(linux)
+    kvm = KVM and bool(linux)
     argv = [
-        "qemu-system-x86_64",
+        QEMU_DISPLAY if show else "qemu-system-x86_64",
         "-machine", "q35",
-        "-accel", "tcg,thread=single",
-        "-cpu", cpu,
+        "-accel", "kvm" if kvm else "tcg,thread=single",
+        "-cpu", "host" if kvm else cpu,
         "-smp", "1",
-        "-m", "256M",
-        "-display", "none",
+        "-m", machine_memory(disk) if linux else "256M",
+        "-display", "gtk" if show else "none",
         "-monitor", "none",
         "-net", "none",
         "-no-reboot",
@@ -106,26 +368,169 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path):
         "-device", "isa-debug-exit,iobase=0xf4,iosize=4",
         "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={code}",
         "-drive", f"if=pflash,format=raw,unit=1,file={vars_fd}",
-        "-drive", f"format=raw,file=fat:rw:{d / 'esp'}",
+        *esp_drive(d / "esp", direct_disk(disk) if linux else False),
         "-fw_cfg", f"name=opt/nanox/kernel.elf,file={KERNEL}",
     ]
     # The M1 scenarios are long under TCG: run them in one SVM profile.
     if M1_KERNEL and name == "svm":
         argv += ["-fw_cfg", f"name=opt/nanox/kernel-m1.elf,file={M1_KERNEL}"]
+    if linux:
+        argv += [
+            "-fw_cfg", f"name=opt/nanox/bzimage,file={LINUX_KERNEL}",
+            "-fw_cfg", f"name=opt/nanox/initrd,file={linux}",
+            # QEMU's option syntax: a comma in a value is doubled.
+            "-fw_cfg", f"name=opt/nanox/cmdline,string={LINUX_CMDLINE.replace(',', ',,')}",
+        ]
+        if LINUX_HOST_TICK:
+            argv += ["-fw_cfg", f"name=opt/nanox/host-tick-ns,string={LINUX_HOST_TICK}"]
+        if disk and direct_disk(disk):
+            argv += [
+                "-drive", f"file={disk},format=raw,if=none,id=guestdisk,readonly=on",
+                "-device", "virtio-blk-pci,drive=guestdisk,disable-legacy=on",
+            ]
+        elif disk:
+            argv += ["-fw_cfg", f"name=opt/nanox/disk,file={disk}"]
+        if show:
+            argv += ["-fw_cfg", "name=opt/nanox/hold,string=1"]
+        if LINUX_RAM_MIB is not None:
+            argv += ["-fw_cfg", f"name=opt/nanox/ram-mib,string={LINUX_RAM_MIB}"]
+        if INTERACTIVE:
+            argv += ["-fw_cfg", "name=opt/nanox/interactive,string=1"]
+    qmp = d / "qmp.sock"
+    typing = SHELL_TESTING and bool(linux)
+    if typing:
+        argv += ["-qmp", f"unix:{qmp},server=on,wait=off"]
+    if kvm and not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        # Group kvm granted after this session began: start QEMU with it.
+        import shlex
+        argv = ["sg", "kvm", "-c", shlex.join(argv)]
     (d / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
     started = time.monotonic()
+    # A shown run lasts until its window is closed.
+    timeout = None if show else LINUX_TIMEOUT_S if linux else TIMEOUT_S
+    typed = None
     try:
-        p = subprocess.run(argv, capture_output=True, timeout=TIMEOUT_S)
-        status, stderr = p.returncode, p.stderr
+        if typing:
+            p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            typed = type_through_qmp(qmp, serial, SHELL_TEST, timeout)
+            _, stderr = p.communicate(timeout=timeout)
+            status = p.returncode
+        else:
+            p = subprocess.run(argv, capture_output=True, timeout=timeout)
+            status, stderr = p.returncode, p.stderr
     except subprocess.TimeoutExpired as e:
-        status, stderr = "timeout", e.stderr or b""
+        if typing:
+            p.kill()
+            _, stderr = p.communicate()
+        else:
+            stderr = e.stderr or b""
+        status = "timeout"
     (d / "stderr.log").write_bytes(stderr)
     text = serial.read_text(errors="replace") if serial.exists() else ""
-    return {
-        "cpu": cpu,
+    lines = text.splitlines()
+    r = {
+        "cpu": "host (KVM)" if kvm else cpu,
+        "shown": show,
+        "typed": typed,
         "status": status,
         "seconds": round(time.monotonic() - started, 1),
-        "serial_lines": [l for l in text.splitlines() if l.startswith("NANOX:SVM-PROBE")],
+        # The guest's own lines stay in serial.log.
+        "serial_lines": [l for l in lines if l.startswith("NANOX:SVM-PROBE")
+                         and not l.startswith(("NANOX:SVM-PROBE:LINUX ",
+                                               "NANOX:SVM-PROBE:LINUX-PROGRESS",
+                                               "NANOX:SVM-PROBE:LINUX-FB ",
+                                               "NANOX:SVM-PROBE:NANOX-FB "))],
+    }
+    if linux:
+        guest = [l[len("NANOX:SVM-PROBE:LINUX "):] for l in lines
+                 if l.startswith("NANOX:SVM-PROBE:LINUX ")]
+        r["linux"] = linux_summary(guest, lines)
+        r["linux"]["screen"] = linux_screen(lines, d / "screen.png")
+        r["linux"]["nanox_screen"] = linux_screen(lines, d / "nanox-screen.png", "NANOX")
+        if typing:
+            marks = [m for _, m, _ in SHELL_TEST if m]
+            keyboard = next((l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-KEYBOARD ")), "")
+            packets = re.search(r"host_mouse_packets=(\d+)", keyboard)
+            mouse = int(packets[1]) if packets else 0
+            r["linux"]["shell_test"] = {
+                "lines": [next((g for g in guest if m in g), None) for m in marks],
+                "seconds_to_mark": typed,
+                "mouse_packets": mouse,
+                "ok": bool(typed) and (SHELL_SCRIPT or mouse >= len(MOUSE_EVENTS)) and all(
+                    s is not None and s >= least
+                    for s, (_, m, least) in zip(typed, SHELL_TEST) if m),
+            }
+    return r
+
+
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
+
+
+def linux_screen(lines, png: Path, tag="LINUX"):
+    """A screen from the probe's dump (svm-probe linux.rs `dump_screen`; LINUX is the
+    guest's, NANOX the probe's display) as a PNG; its pixels are checked against the
+    probe's hash."""
+    head = [l for l in lines if l.startswith(f"NANOX:SVM-PROBE:{tag}-SCREEN ")]
+    if not head:
+        return None
+    m = re.fullmatch(rf"NANOX:SVM-PROBE:{tag}-SCREEN width=(\d+) height=(\d+)", head[0])
+    w, h = int(m[1]), int(m[2])
+    rows = []
+    for l in lines:
+        if not l.startswith(f"NANOX:SVM-PROBE:{tag}-FB "):
+            continue
+        runs = l.split()[1:]
+        if runs == ["="]:
+            rows.append(rows[-1])
+            continue
+        row = b"".join(bytes.fromhex(px) * int(n, 16) for n, px in (r.split(":") for r in runs))
+        rows.append(row)
+    end = [l for l in lines if l.startswith(f"NANOX:SVM-PROBE:{tag}-SCREEN-END ")]
+    pixels = b"".join(rows)
+    fnv = FNV_OFFSET
+    for b in pixels:
+        fnv = ((fnv ^ b) * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    complete = len(rows) == h and all(len(r) == 3 * w for r in rows) and bool(end)
+    ok = complete and end[0] == f"NANOX:SVM-PROBE:{tag}-SCREEN-END fnv={fnv:016x}"
+    if ok:
+        png.write_bytes(png_rgb(w, h, rows))
+    return {
+        "width": w,
+        "height": h,
+        "rows": len(rows),
+        "fnv": f"{fnv:016x}",
+        "match": ok,
+        "lit_pixels": sum(1 for i in range(0, len(pixels), 3) if pixels[i:i + 3] != bytes(3)),
+        "png": str(png) if ok else None,
+    }
+
+
+def png_rgb(w, h, rows):
+    """An 8-bit RGB PNG of `rows` (3 * w bytes each)."""
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data)))
+    raw = b"".join(b"\0" + r for r in rows)
+    return (bytes([0x89]) + b"PNG" + bytes([0x0D, 0x0A, 0x1A, 0x0A])
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
+
+
+def linux_summary(guest, lines):
+    """What the Linux guest printed: its report, and how far it got."""
+    begin = next((i for i, l in enumerate(guest) if "NANOX_GUEST_REPORT_BEGIN" in l), None)
+    end = next((i for i, l in enumerate(guest) if "NANOX_GUEST_REPORT_END" in l), None)
+    progress = [l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-PROGRESS")]
+    return {
+        "guest_lines": len(guest),
+        "report_complete": begin is not None and end is not None and end > begin,
+        "report": guest[begin:end + 1] if begin is not None and end is not None else None,
+        "last_guest_lines": guest[-20:],
+        "last_progress": progress[-1] if progress else None,
+        "case": next((l for l in lines if l.startswith("NANOX:SVM-PROBE:CASE linux ")), None),
+        "agent": next((l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-AGENT ")), None),
     }
 
 
@@ -240,6 +645,9 @@ def main() -> int:
              "-p", "svm-probe", "--target", "x86_64-unknown-uefi"],
             cwd=ROOT, check=True,
         )
+        if LINUX_KERNEL and not LINUX_INIT:
+            subprocess.run([sys.executable, "tools/native/build.py", "--package",
+                            "linux-probe-init"], cwd=ROOT, check=True)
     if "--repro" in sys.argv:
         return repro(int(option("--runs") or 2))
     code = Path(os.environ["NANOX_OVMF_CODE"])
@@ -259,23 +667,68 @@ def main() -> int:
         "qemu": qemu,
         "profiles": {},
     }
+    if SHOW:
+        if not os.path.exists(QEMU_DISPLAY):
+            print(f"--show needs a QEMU with a window at {QEMU_DISPLAY}: "
+                  "nix build .#qemu-display --out-link ~/.nix-qemu-display")
+            return 2
+        summary["qemu_display"] = subprocess.run(
+            [QEMU_DISPLAY, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
+    profiles = [] if "--linux-only" in sys.argv else list(PROFILES)
+    initrd = None
+    disk = None
+    if LINUX_KERNEL:
+        initrd = linux_initrd(out)
+        disk = Path(LINUX_DISK) if LINUX_DISK else linux_test_disk(out)
+        init = Path(LINUX_INIT) if LINUX_INIT else LINUX_INIT_DEFAULT
+        summary["linux"] = {
+            "kernel": LINUX_KERNEL,
+            "kernel_sha256": sha256(Path(LINUX_KERNEL)),
+            "init": str(init),
+            "initrd_given": LINUX_INITRD,
+            "init_sha256": sha256(init),
+            "initrd_bytes": initrd.stat().st_size,
+            "initrd_sha256": sha256(initrd),
+            "cmdline": LINUX_CMDLINE,
+            "host_tick_ns": LINUX_HOST_TICK or "probe default",
+            "disk": str(disk),
+            "disk_sha256": sha256(disk),
+        }
+        profiles.append(LINUX_PROFILE)
     ok = True
-    for name, cpu, want_status, want_line in PROFILES:
-        r = run_profile(out, name, cpu, code, vars_src)
+    for name, cpu, want_status, want_line in profiles:
+        r = run_profile(out, name, cpu, code, vars_src,
+                        linux=initrd if name == "linux" else None,
+                        disk=disk if name == "linux" else None)
         r["expected_status"] = want_status
         r["expected_line"] = want_line
-        r["match"] = r["status"] == want_status and want_line in r["serial_lines"]
+        # Shown, the run ends when the window is closed: only the RESULT line counts.
+        status_ok = r["status"] == want_status or r["shown"]
+        r["match"] = status_ok and want_line in r["serial_lines"]
+        if SHELL_TESTING and "linux" in r:
+            r["match"] &= r["linux"]["shell_test"]["ok"]
         ok &= r["match"]
         summary["profiles"][name] = r
         print(f"{name:7} status={r['status']} match={r['match']} ({r['seconds']} s)")
-    cmp = compare_m0(summary["profiles"]["svm"]["serial_lines"], kernel_sha)
-    summary["m0_comparison"] = cmp
-    for case, c in cmp.items():
-        if c["compared"]:
-            ok &= c["equal"]
-            print(f"{case:9} vs QEMU {c['record']}: equal={c['equal']}")
-        else:
-            print(f"{case:9} not compared: {c['reason']}")
+        if "linux" in r:
+            print(f"        {r['linux']['case']}")
+            print(f"        screen: {r['linux']['screen']}")
+            print(f"        nanox screen: {r['linux']['nanox_screen']}")
+            if "shell_test" in r["linux"]:
+                print(f"        shell test: {r['linux']['shell_test']}")
+    if initrd and not LINUX_INITRD:
+        # The archive is rebuilt from the init on every run; its hash is recorded.
+        # A given initramfs (--linux-initrd) is the caller's and stays.
+        initrd.unlink()
+    if "svm" in summary["profiles"]:
+        cmp = compare_m0(summary["profiles"]["svm"]["serial_lines"], kernel_sha)
+        summary["m0_comparison"] = cmp
+        for case, c in cmp.items():
+            if c["compared"]:
+                ok &= c["equal"]
+                print(f"{case:9} vs QEMU {c['record']}: equal={c['equal']}")
+            else:
+                print(f"{case:9} not compared: {c['reason']}")
     summary["match"] = ok
     (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     print(f"records: {out}")

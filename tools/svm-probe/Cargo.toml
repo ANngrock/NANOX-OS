@@ -10,6 +10,12 @@ publish = false
 hw-svm = { path = "../../crates/hw-svm" }
 guest-boot = { path = "../../crates/guest-boot" }
 boot-protocol = { path = "../../crates/boot-protocol" }
+vmm-devices = { path = "../../crates/vmm-devices" }
+vswitch = { path = "../../crates/vswitch" }
+fb-console = { path = "../../crates/fb-console" }
+canvas = { path = "../../crates/canvas" }
+serverwin = { path = "../../crates/serverwin" }
+virtio-driver = { path = "../../crates/virtio-driver" }
 
 [[bin]]
 name = "svm-probe"

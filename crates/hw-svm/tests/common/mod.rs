@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use hw_svm::exit::code;
 use hw_svm::npt::Npt;
 use hw_svm::perm::{IoPermissionMap, MsrPermissionMap, IOPM_BYTES, MSRPM_BYTES};
+use hw_svm::platform_vm::{Host, PlatformVcpu};
 use hw_svm::vmcb::{ctl, tlb, Gprs, Vmcb};
 use hw_svm::vmm::{Outcome, Vcpu, VmConfig};
 use hw_svm::{Clock, FrameAlloc, NptPerms, PhysMem, SvmCpu, PAGE_SIZE};
@@ -185,11 +186,21 @@ pub enum Step {
         len: u8,
         assist: bool,
     },
+    /// A nested page fault with this error code at `gpa`, without progress
+    /// (a fetch, a page-table walk, a permission fault).
+    Npf {
+        gpa: u64,
+        error: u64,
+    },
     /// Sets RFLAGS.IF; the next step is in the interrupt shadow.
     Sti,
     Cli,
     /// PAUSE; must be intercepted.
     Pause,
+    /// RDTSC: exits if intercepted (the result goes to `rdtsc_results`), else reads the host TSC.
+    Rdtsc,
+    /// RDTSCP: exits if intercepted, else reads the host TSC.
+    Rdtscp,
 }
 
 impl Step {
@@ -202,8 +213,9 @@ impl Step {
             | Step::MsrEmulated { .. } => 2,
             Step::Vmmcall => 3,
             Step::Hlt | Step::Sti | Step::Cli => 1,
-            Step::Pause => 2,
-            Step::Load { .. } | Step::Store { .. } => 3,
+            Step::Pause | Step::Rdtsc => 2,
+            Step::Rdtscp => 3,
+            Step::Load { .. } | Step::Store { .. } | Step::Npf { .. } => 3,
             Step::Tick | Step::SpinForever | Step::TripleFault => 2,
             Step::Mmio { len, .. } => u64::from(len),
         }
@@ -243,6 +255,10 @@ pub struct FakeCpu {
     pub injected: Vec<u64>,
     pub cpuid_results: Vec<[u32; 4]>,
     pub rdmsr_results: Vec<u64>,
+    /// EDX:EAX of every RDTSC/RDTSCP, intercepted or not.
+    pub rdtsc_results: Vec<u64>,
+    /// The host's TSC for reads the VMM does not intercept; each read adds 1000.
+    pub host_tsc: u64,
     pub loads: Vec<u8>,
     pub vmruns: u64,
     pub msrs: HashMap<u32, u64>,
@@ -290,6 +306,8 @@ impl FakeCpu {
             injected: Vec::new(),
             cpuid_results: Vec::new(),
             rdmsr_results: Vec::new(),
+            rdtsc_results: Vec::new(),
+            host_tsc: 0x10_0000_0000,
             loads: Vec::new(),
             vmruns: 0,
             msrs: HashMap::new(),
@@ -298,6 +316,15 @@ impl FakeCpu {
             interrupts: Vec::new(),
             ncr3: 0,
             sti_shadow: false,
+        }
+    }
+
+    /// Lays the script out from `entry` instead of [`ENTRY`] (a guest that starts elsewhere).
+    pub fn start_at(&mut self, entry: u64) {
+        let mut rip = entry;
+        for s in &mut self.steps {
+            s.0 = rip;
+            rip += s.1.len();
         }
     }
 
@@ -459,6 +486,16 @@ impl FakeCpu {
             Step::MsrEmulated { write: false, .. } if !injected => self
                 .rdmsr_results
                 .push(gprs.rdx << 32 | (vmcb.rax() & 0xFFFF_FFFF)),
+            Step::Rdtsc if !injected => {
+                if vmcb.rax() >> 32 != 0 || gprs.rdx >> 32 != 0 {
+                    self.violations.push(format!(
+                        "RDTSC: upper halves {:#x} {:#x}",
+                        vmcb.rax(),
+                        gprs.rdx
+                    ));
+                }
+                self.rdtsc_results.push(gprs.rdx << 32 | vmcb.rax());
+            }
             _ => {}
         }
         self.pos = p.index + 1;
@@ -550,6 +587,35 @@ impl SvmCpu for FakeCpu {
                     Self::exit(vmcb, code::PAUSE, 0, 0, next);
                     self.pending = pend(true, false);
                     return;
+                }
+                Step::Rdtsc | Step::Rdtscp => {
+                    let (m, bit, exit) = if step == Step::Rdtsc {
+                        (
+                            ctl::INTERCEPT_MISC1,
+                            hw_svm::vmcb::misc1::RDTSC,
+                            code::RDTSC,
+                        )
+                    } else {
+                        (
+                            ctl::INTERCEPT_MISC2,
+                            hw_svm::vmcb::misc2::RDTSCP,
+                            code::RDTSCP,
+                        )
+                    };
+                    if vmcb.read_u32(m) & bit != 0 {
+                        vmcb.set_rax(0xDEAD_BEEF_DEAD_BEEF);
+                        gprs.rdx = 0xDEAD_BEEF_DEAD_BEEF;
+                        Self::exit(vmcb, exit, 0, 0, next);
+                        // RDTSCP is expected to fault (the platform hides it).
+                        self.pending = pend(true, step == Step::Rdtscp);
+                        return;
+                    }
+                    let t = self.host_tsc;
+                    self.host_tsc += 1000;
+                    vmcb.set_rax(t & 0xFFFF_FFFF);
+                    gprs.rdx = t >> 32;
+                    self.rdtsc_results.push(t);
+                    self.pos += 1;
                 }
                 Step::MsrEmulated { msr, write, value } => {
                     gprs.rcx = u64::from(msr);
@@ -675,6 +741,12 @@ impl SvmCpu for FakeCpu {
                         }
                     }
                 }
+                Step::Npf { gpa, error } => {
+                    Self::exit(vmcb, code::NPF, error, gpa, rip);
+                    vmcb.write_u8(ctl::INSN_LEN, 0);
+                    self.pending = pend(false, false);
+                    return;
+                }
                 Step::Tick => {
                     Self::exit(vmcb, code::INTR, 0, 0, rip);
                     self.pending = pend(false, false);
@@ -743,6 +815,13 @@ pub struct Rig {
 }
 
 impl Rig {
+    /// A rig for `PlatformVcpu`: its MSR policy in the permission map.
+    pub fn platform(script: &[Step]) -> Self {
+        let mut rig = Self::new(script);
+        rig.cpu.mem.write_bytes(MSRPM_PA, &platform_msr_map_bytes());
+        rig
+    }
+
     pub fn new(script: &[Step]) -> Self {
         let mut mem = Mem::new();
         let mut frames = Frames::new();
@@ -772,6 +851,25 @@ impl Rig {
             ram,
             clock: FakeClock { now: 0, step: 1 },
             prepared: false,
+        }
+    }
+
+    /// Maps more guest RAM: pages `RAM_PAGES..pages` at their identity GPAs (filled with zeros).
+    pub fn map_ram(&mut self, pages: u64) {
+        for i in self.ram.len() as u64..pages {
+            let f = self.cpu.frames.alloc_frame().unwrap();
+            self.cpu.mem.write_bytes(f, &[0; 4096]);
+            self.npt
+                .map(
+                    &mut self.cpu.mem,
+                    &mut self.cpu.frames,
+                    i * PAGE_SIZE,
+                    f,
+                    PAGE_SIZE,
+                    RW,
+                )
+                .expect("map RAM");
+            self.ram.push(f);
         }
     }
 
@@ -807,6 +905,23 @@ pub fn run(rig: &mut Rig, vcpu: &mut Vcpu<'_>) -> Outcome {
         rig.prepared = true;
     }
     vcpu.run(&mut rig.cpu, &mut rig.clock, &mut vmcb, &mut rig.gprs)
+}
+
+/// Runs the rig's guest on the platform vCPU with `host`.
+pub fn run_platform(rig: &mut Rig, vcpu: &mut PlatformVcpu<'_>, host: &mut Host<'_>) -> Outcome {
+    let mut vmcb = Vmcb::wrap(&mut rig.page);
+    if !rig.prepared {
+        vcpu.prepare(&mut vmcb);
+        rig.prepared = true;
+    }
+    vcpu.run(&mut rig.cpu, &mut rig.clock, host, &mut vmcb, &mut rig.gprs)
+}
+
+pub fn platform_msr_map_bytes() -> Vec<u8> {
+    let mut m = [0u8; MSRPM_BYTES];
+    let mut map = MsrPermissionMap::intercept_all(&mut m);
+    PlatformVcpu::msr_policy(&mut map);
+    m.to_vec()
 }
 
 pub fn msr_map_bytes() -> Vec<u8> {

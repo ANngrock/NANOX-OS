@@ -74,6 +74,7 @@ pub mod misc1 {
     pub const SMI: u32 = 1 << 2;
     pub const INIT: u32 = 1 << 3;
     pub const VINTR: u32 = 1 << 4;
+    pub const RDTSC: u32 = 1 << 14;
     pub const CPUID: u32 = 1 << 18;
     pub const PAUSE: u32 = 1 << 23;
     pub const HLT: u32 = 1 << 24;
@@ -91,6 +92,7 @@ pub mod misc2 {
     pub const STGI: u32 = 1 << 4;
     pub const CLGI: u32 = 1 << 5;
     pub const SKINIT: u32 = 1 << 6;
+    pub const RDTSCP: u32 = 1 << 7;
     pub const XSETBV: u32 = 1 << 13;
 }
 
@@ -373,6 +375,44 @@ impl<'a> Vmcb<'a> {
         self.write_u64(save::RSP, stack);
         // PAT power-on default.
         self.write_u64(save::G_PAT, 0x0007_0406_0007_0406);
+    }
+
+    /// The 64-bit entry of the Linux x86 boot protocol, as `guest_boot::linux` leaves it:
+    /// `__BOOT_CS` = 0x10 (64-bit code) and `__BOOT_DS` = 0x18 in every data segment, the
+    /// loader's GDT, paging on with CR3 = `cr3` (identity map), CR4 = PAE, EFER = LME | LMA
+    /// (Linux turns NX and SCE on itself), RIP = `entry`, no stack, interrupts off. The caller
+    /// puts the zero page's address in RSI (`Gprs::rsi`).
+    pub fn setup_linux_boot(&mut self, entry: u64, cr3: u64, gdt_base: u64, gdt_limit: u16) {
+        use bits::*;
+        self.setup_long_mode(entry, cr3, 0);
+        let data = Segment {
+            selector: 0x18,
+            attrib: attr::DATA,
+            limit: 0xFFFF_FFFF,
+            base: 0,
+        };
+        self.set_segment(
+            save::CS,
+            Segment {
+                selector: 0x10,
+                attrib: attr::CODE_64,
+                limit: 0xFFFF_FFFF,
+                base: 0,
+            },
+        );
+        for off in [save::DS, save::ES, save::SS, save::FS, save::GS] {
+            self.set_segment(off, data);
+        }
+        self.set_segment(
+            save::GDTR,
+            Segment {
+                limit: u32::from(gdt_limit),
+                base: gdt_base,
+                ..Segment::default()
+            },
+        );
+        self.write_u64(save::EFER, EFER_LME | EFER_LMA | EFER_SVME);
+        self.write_u64(save::CR4, CR4_PAE);
     }
 
     /// The VMRUN consistency checks (APM 15.5.1) plus this VMM's own

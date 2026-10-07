@@ -40,5 +40,14 @@
           echo "NANOX M0: Rust 1.90.0; use cargo xtask doctor"
         '';
       };
+      packages.${system} = {
+        # QEMU with a window (GTK), to watch a run rather than record it:
+        # `nix build .#qemu-display`, then run.py --show. Not in the shell: the
+        # records and replays keep the minimal, patched QEMU above.
+        qemu-display = pkgs.qemu_kvm;
+        # A static busybox for the Linux guest's interactive shell (run.py
+        # --show): `nix build .#guest-busybox`.
+        guest-busybox = pkgs.pkgsStatic.busybox;
+      };
     };
 }

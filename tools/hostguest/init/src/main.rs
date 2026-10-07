@@ -1,5 +1,10 @@
 //! Init for the measurement boot: mounts the pseudo file systems, prints what
-//! the guest kernel reports about its machine on the console, and powers off.
+//! the guest kernel reports about its machine on the console, greets the host
+//! on the agent channel (virtio-console, `/dev/hvc0`) when there is one,
+//! reports a line typed on the keyboard (the first virtual terminal), brings up
+//! `eth0` and pings the host (10.0.2.2) when there is a network card, and
+//! powers off — after an interactive busybox shell on the first virtual
+//! terminal if the command line has `nanox.shell` (run.py --show).
 //! Raw Linux system calls, no libc: the same kind of freestanding static
 //! program a NANOX native process is.
 
@@ -13,20 +18,68 @@ const SYS_READ: usize = 0;
 const SYS_WRITE: usize = 1;
 const SYS_OPEN: usize = 2;
 const SYS_CLOSE: usize = 3;
+const SYS_POLL: usize = 7;
+const SYS_IOCTL: usize = 16;
+const SYS_SOCKET: usize = 41;
+const SYS_SENDTO: usize = 44;
+const SYS_RECVFROM: usize = 45;
 const SYS_DUP2: usize = 33;
 const SYS_MKDIR: usize = 83;
 const SYS_MOUNT: usize = 165;
 const SYS_REBOOT: usize = 169;
 const SYS_EXIT_GROUP: usize = 231;
+const SYS_FORK: usize = 57;
+const SYS_EXECVE: usize = 59;
+const SYS_WAIT4: usize = 61;
+const SYS_SETSID: usize = 112;
+const O_RDWR: usize = 2;
+const O_NOCTTY: usize = 0o400;
+const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+/// `c_oflag`: output processing (`\n` to `\r\n`).
+const OPOST: u32 = 0o1;
+/// `c_lflag`: echo of the input.
+const ECHO: u32 = 0o10;
+const POLLIN: u16 = 1;
+/// How long the host may take to answer on the agent channel.
+const AGENT_WAIT_MS: usize = 1000;
+/// How long a line may take to be typed.
+const TYPING_WAIT_MS: usize = 2000;
+const AF_INET: u16 = 2;
+const SOCK_DGRAM: usize = 2;
+const SOCK_RAW: usize = 3;
+const IPPROTO_ICMP: usize = 1;
+const SIOCGIFFLAGS: usize = 0x8913;
+const SIOCSIFFLAGS: usize = 0x8914;
+const SIOCSIFADDR: usize = 0x8916;
+const SIOCSIFNETMASK: usize = 0x891C;
+const IFF_UP: u8 = 1;
+/// The guest's address and the host's on the VMM's network (as QEMU's user network has them).
+const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+const NETMASK: [u8; 4] = [255, 255, 255, 0];
+const HOST_IP: [u8; 4] = [10, 0, 2, 2];
+const PING_DATA: &[u8] = b"NANOX ping";
+/// How long the host may take to answer a ping.
+const PING_WAIT_MS: usize = 1000;
+/// How long the link may take to come up after `eth0` does: Linux starts the
+/// interface's packet queue from its link-watch work, which runs at most once
+/// a second, and drops what is sent before (the first ARP request would be
+/// lost and repeated only a second later).
+const LINK_WAIT_MS: usize = 2000;
 
 unsafe fn syscall(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
+    // SAFETY: the caller's arguments; the sixth is 0.
+    unsafe { syscall6(n, a, b, c, d, e, 0) }
+}
+
+unsafe fn syscall6(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> isize {
     let ret: isize;
     // SAFETY: the Linux system call ABI; the arguments are the caller's.
     unsafe {
         asm!(
             "syscall",
             inlateout("rax") n as isize => ret,
-            in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d, in("r8") e,
+            in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d, in("r8") e, in("r9") f,
             lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
@@ -146,6 +199,395 @@ fn pci_devices() {
     }
 }
 
+/// The agent channel (virtio-console port 0, `/dev/hvc0`): one line to the
+/// host, and its answer line (if it comes within [`AGENT_WAIT_MS`]) on the console.
+fn agent() {
+    write(1, b"--- agent\n");
+    let mut b = [0u8; 128];
+    let p = path("/dev/hvc0", &mut b);
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { syscall(SYS_OPEN, p, O_RDWR | O_NOCTTY, 0, 0, 0) };
+    if fd < 0 {
+        write(1, b"(not available)\n");
+        return;
+    }
+    let fd = fd as usize;
+    // The kernel's struct termios: four flag words, the line discipline and 19
+    // control characters. Raw output and no echo: the host gets exactly the
+    // bytes written, and its answer is not sent back to it.
+    let mut t = [0u32; 9];
+    // SAFETY: a buffer of the kernel's termios size for TCGETS and TCSETS.
+    unsafe {
+        if syscall(SYS_IOCTL, fd, TCGETS, t.as_mut_ptr() as usize, 0, 0) == 0 {
+            t[1] &= !OPOST;
+            t[3] &= !ECHO;
+            syscall(SYS_IOCTL, fd, TCSETS, t.as_ptr() as usize, 0, 0);
+        }
+    }
+    write(fd, b"NANOX_AGENT_HELLO\n");
+    // struct pollfd: fd, events, revents.
+    let mut pfd = [fd as u32, u32::from(POLLIN)];
+    // SAFETY: one pollfd; the canonical tty returns one line per read.
+    let ready = unsafe { syscall(SYS_POLL, pfd.as_mut_ptr() as usize, 1, AGENT_WAIT_MS, 0, 0) };
+    let mut line = [0u8; 128];
+    let n = if ready > 0 {
+        // SAFETY: a valid buffer.
+        unsafe { syscall(SYS_READ, fd, line.as_mut_ptr() as usize, line.len(), 0, 0) }
+    } else {
+        0
+    };
+    if n > 0 {
+        write(1, &line[..n as usize]);
+    } else {
+        write(1, b"(no answer)\n");
+    }
+    // SAFETY: closing the descriptor we opened.
+    unsafe { syscall(SYS_CLOSE, fd, 0, 0, 0, 0) };
+}
+
+/// `n` in decimal.
+fn write_dec(fd: usize, mut n: usize) {
+    let mut d = [0u8; 20];
+    let mut i = d.len();
+    loop {
+        i -= 1;
+        d[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    write(fd, &d[i..]);
+}
+
+/// A struct sockaddr_in: AF_INET, port 0, `addr`.
+fn sockaddr(addr: [u8; 4]) -> [u8; 16] {
+    let mut s = [0u8; 16];
+    s[..2].copy_from_slice(&AF_INET.to_le_bytes());
+    s[4..8].copy_from_slice(&addr);
+    s
+}
+
+/// A struct ifreq for `eth0`, its union holding a struct sockaddr_in of `addr`.
+fn ifreq(addr: [u8; 4]) -> [u8; 40] {
+    let mut r = [0u8; 40];
+    r[..4].copy_from_slice(b"eth0");
+    r[16..32].copy_from_slice(&sockaddr(addr));
+    r
+}
+
+/// The Internet checksum (RFC 1071).
+fn checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for pair in data.chunks(2) {
+        sum += u32::from(u16::from_be_bytes([
+            pair[0],
+            pair.get(1).copied().unwrap_or(0),
+        ]));
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Whether `eth0`'s operational state becomes "up" within [`LINK_WAIT_MS`].
+fn link_up() -> bool {
+    let mut b = [0u8; 128];
+    let p = path("/sys/class/net/eth0/operstate", &mut b);
+    for _ in 0..LINK_WAIT_MS / 10 {
+        let mut state = [0u8; 16];
+        // SAFETY: a NUL-terminated path, a valid buffer, our descriptor; a
+        // poll without descriptors sleeps 10 ms.
+        let n = unsafe {
+            let fd = syscall(SYS_OPEN, p, 0, 0, 0, 0);
+            if fd < 0 {
+                return false;
+            }
+            let n = syscall(SYS_READ, fd as usize, state.as_mut_ptr() as usize, 16, 0, 0);
+            syscall(SYS_CLOSE, fd as usize, 0, 0, 0, 0);
+            n
+        };
+        if n >= 2 && state.starts_with(b"up") {
+            return true;
+        }
+        // SAFETY: as above.
+        unsafe { syscall(SYS_POLL, 0, 0, 10, 0, 0) };
+    }
+    false
+}
+
+/// `eth0` gets [`GUEST_IP`]/24 and is brought up; one ICMP echo request goes
+/// to [`HOST_IP`] and its reply (if it comes within [`PING_WAIT_MS`]) is
+/// reported.
+fn net() {
+    write(1, b"--- net\n");
+    // SAFETY: the socket, ioctl and close system calls with buffers of the
+    // kernel's struct ifreq size; the descriptor is ours.
+    let up = unsafe {
+        let s = syscall(SYS_SOCKET, AF_INET as usize, SOCK_DGRAM, 0, 0, 0);
+        if s < 0 {
+            false
+        } else {
+            let s = s as usize;
+            let (addr, mask, mut flags) = (ifreq(GUEST_IP), ifreq(NETMASK), ifreq([0; 4]));
+            let ok = syscall(SYS_IOCTL, s, SIOCSIFADDR, addr.as_ptr() as usize, 0, 0) == 0
+                && syscall(SYS_IOCTL, s, SIOCSIFNETMASK, mask.as_ptr() as usize, 0, 0) == 0
+                && syscall(
+                    SYS_IOCTL,
+                    s,
+                    SIOCGIFFLAGS,
+                    flags.as_mut_ptr() as usize,
+                    0,
+                    0,
+                ) == 0
+                && {
+                    flags[16] |= IFF_UP;
+                    syscall(SYS_IOCTL, s, SIOCSIFFLAGS, flags.as_ptr() as usize, 0, 0) == 0
+                };
+            syscall(SYS_CLOSE, s, 0, 0, 0, 0);
+            ok
+        }
+    };
+    if !up {
+        write(1, b"(no eth0)\n");
+        return;
+    }
+    write(1, b"eth0 10.0.2.15/24 up\n");
+    if !link_up() {
+        write(1, b"(link down)\n");
+        return;
+    }
+    // SAFETY: a raw ICMP socket (init runs as root).
+    let r = unsafe { syscall(SYS_SOCKET, AF_INET as usize, SOCK_RAW, IPPROTO_ICMP, 0, 0) };
+    if r < 0 {
+        write(1, b"(no raw socket)\n");
+        return;
+    }
+    let r = r as usize;
+    // Echo request: type 8, code 0, checksum, identifier "NX", sequence 1, data.
+    let mut req = [0u8; 8 + PING_DATA.len()];
+    req[..8].copy_from_slice(&[8, 0, 0, 0, b'N', b'X', 0, 1]);
+    req[8..].copy_from_slice(PING_DATA);
+    let sum = checksum(&req);
+    req[2..4].copy_from_slice(&sum.to_be_bytes());
+    let to = sockaddr(HOST_IP);
+    let mut pfd = [r as u32, u32::from(POLLIN)];
+    let mut buf = [0u8; 128];
+    // SAFETY: a valid buffer and address for sendto.
+    let sent = unsafe {
+        syscall6(
+            SYS_SENDTO,
+            r,
+            req.as_ptr() as usize,
+            req.len(),
+            0,
+            to.as_ptr() as usize,
+            to.len(),
+        )
+    };
+    if sent != req.len() as isize {
+        write(1, b"(send failed: errno ");
+        write_dec(1, sent.unsigned_abs());
+        write(1, b")\n");
+    }
+    // SAFETY: one pollfd and a valid buffer for recvfrom.
+    let n = unsafe {
+        if sent == req.len() as isize
+            && syscall(SYS_POLL, pfd.as_mut_ptr() as usize, 1, PING_WAIT_MS, 0, 0) > 0
+        {
+            syscall(SYS_RECVFROM, r, buf.as_mut_ptr() as usize, buf.len(), 0, 0)
+        } else {
+            0
+        }
+    };
+    // SAFETY: closing the descriptor we opened.
+    unsafe { syscall(SYS_CLOSE, r, 0, 0, 0, 0) };
+    // A raw socket gets the IPv4 header, then the ICMP message.
+    let n = n.max(0) as usize;
+    let ihl = usize::from(buf[0] & 0x0F) * 4;
+    let reply = buf.get(ihl..n).unwrap_or(&[]);
+    if reply.len() == req.len() && reply[0] == 0 && reply[4..] == req[4..] && checksum(reply) == 0 {
+        write(1, b"ping 10.0.2.2: echo reply, ttl ");
+        write_dec(1, usize::from(buf[8]));
+        write(1, b", ");
+        write_dec(1, n);
+        write(1, b" bytes\n");
+    } else {
+        write(1, b"(no reply)\n");
+        cat("net/dev", "/proc/net/dev");
+        cat("net/arp", "/proc/net/arp");
+    }
+}
+
+/// The first virtual terminal (the screen's console and the keyboard's), opened
+/// before the host is greeted: the host types on it once it has answered.
+fn open_tty() -> isize {
+    let mut b = [0u8; 128];
+    let p = path("/dev/tty1", &mut b);
+    // SAFETY: a NUL-terminated path.
+    unsafe { syscall(SYS_OPEN, p, O_RDWR | O_NOCTTY, 0, 0, 0) }
+}
+
+/// A line typed on the keyboard, if one comes within [`TYPING_WAIT_MS`]; the
+/// terminal echoes it on the screen.
+fn keyboard(tty: isize) {
+    write(1, b"--- keyboard\n");
+    if tty < 0 {
+        write(1, b"(not available)\n");
+        return;
+    }
+    let fd = tty as usize;
+    let mut pfd = [fd as u32, u32::from(POLLIN)];
+    let mut line = [0u8; 128];
+    // SAFETY: one pollfd and a valid buffer; the canonical tty returns one line per read.
+    let n = unsafe {
+        if syscall(SYS_POLL, pfd.as_mut_ptr() as usize, 1, TYPING_WAIT_MS, 0, 0) > 0 {
+            syscall(SYS_READ, fd, line.as_mut_ptr() as usize, line.len(), 0, 0)
+        } else {
+            0
+        }
+    };
+    if n > 0 {
+        write(1, b"typed: ");
+        write(1, &line[..n as usize]);
+    } else {
+        write(1, b"(nothing typed)\n");
+    }
+    // SAFETY: closing the descriptor we opened.
+    unsafe { syscall(SYS_CLOSE, fd, 0, 0, 0, 0) };
+}
+
+/// Whether the kernel command line asks for the interactive shell.
+fn shell_wanted() -> bool {
+    let mut b = [0u8; 128];
+    let p = path("/proc/cmdline", &mut b);
+    let mut line = [0u8; 1024];
+    // SAFETY: a NUL-terminated path, a valid buffer, our descriptor.
+    let n = unsafe {
+        let fd = syscall(SYS_OPEN, p, 0, 0, 0, 0);
+        if fd < 0 {
+            return false;
+        }
+        let n = syscall(
+            SYS_READ,
+            fd as usize,
+            line.as_mut_ptr() as usize,
+            line.len(),
+            0,
+            0,
+        );
+        syscall(SYS_CLOSE, fd as usize, 0, 0, 0, 0);
+        n
+    };
+    let line = &line[..n.max(0) as usize];
+    line.windows(11).any(|w| w == b"nanox.shell")
+}
+
+/// Runs the program `argv[0]` (at most seven NUL-terminated strings) in a
+/// child and waits for it. With `tty`, the child starts a session whose controlling terminal
+/// that is, on its standard input, output and error.
+fn spawn(argv: &[&[u8]], tty: Option<&[u8]>) {
+    const ENV: [&[u8]; 4] = [
+        b"HOME=/\0",
+        b"PATH=/bin\0",
+        b"TERM=linux\0",
+        b"PS1=nanox-guest:$PWD# \0",
+    ];
+    let mut args = [0usize; 8];
+    for (slot, a) in args.iter_mut().zip(argv) {
+        *slot = a.as_ptr() as usize;
+    }
+    let mut env = [0usize; ENV.len() + 1];
+    for (slot, e) in env.iter_mut().zip(ENV) {
+        *slot = e.as_ptr() as usize;
+    }
+    // SAFETY: fork, then in the child setsid, open, dup2 and execve with
+    // NUL-terminated strings and NULL-terminated pointer arrays that live on
+    // this stack (copied into the child by fork); the parent waits for its child.
+    unsafe {
+        let pid = syscall(SYS_FORK, 0, 0, 0, 0, 0);
+        if pid == 0 {
+            if let Some(t) = tty {
+                syscall(SYS_SETSID, 0, 0, 0, 0, 0);
+                // A session leader's first terminal becomes its controlling one.
+                let fd = syscall(SYS_OPEN, t.as_ptr() as usize, O_RDWR, 0, 0, 0);
+                if fd >= 0 {
+                    for to in 0..3 {
+                        syscall(SYS_DUP2, fd as usize, to, 0, 0, 0);
+                    }
+                }
+            }
+            syscall(
+                SYS_EXECVE,
+                args[0],
+                args.as_ptr() as usize,
+                env.as_ptr() as usize,
+                0,
+                0,
+            );
+            syscall(SYS_EXIT_GROUP, 127, 0, 0, 0, 0);
+        }
+        if pid > 0 {
+            let mut status = 0u32;
+            loop {
+                let r = syscall(
+                    SYS_WAIT4,
+                    pid as usize,
+                    &mut status as *mut u32 as usize,
+                    0,
+                    0,
+                    0,
+                );
+                if r == pid || r < 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The interactive shell: busybox's commands linked into /bin, the kernel's
+/// console quieted (its messages would land in the middle of what is typed;
+/// `dmesg` still has them), a greeting on the first virtual terminal, then
+/// `sh` there until it exits.
+fn shell() {
+    const BUSYBOX: &[u8] = b"/bin/busybox\0";
+    const TTY: &[u8] = b"/dev/tty1\0";
+    // SAFETY: a NUL-terminated path; the descriptor is closed at once.
+    let fd = unsafe { syscall(SYS_OPEN, BUSYBOX.as_ptr() as usize, 0, 0, 0, 0) };
+    if fd < 0 {
+        write(1, b"(no shell: /bin/busybox is missing)\n");
+        return;
+    }
+    // SAFETY: closing the descriptor we opened.
+    unsafe { syscall(SYS_CLOSE, fd as usize, 0, 0, 0, 0) };
+    spawn(&[BUSYBOX, b"--install\0", b"-s\0", b"/bin\0"], None);
+    let mut b = [0u8; 128];
+    let p = path("/proc/sys/kernel/printk", &mut b);
+    // SAFETY: a NUL-terminated path; write-only open; our descriptor.
+    unsafe {
+        let fd = syscall(SYS_OPEN, p, 1, 0, 0, 0);
+        if fd >= 0 {
+            write(fd as usize, b"1\n");
+            syscall(SYS_CLOSE, fd as usize, 0, 0, 0, 0);
+        }
+    }
+    // SAFETY: a NUL-terminated path; the descriptor is ours.
+    let tty = unsafe { syscall(SYS_OPEN, TTY.as_ptr() as usize, O_RDWR | O_NOCTTY, 0, 0, 0) };
+    if tty >= 0 {
+        write(
+            tty as usize,
+            b"\n  Linux under the NANOX VMM: a busybox shell.\n  Try: uname -a, ls /, ps, free, cat /proc/cpuinfo, ping -c 3 10.0.2.2\n  'exit' powers the guest off.\n\n",
+        );
+        // SAFETY: closing the descriptor we opened.
+        unsafe { syscall(SYS_CLOSE, tty as usize, 0, 0, 0, 0) };
+    }
+    write(1, b"NANOX_SHELL_READY\n");
+    spawn(&[b"/bin/sh\0"], Some(TTY));
+    write(1, b"NANOX_SHELL_EXIT\n");
+}
+
 #[no_mangle]
 extern "C" fn init_main() -> ! {
     mkdir("/dev");
@@ -173,8 +615,16 @@ extern "C" fn init_main() -> ! {
         "/sys/devices/system/clocksource/clocksource0/current_clocksource",
     );
     cat("devices", "/proc/devices");
+    cat("input", "/proc/bus/input/devices");
     pci_devices();
+    let tty = open_tty();
+    agent();
+    keyboard(tty);
+    net();
     write(1, b"NANOX_GUEST_REPORT_END\n");
+    if shell_wanted() {
+        shell();
+    }
     // SAFETY: the reboot system call with the documented magic numbers; power off.
     unsafe { syscall(SYS_REBOOT, 0xfee1dead, 672274793, 0x4321fedc, 0, 0) };
     // SAFETY: leaving the process.

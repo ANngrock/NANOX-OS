@@ -22,6 +22,10 @@
 //! `m0-*` cases boot a real NANOX kernel ELF (fw_cfg `opt/nanox/kernel.elf`)
 //! as a guest with 4 MiB of RAM: `guest-boot` builds the M0 handoff, and
 //! the kernel's own BootInfo validation decides whether it was right.
+//!
+//! The `linux` case (fw_cfg `opt/nanox/bzimage` and `opt/nanox/initrd`, when
+//! the runner passes them) boots a Linux kernel on the whole emulated
+//! platform (`hw_svm::platform_vm`): see `linux.rs`.
 
 #![no_std]
 #![no_main]
@@ -82,6 +86,10 @@ macro_rules! out {
     }};
 }
 
+mod host_disk;
+mod linux;
+mod screen;
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     out!("NANOX:SVM-PROBE:PANIC {}", info.message());
@@ -128,16 +136,17 @@ impl Phys {
     }
 }
 
-/// Guest RAM of the kernel guest: contiguous frames from `base`.
+/// Guest RAM of a kernel guest: `size` bytes of contiguous frames from `base`.
 struct GuestRam<'a> {
     phys: &'a mut Phys,
     base: u64,
+    size: u64,
 }
 
 impl GuestRam<'_> {
-    fn check(gpa: u64, len: usize) {
+    fn check(&self, gpa: u64, len: usize) {
         assert!(
-            gpa.checked_add(len as u64).is_some_and(|e| e <= KERNEL_RAM),
+            gpa.checked_add(len as u64).is_some_and(|e| e <= self.size),
             "guest access outside RAM: {gpa:#x}+{len:#x}"
         );
     }
@@ -145,12 +154,12 @@ impl GuestRam<'_> {
 
 impl guest_boot::GuestMemory for GuestRam<'_> {
     fn write(&mut self, gpa: u64, bytes: &[u8]) {
-        Self::check(gpa, bytes.len());
+        self.check(gpa, bytes.len());
         self.phys.copy(self.base + gpa, bytes);
     }
 
     fn read(&mut self, gpa: u64, out: &mut [u8]) {
-        Self::check(gpa, out.len());
+        self.check(gpa, out.len());
         self.phys.read_into(self.base + gpa, out);
     }
 }
@@ -171,15 +180,30 @@ impl PhysMem for Phys {
     }
 }
 
-/// Bump allocator over the frame region, reset for every guest.
+/// Frees the bump allocator keeps for reuse (only the error paths of
+/// `Npt::map` free frames).
+const FREE_SLOTS: usize = 64;
+
+/// Bump allocator over `pages` frames from `base`, reset for every guest.
 struct Frames {
     base: u64,
+    pages: usize,
     next: usize,
-    free: [u64; FRAME_PAGES],
+    free: [u64; FREE_SLOTS],
     nfree: usize,
 }
 
 impl Frames {
+    const fn new(base: u64, pages: usize) -> Self {
+        Self {
+            base,
+            pages,
+            next: 0,
+            free: [0; FREE_SLOTS],
+            nfree: 0,
+        }
+    }
+
     fn reset(&mut self) {
         self.next = 0;
         self.nfree = 0;
@@ -192,7 +216,7 @@ impl FrameAlloc for Frames {
             self.nfree -= 1;
             return Some(self.free[self.nfree]);
         }
-        if self.next == FRAME_PAGES {
+        if self.next == self.pages {
             return None;
         }
         self.next += 1;
@@ -200,7 +224,7 @@ impl FrameAlloc for Frames {
     }
 
     fn free_frame(&mut self, pa: u64) {
-        assert!(self.nfree < FRAME_PAGES, "double free of {pa:#x}");
+        assert!(self.nfree < FREE_SLOTS, "too many frees ({pa:#x})");
         self.free[self.nfree] = pa;
         self.nfree += 1;
     }
@@ -217,6 +241,8 @@ enum GuestMap {
         base: u64,
         size: u64,
     },
+    /// The Linux guest: pieces wherever the firmware had them.
+    Chunked(&'static linux::RamChunks),
 }
 
 struct Cpu {
@@ -236,6 +262,10 @@ impl SvmCpu for Cpu {
                     None => return false,
                 },
                 GuestMap::Contig { base, size } if a < size => base + a,
+                GuestMap::Chunked(c) => match c.span(a, 1) {
+                    Some((h, _)) => h,
+                    None => return false,
+                },
                 _ => return false,
             };
             // SAFETY: `hpa` is in a frame of the probe's pool that backs
@@ -653,6 +683,7 @@ fn kernel_case(
     let mut ram = GuestRam {
         phys: &mut env.phys,
         base,
+        size: KERNEL_RAM,
     };
     let entry = guest_boot::load(elf, &mut ram, &cfg).expect("guest-boot");
     env.cpu.ram = GuestMap::Contig {
@@ -1101,7 +1132,7 @@ fn checks(env: &mut Env, page: &mut [u8; 4096]) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "efiapi" fn efi_main(_image: *mut u8, _system: *mut u8) -> usize {
+pub extern "efiapi" fn efi_main(_image: *mut u8, system: *mut u8) -> usize {
     hw::interrupts_off();
     Serial::init();
     out!("NANOX:SVM-PROBE:START\n");
@@ -1157,12 +1188,7 @@ pub extern "efiapi" fn efi_main(_image: *mut u8, _system: *mut u8) -> usize {
             lo: pa(FIXED_PAGES),
             hi: pa(POOL_PAGES),
         },
-        frames: Frames {
-            base: pa(FIXED_PAGES),
-            next: 0,
-            free: [0; FRAME_PAGES],
-            nfree: 0,
-        },
+        frames: Frames::new(pa(FIXED_PAGES), FRAME_PAGES),
         cpu: Cpu {
             host_save: pa(1),
             ram: GuestMap::None,
@@ -1198,10 +1224,23 @@ pub extern "efiapi" fn efi_main(_image: *mut u8, _system: *mut u8) -> usize {
         }
         Err(e) => out!("NANOX:SVM-PROBE:KERNEL-M1 absent fw_cfg={e}\n"),
     }
+    // Last: it replaces the MSR policy with the platform VMM's.
+    linux::case(&mut env, vmcb, msrpm, system);
     if env.failures == 0 {
         out!("NANOX:SVM-PROBE:RESULT PASS\n");
-        hw::exit(0x10)
+        finish(0x10)
     }
     out!("NANOX:SVM-PROBE:RESULT FAIL failures={}\n", env.failures);
-    hw::exit(0x11)
+    finish(0x11)
+}
+
+/// Ends the run with `value`; with fw_cfg `opt/nanox/hold` (run.py --show)
+/// it halts instead, so the last screen stays in QEMU's window until the
+/// user closes it.
+fn finish(value: u32) -> ! {
+    if fwcfg::find("opt/nanox/hold").is_ok() {
+        out!("NANOX:SVM-PROBE:HOLD close the window to end the run\n");
+        hw::halt()
+    }
+    hw::exit(value)
 }

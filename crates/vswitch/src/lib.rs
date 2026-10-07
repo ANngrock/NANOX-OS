@@ -21,6 +21,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod endpoint;
+
 pub const MAX_PORTS: usize = 16;
 pub const MIN_FRAME: usize = 14;
 pub const VLAN_TAG: usize = 4;

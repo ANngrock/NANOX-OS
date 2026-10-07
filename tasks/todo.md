@@ -39,6 +39,34 @@ clippy, build-none, тесты, xtask-test) и запись в PR. Критер�
         перехват `syscall`, загрузчик Linux ELF): [M10-ROUTES](../docs/specs/M10-ROUTES.md), §2.6.
 - [x] **M11: окно сервера** (`crates/serverwin`, [M11-WINDOW](../docs/specs/M11-WINDOW.md)),
       измерение требований Linux-гостя (`tools/hostguest`).
+- [ ] **VMM для гостя Linux** (M11-WINDOW §5; устройства в `crates/vmm-devices`, PR #13):
+  - [x] Шаг 2: UART, 8259+ELCR, RTC, легаси-порты, IOAPIC, HPET, i8042, ACPI PM, шина `Machine`.
+  - [x] Шаг 3: шина PCI (механизм №1, ECAM), транспорт virtio 1.x, `virtio-blk`, `virtio-net`.
+  - [x] Шаг 4: `virtio-gpu` (2D) за трейтом `Scanout`.
+  - [x] Шаг 6: канал агента `virtio-console`.
+  - [x] Шаг 5: ввод `virtio-input` (клавиатура и планшет).
+  - [x] PIT каналы 0–2 и IRQ0 (частичных строк в `map` больше нет).
+  - [x] Шаг 1, часть: ACPI-таблицы платформы (RSDP…DSDT).
+  - [x] Свести три ветки в `claude/m10-vmm-legacy`, мутации, STATUS, пуш, PR #13.
+  - [x] Цикл vCPU на `Machine` (`hw-svm::platform_vm`), прямая загрузка Linux
+        (`guest-boot::linux`), `setup_linux_boot`.
+  - [x] Linux 7.0.2-6-pve под VMM NANOX до `NANOX_GUEST_REPORT_END` (svm-probe, QEMU TCG).
+  - [x] Согласованное время гостя (TSC по виртуальному времени, RDTSC перехвачен).
+  - [x] Диск гостя в зонде (образ в памяти через `virtio-blk`).
+  - [x] Экран гостя: кадровый буфер в `screen_info`, консоль Linux, `screen.png`.
+  - [x] Канал агента: приветствие гостя через `virtio-console` и ответ VMM.
+  - [x] Сеть: `eth0` гостя, ARP и ping до адреса хоста (`vswitch::endpoint`).
+  - [x] Ввод: клавиатура PS/2 (исправлен фронт IRQ1 у i8042), набранная строка у гостя.
+  - [x] Экран NANOX в зонде: окно сервера с гостем на дисплее UEFI GOP (`crates/canvas`).
+  - [x] Живое окно для владельца: `run.py --show` (QEMU с GTK через WSLg, `.#qemu-display`).
+  - [x] Интерактивная оболочка busybox в госте, ввод из окна; проверка `--shell-test` через QMP.
+  - [x] Время интерактивного гостя по настоящему; память гостя любого объёма (куски по 64 МиБ).
+  - [x] Мышь PS/2 с колесом и пересылкой; диск машины через `virtio-driver`.
+  - [x] IPI самому себе в LAPIC (irq_work, SRCU) — найдено на ядре Parrot 7.1.
+  - [ ] KDE Plasma из Parrot 7.4 в окне NANOX: нужен KVM (доступ к /dev/kvm), затем показ
+        `virtio-gpu` или проверка KDE на simpledrm.
+  - [ ] Запуск на железе и под ядром NANOX (VMRUN в ядре — Codex); вложенный SVM;
+        протокол агента (QGA); сеть наружу через vswitch.
 
 ## Нельзя закрыть здесь (причина)
 

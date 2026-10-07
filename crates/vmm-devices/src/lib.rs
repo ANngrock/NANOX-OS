@@ -7,8 +7,19 @@
 //!   QEMU TCG);
 //! * [`lapic`] — an xAPIC register model with the timer (one-shot and
 //!   periodic, divide configuration), IRR/ISR, TPR and EOI;
-//! * [`pit`] — PIT channel 2 with the port 0x61 gate and OUT2 status, the
-//!   calibration reference.
+//! * [`pit`] — the 8254 PIT, its three channels and port 0x61 (channel 2's
+//!   gate and OUT2): the calibration reference, and the IRQ0 tick;
+//! * for a Linux guest (docs/specs/M11-WINDOW.md §5, step 2): [`uart`] (16550A
+//!   console), [`pic`] (the two 8259A and the ELCR), [`rtc`] (MC146818 and
+//!   CMOS), [`legacy`] (port 0x92, POST, DMA registers, parallel probe),
+//!   [`ioapic`], [`hpet`], [`i8042`] (PS/2 controller and keyboard),
+//!   [`acpi_pm`] (PM1 events, timer, GPE0, SMI command, soft-off),
+//!   [`machine`] (all of them on one port and memory bus, with the chipset's
+//!   interrupt wiring: 8259, I/O APIC, local APIC) and
+//!   [`map`], the table of the 37 regions a Linux kernel was measured to touch
+//!   and which of them these modules provide;
+//! * [`acpi`] (step 1, part): the ACPI tables that describe this platform to
+//!   the guest, written into a buffer at a guest physical address.
 //!
 //! Devices are pure state machines over a virtual time in nanoseconds that
 //! the VMM passes in; they never read a clock, so a run is reproducible.
@@ -17,9 +28,27 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod acpi;
+pub mod acpi_pm;
 pub mod decode;
+pub mod hpet;
+pub mod i8042;
+pub mod ioapic;
 pub mod lapic;
+pub mod legacy;
+pub mod machine;
+pub mod map;
+pub mod pci;
+pub mod pic;
 pub mod pit;
+pub mod rtc;
+pub mod uart;
+pub mod virtio;
+pub mod virtio_blk;
+pub mod virtio_console;
+pub mod virtio_gpu;
+pub mod virtio_input;
+pub mod virtio_net;
 
 pub const NS_PER_SEC: u64 = 1_000_000_000;
 

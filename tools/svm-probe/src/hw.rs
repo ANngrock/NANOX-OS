@@ -6,14 +6,32 @@ use core::arch::{asm, global_asm};
 use core::fmt;
 
 pub fn outb(port: u16, value: u8) {
-    // SAFETY: CPL 0; port I/O has no memory operands. Only the fixed COM1
-    // and isa-debug-exit ports of the probe profile are used.
+    // SAFETY: CPL 0; port I/O has no memory operands. Only the fixed COM1,
+    // isa-debug-exit and PCI configuration ports and (in an interactive run)
+    // the PS/2 controller and PIT channel 2 ports of the probe profile are used.
     unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
 }
 
 pub fn outw(port: u16, value: u16) {
     // SAFETY: as in `outb` (the fw_cfg selector port).
     unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) }
+}
+
+/// OUT of a 32-bit value that starts a device's DMA (the fw_cfg DMA address
+/// register): without `nomem`, so the compiler keeps the memory the device
+/// reads and writes in place around it.
+pub fn outl(port: u16, value: u32) {
+    // SAFETY: as in `outb`; the only DMA started is fw_cfg's, into a buffer
+    // the caller owns.
+    unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nostack)) }
+}
+
+/// IN of a 32-bit value (PCI configuration data, port 0xCFC).
+pub fn inl(port: u16) -> u32 {
+    let value;
+    // SAFETY: as in `outb`.
+    unsafe { asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack)) }
+    value
 }
 
 pub fn inb(port: u16) -> u8 {
@@ -72,11 +90,131 @@ pub fn interrupts_off() {
     unsafe { asm!("cli", options(nomem, nostack)) }
 }
 
+/// `pages` 4 KiB pages of EfiLoaderData anywhere, from the firmware's boot
+/// services (UEFI 2.10 §7.2 AllocatePages; EFI_SYSTEM_TABLE.BootServices at
+/// 0x60, EFI_BOOT_SERVICES.AllocatePages at 0x28): the `linux` case needs
+/// hundreds of MiB, which a static pool would add to the image every profile
+/// loads. OVMF identity-maps all memory, so the address is also a pointer.
+/// Interrupts stay off: AllocatePages raises the TPL to TPL_NOTIFY only, and
+/// returning from it re-enables interrupts only below TPL_HIGH_LEVEL.
+pub fn allocate_pages(system: *mut u8, pages: usize) -> Option<u64> {
+    type AllocatePages = unsafe extern "efiapi" fn(u32, u32, usize, *mut u64) -> usize;
+    const ALLOCATE_ANY_PAGES: u32 = 0;
+    const ALLOCATE_MAX_ADDRESS: u32 = 1;
+    const EFI_LOADER_DATA: u32 = 2;
+    // SAFETY: `system` is the EFI_SYSTEM_TABLE the firmware passed to
+    // efi_main; boot services are still active (the probe never calls
+    // ExitBootServices), so the table and the function are valid.
+    let allocate = |kind: u32, mut addr: u64| unsafe {
+        let boot = *(system.add(0x60) as *const *const u8);
+        let f: AllocatePages = core::mem::transmute(*(boot.add(0x28) as *const usize));
+        (f(kind, EFI_LOADER_DATA, pages, &mut addr) == 0).then_some(addr)
+    };
+    // AllocateAnyPages stays below 4 GiB in OVMF; a guest's GiBs of RAM may
+    // only fit above, so the second try allows any address.
+    allocate(ALLOCATE_ANY_PAGES, 0).or_else(|| allocate(ALLOCATE_MAX_ADDRESS, u64::MAX))
+}
+
+/// The firmware's display (UEFI 2.10 §12.9, Graphics Output Protocol): the
+/// mode in use and its linear framebuffer.
+#[derive(Clone, Copy, Debug)]
+pub struct Gop {
+    pub base: u64,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    /// EFI_GRAPHICS_PIXEL_FORMAT.
+    pub format: u32,
+}
+
+/// EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID 9042a9de-23dc-4a38-96fb-7aded080516a, as laid out in memory.
+const GOP_GUID: [u8; 16] = [
+    0xde, 0xa9, 0x42, 0x90, 0xdc, 0x23, 0x38, 0x4a, 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a,
+];
+/// PixelBlueGreenRedReserved8BitPerColor.
+const GOP_BGRX8: u32 = 1;
+
+/// Finds the display (EFI_BOOT_SERVICES.LocateProtocol at 0x140), switches
+/// it to the largest blue-green-red mode that fits `max_w` × `max_h` (if
+/// there is one) and returns the mode in use; None without a display. The
+/// mode information QueryMode allocates stays with the firmware (a few dozen
+/// bytes per mode, once per run).
+pub fn gop(system: *mut u8, max_w: u32, max_h: u32) -> Option<Gop> {
+    type LocateProtocol = unsafe extern "efiapi" fn(*const u8, *const u8, *mut *mut u8) -> usize;
+    type QueryMode = unsafe extern "efiapi" fn(*mut u8, u32, *mut usize, *mut *const u8) -> usize;
+    type SetMode = unsafe extern "efiapi" fn(*mut u8, u32) -> usize;
+    let mut gop: *mut u8 = core::ptr::null_mut();
+    // SAFETY: `system` is the EFI_SYSTEM_TABLE and boot services are active
+    // (see `allocate_pages`); LocateProtocol writes the interface pointer.
+    let status = unsafe {
+        let boot = *(system.add(0x60) as *const *const u8);
+        let locate: LocateProtocol = core::mem::transmute(*(boot.add(0x140) as *const usize));
+        locate(GOP_GUID.as_ptr(), core::ptr::null(), &mut gop)
+    };
+    if status != 0 || gop.is_null() {
+        return None;
+    }
+    // SAFETY: `gop` is the EFI_GRAPHICS_OUTPUT_PROTOCOL the firmware handed
+    // out: QueryMode at 0, SetMode at 8, Mode at 0x18; EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE
+    // has MaxMode at 0, Info at 8, FrameBufferBase at 24 and FrameBufferSize at 32;
+    // EFI_GRAPHICS_OUTPUT_MODE_INFORMATION has the resolution at 4 and 8, the
+    // pixel format at 12 and PixelsPerScanLine at 32.
+    unsafe {
+        let query: QueryMode = core::mem::transmute(*(gop as *const usize));
+        let set: SetMode = core::mem::transmute(*(gop.add(8) as *const usize));
+        let mode = *(gop.add(0x18) as *const *const u8);
+        let max_mode = *(mode as *const u32);
+        let mut best: Option<(u32, u64)> = None;
+        for m in 0..max_mode {
+            let (mut size, mut info) = (0usize, core::ptr::null::<u8>());
+            if query(gop, m, &mut size, &mut info) != 0 || info.is_null() {
+                continue;
+            }
+            let w = *(info.add(4) as *const u32);
+            let h = *(info.add(8) as *const u32);
+            let area = u64::from(w) * u64::from(h);
+            let fits = *(info.add(12) as *const u32) == GOP_BGRX8 && w <= max_w && h <= max_h;
+            if fits && best.is_none_or(|(_, a)| area > a) {
+                best = Some((m, area));
+            }
+        }
+        if let Some((m, _)) = best {
+            if set(gop, m) != 0 {
+                return None;
+            }
+        }
+        let info = *(mode.add(8) as *const *const u8);
+        let word = |at: usize| *(info.add(at) as *const u32);
+        Some(Gop {
+            base: *(mode.add(24) as *const u64),
+            size: *(mode.add(32) as *const usize) as u64,
+            width: word(4),
+            height: word(8),
+            format: word(12),
+            stride: word(32),
+        })
+    }
+}
+
 /// Ends the QEMU run through isa-debug-exit: status `(value << 1) | 1`.
 pub fn exit(value: u32) -> ! {
     // SAFETY: the probe profile always has isa-debug-exit at 0xF4; without
     // it the OUT is ignored and the loop below halts the processor.
     unsafe { asm!("out dx, eax", in("dx") 0xF4u16, in("eax") value, options(nomem, nostack)) }
+    halt()
+}
+
+/// The probe machine's time-stamp counter (the probe's own, never a guest's).
+pub fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: RDTSC reads a counter; CR4.TSD is clear at CPL 0 anyway.
+    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) }
+    u64::from(hi) << 32 | u64::from(lo)
+}
+
+/// Stops the processor for good, leaving the display as it is.
+pub fn halt() -> ! {
     loop {
         // SAFETY: final state; interrupts masked.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) }

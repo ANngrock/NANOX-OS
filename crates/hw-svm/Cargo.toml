@@ -9,3 +9,6 @@ path = "src/lib.rs"
 
 [dependencies]
 vmm-devices = { path = "../vmm-devices" }
+
+[dev-dependencies]
+guest-boot = { path = "../guest-boot" }
