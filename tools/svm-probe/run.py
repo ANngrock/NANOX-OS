@@ -149,7 +149,11 @@ LINUX_CMDLINE = option("--linux-cmdline") or " ".join([
 # fw_cfg opt/nanox/host-tick-ns).
 LINUX_HOST_TICK = option("--linux-host-tick")
 # A disk image for the guest's virtio-blk; without one a small test disk is made.
+# Up to DIRECT_DISK bytes it goes through fw_cfg into the probe's memory; a larger
+# one (an installer or live ISO) is the machine's own virtio-blk, read-only, which
+# the probe drives (svm-probe host_disk.rs).
 LINUX_DISK = option("--linux-disk")
+DIRECT_DISK = 64 << 20
 LINUX_TIMEOUT_S = int(option("--linux-timeout") or 7200)
 LINUX_RAM_MIB = int(option("--linux-ram")) if option("--linux-ram") else None
 KVM = "--kvm" in sys.argv
@@ -268,12 +272,26 @@ def linux_test_disk(out: Path) -> Path:
     return img
 
 
+def direct_disk(disk) -> bool:
+    """Whether the image is the machine's own disk rather than fw_cfg data."""
+    return bool(disk) and Path(disk).stat().st_size > DIRECT_DISK
+
+
+def esp_drive(esp: Path, pinned: bool):
+    """The probe's ESP. With another disk on the machine it is the first boot
+    device (OVMF would otherwise boot the other disk's loader)."""
+    if not pinned:
+        return ["-drive", f"format=raw,file=fat:rw:{esp}"]
+    return ["-drive", f"if=none,id=esp,format=raw,file=fat:rw:{esp}",
+            "-device", "ide-hd,drive=esp,bus=ide.0,bootindex=0"]
+
+
 def machine_memory(disk) -> str:
     """The probe machine's RAM for the linux profile: 1 GiB, or with --linux-ram the
     guest's RAM, 2 GiB more and the disk image the probe holds in memory."""
     if LINUX_RAM_MIB is None:
         return "1G"
-    disk_mib = -(-Path(disk).stat().st_size // (1 << 20)) if disk else 0
+    disk_mib = -(-Path(disk).stat().st_size // (1 << 20)) if disk and not direct_disk(disk) else 0
     return f"{LINUX_RAM_MIB + 2048 + disk_mib}M"
 
 
@@ -303,7 +321,7 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
         "-device", "isa-debug-exit,iobase=0xf4,iosize=4",
         "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={code}",
         "-drive", f"if=pflash,format=raw,unit=1,file={vars_fd}",
-        "-drive", f"format=raw,file=fat:rw:{d / 'esp'}",
+        *esp_drive(d / "esp", direct_disk(disk) if linux else False),
         "-fw_cfg", f"name=opt/nanox/kernel.elf,file={KERNEL}",
     ]
     # The M1 scenarios are long under TCG: run them in one SVM profile.
@@ -318,7 +336,12 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
         ]
         if LINUX_HOST_TICK:
             argv += ["-fw_cfg", f"name=opt/nanox/host-tick-ns,string={LINUX_HOST_TICK}"]
-        if disk:
+        if disk and direct_disk(disk):
+            argv += [
+                "-drive", f"file={disk},format=raw,if=none,id=guestdisk,readonly=on",
+                "-device", "virtio-blk-pci,drive=guestdisk,disable-legacy=on",
+            ]
+        elif disk:
             argv += ["-fw_cfg", f"name=opt/nanox/disk,file={disk}"]
         if show:
             argv += ["-fw_cfg", "name=opt/nanox/hold,string=1"]

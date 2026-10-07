@@ -35,6 +35,7 @@
 //! window and the guest's screen in it (`crate::screen`), dumped at the end
 //! as `NANOX:SVM-PROBE:NANOX-SCREEN`.
 
+use crate::host_disk::HostDisk;
 use crate::hw::Serial;
 use crate::screen::{Display, Status};
 use crate::{fwcfg, has, hw, Cpu, Env, Frames, GuestMap, Phys, HOST_TICK_COUNT};
@@ -1035,9 +1036,23 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         reads: 0,
         writes: 0,
     });
-    let disk: &mut dyn BlockBackend = match mem_disk.as_mut() {
-        Some(d) => d,
-        None => &mut no_disk,
+    // Without an image in fw_cfg, the machine's own virtio-blk (a large image).
+    let mut host_disk = if mem_disk.is_none() {
+        HostDisk::open(|n| allocate(system, n))
+    } else {
+        None
+    };
+    if let Some(h) = &host_disk {
+        out!(
+            "NANOX:SVM-PROBE:LINUX-DISK host virtio-blk sectors={} read_only={}\n",
+            h.sectors(),
+            h.read_only()
+        );
+    }
+    let disk: &mut dyn BlockBackend = match (mem_disk.as_mut(), host_disk.as_mut()) {
+        (Some(d), _) => d,
+        (None, Some(h)) => h,
+        (None, None) => &mut no_disk,
     };
     let typing = Cell::new(false);
     let (mut mem, mut net, mut screen, mut agent, mut input) = (
@@ -1124,6 +1139,14 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         input.host.as_ref().map_or(0, |h| h.bytes),
         vcpu.machine().kbd.dropped
     );
+    if let Some(h) = &host_disk {
+        out!(
+            "NANOX:SVM-PROBE:LINUX-HOST-DISK requests={} errors={} last_error={:?}\n",
+            h.requests,
+            h.errors,
+            h.last_error
+        );
+    }
     surface.print();
     dump_screen("LINUX", &guest_screen(fb_host));
     if let Some(d) = display.as_mut() {

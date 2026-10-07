@@ -15,6 +15,7 @@ vswitch = { path = "../../crates/vswitch" }
 fb-console = { path = "../../crates/fb-console" }
 canvas = { path = "../../crates/canvas" }
 serverwin = { path = "../../crates/serverwin" }
+virtio-driver = { path = "../../crates/virtio-driver" }
 
 [[bin]]
 name = "svm-probe"

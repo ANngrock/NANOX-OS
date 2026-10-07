@@ -86,6 +86,7 @@ macro_rules! out {
     }};
 }
 
+mod host_disk;
 mod linux;
 mod screen;
 

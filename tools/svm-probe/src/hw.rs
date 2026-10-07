@@ -7,8 +7,8 @@ use core::fmt;
 
 pub fn outb(port: u16, value: u8) {
     // SAFETY: CPL 0; port I/O has no memory operands. Only the fixed COM1,
-    // isa-debug-exit and (in an interactive run) PS/2 controller and PIT
-    // channel 2 ports of the probe profile are used.
+    // isa-debug-exit and PCI configuration ports and (in an interactive run)
+    // the PS/2 controller and PIT channel 2 ports of the probe profile are used.
     unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
 }
 
@@ -24,6 +24,14 @@ pub fn outl(port: u16, value: u32) {
     // SAFETY: as in `outb`; the only DMA started is fw_cfg's, into a buffer
     // the caller owns.
     unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nostack)) }
+}
+
+/// IN of a 32-bit value (PCI configuration data, port 0xCFC).
+pub fn inl(port: u16) -> u32 {
+    let value;
+    // SAFETY: as in `outb`.
+    unsafe { asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack)) }
+    value
 }
 
 pub fn inb(port: u16) -> u8 {
