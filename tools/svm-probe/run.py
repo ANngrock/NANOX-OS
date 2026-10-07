@@ -245,7 +245,13 @@ def type_through_qmp(sock_path: Path, serial: Path, steps, wait_s: float):
 
     call("qmp_capabilities")
     seconds = []
-    for text, mark, _ in steps:
+    for n, (text, mark, _) in enumerate(steps):
+        if n == len(steps) - 1:
+            # Before the last line: the mouse moves and clicks (the probe hands
+            # the machine's PS/2 mouse on; it counts the packets).
+            for events in MOUSE_EVENTS:
+                call("input-send-event", {"events": events})
+                time.sleep(0.2)
         for c in text:
             keys = [{"type": "qcode", "data": k} for k in qcodes(c)]
             call("send-key", {"keys": keys, "hold-time": 40})
@@ -254,6 +260,15 @@ def type_through_qmp(sock_path: Path, serial: Path, steps, wait_s: float):
         seconds.append(None if t is None else round(t, 2))
     s.close()
     return seconds
+
+
+# What --shell-test does with the mouse: a move, a click.
+MOUSE_EVENTS = [
+    [{"type": "rel", "data": {"axis": "x", "value": 30}},
+     {"type": "rel", "data": {"axis": "y", "value": -12}}],
+    [{"type": "btn", "data": {"down": True, "button": "left"}}],
+    [{"type": "btn", "data": {"down": False, "button": "left"}}],
+]
 
 
 def linux_test_disk(out: Path) -> Path:
@@ -402,10 +417,14 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
         r["linux"]["nanox_screen"] = linux_screen(lines, d / "nanox-screen.png", "NANOX")
         if typing:
             marks = [m for _, m, _ in SHELL_TEST if m]
+            keyboard = next((l for l in lines if l.startswith("NANOX:SVM-PROBE:LINUX-KEYBOARD ")), "")
+            packets = re.search(r"host_mouse_packets=(\d+)", keyboard)
+            mouse = int(packets[1]) if packets else 0
             r["linux"]["shell_test"] = {
                 "lines": [next((g for g in guest if m in g), None) for m in marks],
                 "seconds_to_mark": typed,
-                "ok": bool(typed) and all(
+                "mouse_packets": mouse,
+                "ok": bool(typed) and mouse >= len(MOUSE_EVENTS) and all(
                     s is not None and s >= least
                     for s, (_, m, least) in zip(typed, SHELL_TEST) if m),
             }

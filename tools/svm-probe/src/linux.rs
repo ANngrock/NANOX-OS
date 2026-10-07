@@ -479,6 +479,12 @@ struct HostKeyboard {
     translated: bool,
     /// Key bytes handed on.
     bytes: u64,
+    /// The machine's PS/2 mouse: its packet so far, and its size (4 with the wheel).
+    packet: [u8; 4],
+    have: usize,
+    packet_len: usize,
+    /// Mouse packets handed on.
+    pub packets: u64,
 }
 
 const PS2_DATA: u16 = 0x60;
@@ -501,12 +507,50 @@ impl HostKeyboard {
                 break;
             }
         }
-        // The keyboard interface on.
+        // The keyboard and mouse interfaces on; the mouse to defaults, the
+        // wheel knocked on (rates 200, 100, 80), identified, reporting.
         hw::outb(PS2_STATUS, 0xAE);
+        hw::outb(PS2_STATUS, 0xA8);
+        for b in [0xF6, 0xF3, 200, 0xF3, 100, 0xF3, 80] {
+            mouse_command(b);
+        }
+        mouse_command(0xF2);
+        let id = aux_byte().unwrap_or(0);
+        mouse_command(0xF4);
         Self {
             translated: command & 0x40 != 0,
             bytes: 0,
+            packet: [0; 4],
+            have: 0,
+            packet_len: if id == 3 { 4 } else { 3 },
+            packets: 0,
         }
+    }
+
+    /// A byte of the machine's mouse: a packet's bytes are gathered (a first
+    /// byte must have bit 3 set, else the stream is out of step and the byte
+    /// is dropped), then handed on to the guest's mouse.
+    fn mouse_byte(&mut self, m: &mut Machine, b: u8) {
+        if self.have == 0 && b & 0x08 == 0 {
+            return;
+        }
+        self.packet[self.have] = b;
+        self.have += 1;
+        if self.have < self.packet_len {
+            return;
+        }
+        self.have = 0;
+        let p = self.packet;
+        // 9-bit movements: the sign in the first byte; PS/2 counts up as positive.
+        let dx = i32::from(p[1]) - (i32::from(p[0] & 0x10) << 4);
+        let dy = i32::from(p[2]) - (i32::from(p[0] & 0x20) << 3);
+        let wheel = if self.packet_len == 4 {
+            i32::from((p[3] << 4) as i8 >> 4)
+        } else {
+            0
+        };
+        m.kbd.push_mouse(dx, dy, p[0] & 7, wheel);
+        self.packets += 1;
     }
 
     fn poll(&mut self, m: &mut Machine) {
@@ -518,6 +562,7 @@ impl HostKeyboard {
             }
             let b = hw::inb(PS2_DATA);
             if status & PS2_AUX != 0 {
+                self.mouse_byte(m, b);
                 continue;
             }
             self.bytes += 1;
@@ -531,6 +576,28 @@ impl HostKeyboard {
             }
         }
     }
+}
+
+/// A byte for the machine's PS/2 mouse (controller command 0xD4), and its
+/// acknowledgement taken.
+fn mouse_command(b: u8) {
+    hw::outb(PS2_STATUS, 0xD4);
+    hw::outb(PS2_DATA, b);
+    aux_byte();
+}
+
+/// The next byte the machine's mouse sends, if one comes soon.
+fn aux_byte() -> Option<u8> {
+    for _ in 0..1_000_000 {
+        let status = hw::inb(PS2_STATUS);
+        if status & PS2_OBF != 0 {
+            let b = hw::inb(PS2_DATA);
+            if status & PS2_AUX != 0 {
+                return Some(b);
+            }
+        }
+    }
+    None
 }
 
 /// An interactive run's real time: the probe machine's TSC, measured against
@@ -1133,10 +1200,11 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     env.report("CASE", "linux", ok);
     report(&o, vcpu.machine(), slices, &net, &screen, &agent);
     out!(
-        "NANOX:SVM-PROBE:LINUX-KEYBOARD text={TYPED_TEXT} keys={}/{} host_bytes={} dropped={}\n",
+        "NANOX:SVM-PROBE:LINUX-KEYBOARD text={TYPED_TEXT} keys={}/{} host_bytes={} host_mouse_packets={} dropped={}\n",
         input.typed,
         TYPED.len(),
         input.host.as_ref().map_or(0, |h| h.bytes),
+        input.host.as_ref().map_or(0, |h| h.packets),
         vcpu.machine().kbd.dropped
     );
     if let Some(h) = &host_disk {
