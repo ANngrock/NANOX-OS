@@ -44,9 +44,12 @@ init starts a busybox shell on the guest's first virtual terminal; the
 probe hands what is typed into the window on to the guest's keyboard
 (fw_cfg opt/nanox/interactive) and runs without limits. `exit` in the
 shell powers the guest off. --shell-test checks that path without a
-window: QEMU's own keyboard gets a command through QMP (send-key) once the
-shell is up, the command writes a line to the guest's serial port, and
-the run passes when that line arrives and the guest powers off.
+window: QEMU's own keyboard gets commands through QMP (send-key) once the
+shell is up: one writes a line to the guest's serial port, one sleeps 3 s
+first (real time: the probe keeps the guest's virtual time from running
+ahead of its own clock, so at least 3 s must pass between the Enter and
+the line), then `exit`. The run passes when both lines arrive in time and
+the guest powers off.
 
 Profiles:
   svm     qemu64 with SVM, nested paging, NRIP save: every case must pass
@@ -139,15 +142,20 @@ LINUX_PROFILE = ("linux", f"qemu64,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PAS
 # --show: the linux profile in a window, with a QEMU that has one.
 SHOW = "--show" in sys.argv
 # --shell-test: the interactive shell driven through QMP, without a window.
-SHELL_TEST = "--shell-test" in sys.argv
-INTERACTIVE = SHOW or SHELL_TEST
+SHELL_TESTING = "--shell-test" in sys.argv
+INTERACTIVE = SHOW or SHELL_TESTING
 LINUX_BUSYBOX = option("--linux-busybox") or os.path.expanduser(
     "~/.nix-guest-busybox/bin/busybox")
 if INTERACTIVE:
     LINUX_CMDLINE += " nanox.shell"
-# What --shell-test types, and the line it waits for on the guest's serial port.
-SHELL_TEST_INPUT = "echo NANOX_SHELL_OK $(uname -r) $(ls /bin | wc -l) > /dev/ttyS0\nexit\n"
-SHELL_TEST_MARK = "NANOX_SHELL_OK"
+# What --shell-test types, line by line, each with the mark it waits for on the
+# guest's serial port and the least real time that must pass from its Enter to the mark.
+SHELL_TEST = [
+    ("echo NANOX_SHELL_OK $(uname -r) $(ls /bin | wc -l) > /dev/ttyS0\n", "NANOX_SHELL_OK", 0),
+    ("sleep 3; echo NANOX_SHELL_SLEPT > /dev/ttyS0\n", "NANOX_SHELL_SLEPT", 3),
+    ("exit\n", None, 0),
+]
+SHELL_TEST_WAIT_S = 120
 QEMU_DISPLAY = os.environ.get("NANOX_QEMU_DISPLAY",
                               os.path.expanduser("~/.nix-qemu-display/bin/qemu-system-x86_64"))
 
@@ -170,6 +178,7 @@ def linux_initrd(out: Path) -> Path:
 
 # QMP key names of the characters --shell-test types (a list: shift first).
 QCODES = {" ": ["spc"], "\n": ["ret"], "-": ["minus"], "/": ["slash"], ".": ["dot"],
+          ";": ["semicolon"],
           ">": ["shift", "dot"], "$": ["shift", "4"], "(": ["shift", "9"],
           ")": ["shift", "0"], "|": ["shift", "backslash"], "_": ["shift", "minus"]}
 
@@ -182,18 +191,25 @@ def qcodes(c: str):
     return [c]
 
 
-def type_through_qmp(sock_path: Path, serial: Path, text: str, wait_s: float):
+def wait_for_mark(serial: Path, mark: bytes, wait_s: float):
+    """Seconds until `mark` is on the serial port, or None after `wait_s`."""
+    start = time.monotonic()
+    while time.monotonic() - start < wait_s:
+        if serial.exists() and mark in serial.read_bytes():
+            return time.monotonic() - start
+        time.sleep(0.05)
+    return None
+
+
+def type_through_qmp(sock_path: Path, serial: Path, steps, wait_s: float):
     """Waits for the guest's shell (NANOX_SHELL_READY on the serial port), then types
-    `text` on QEMU's own keyboard through QMP; returns whether it got to type."""
+    each step's line on QEMU's own keyboard through QMP and waits for its mark; returns
+    the seconds from each Enter to its mark (None: no mark, or it never came), or None
+    if the shell never came up."""
     import socket
 
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
-        if serial.exists() and b"NANOX_SHELL_READY" in serial.read_bytes():
-            break
-        time.sleep(0.5)
-    else:
-        return False
+    if wait_for_mark(serial, b"NANOX_SHELL_READY", wait_s) is None:
+        return None
     time.sleep(3)  # the shell starts after the marker
     s = socket.socket(socket.AF_UNIX)
     s.connect(str(sock_path))
@@ -209,12 +225,16 @@ def type_through_qmp(sock_path: Path, serial: Path, text: str, wait_s: float):
                 return reply
 
     call("qmp_capabilities")
-    for c in text:
-        keys = [{"type": "qcode", "data": k} for k in qcodes(c)]
-        call("send-key", {"keys": keys, "hold-time": 40})
-        time.sleep(0.12)
+    seconds = []
+    for text, mark, _ in steps:
+        for c in text:
+            keys = [{"type": "qcode", "data": k} for k in qcodes(c)]
+            call("send-key", {"keys": keys, "hold-time": 40})
+            time.sleep(0.12)
+        t = wait_for_mark(serial, mark.encode(), SHELL_TEST_WAIT_S) if mark else None
+        seconds.append(None if t is None else round(t, 2))
     s.close()
-    return True
+    return seconds
 
 
 def linux_test_disk(out: Path) -> Path:
@@ -280,7 +300,7 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
         if INTERACTIVE:
             argv += ["-fw_cfg", "name=opt/nanox/interactive,string=1"]
     qmp = d / "qmp.sock"
-    typing = SHELL_TEST and bool(linux)
+    typing = SHELL_TESTING and bool(linux)
     if typing:
         argv += ["-qmp", f"unix:{qmp},server=on,wait=off"]
     (d / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
@@ -291,7 +311,7 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
     try:
         if typing:
             p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            typed = type_through_qmp(qmp, serial, SHELL_TEST_INPUT, timeout)
+            typed = type_through_qmp(qmp, serial, SHELL_TEST, timeout)
             _, stderr = p.communicate(timeout=timeout)
             status = p.returncode
         else:
@@ -327,7 +347,14 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
         r["linux"]["screen"] = linux_screen(lines, d / "screen.png")
         r["linux"]["nanox_screen"] = linux_screen(lines, d / "nanox-screen.png", "NANOX")
         if typing:
-            r["linux"]["shell_test"] = next((g for g in guest if SHELL_TEST_MARK in g), None)
+            marks = [m for _, m, _ in SHELL_TEST if m]
+            r["linux"]["shell_test"] = {
+                "lines": [next((g for g in guest if m in g), None) for m in marks],
+                "seconds_to_mark": typed,
+                "ok": bool(typed) and all(
+                    s is not None and s >= least
+                    for s, (_, m, least) in zip(typed, SHELL_TEST) if m),
+            }
     return r
 
 
@@ -572,8 +599,8 @@ def main() -> int:
         # Shown, the run ends when the window is closed: only the RESULT line counts.
         status_ok = r["status"] == want_status or r["shown"]
         r["match"] = status_ok and want_line in r["serial_lines"]
-        if SHELL_TEST and "linux" in r:
-            r["match"] &= bool(r["typed"]) and bool(r["linux"].get("shell_test"))
+        if SHELL_TESTING and "linux" in r:
+            r["match"] &= r["linux"]["shell_test"]["ok"]
         ok &= r["match"]
         summary["profiles"][name] = r
         print(f"{name:7} status={r['status']} match={r['match']} ({r['seconds']} s)")
@@ -582,7 +609,7 @@ def main() -> int:
             print(f"        screen: {r['linux']['screen']}")
             print(f"        nanox screen: {r['linux']['nanox_screen']}")
             if "shell_test" in r["linux"]:
-                print(f"        shell test: typed={r['typed']} {r['linux']['shell_test']}")
+                print(f"        shell test: {r['linux']['shell_test']}")
     if initrd:
         # The archive is rebuilt from the init on every run; its hash is recorded.
         initrd.unlink()

@@ -71,9 +71,14 @@ const CMDLINE_MAX: usize = 2048;
 /// 1000 polls in 10 ms it requires (docs/specs/M11-WINDOW.md).
 const QUANTUM_NS: u64 = 2_000;
 const SLICE_EXITS: u64 = 20_000;
-/// Slices of an interactive run (run.py --show): the screen is redrawn after
-/// each, so what is typed shows soon.
+/// Slices of an interactive run (run.py --show), at most this many exits or
+/// [`PACE_NS`] of virtual time each.
 const INTERACTIVE_SLICE_EXITS: u64 = 4_000;
+/// Virtual time an interactive run hands out at once, then waits for its own
+/// clock to catch up ([`Pace`]).
+const PACE_NS: u64 = 10_000_000;
+/// How often an interactive run redraws the screen, in its own nanoseconds.
+const REDRAW_NS: u64 = 200_000_000;
 const MAX_EXITS: u64 = 100_000_000;
 const MAX_VIRTUAL_NS: u64 = 600_000_000_000;
 /// The RTC's time at virtual time 0 (2026-09-21 12:53:20 UTC): fixed, so
@@ -439,6 +444,61 @@ impl HostKeyboard {
             }
         }
     }
+}
+
+/// An interactive run's real time: the probe machine's TSC, measured against
+/// PIT channel 2. The guest's virtual time may lag it (a busy guest runs
+/// slower than a real machine) but is never let run ahead of it: an idle
+/// guest would otherwise skip from one timer to the next at once, and `sleep`
+/// or a blinking cursor would not take their time.
+struct Pace {
+    tsc_hz: u64,
+    tsc0: u64,
+    virtual0: u64,
+}
+
+impl Pace {
+    /// Starts the clock at virtual time `virtual0`.
+    fn start(virtual0: u64) -> Self {
+        Self {
+            tsc_hz: tsc_hz(),
+            tsc0: hw::rdtsc(),
+            virtual0,
+        }
+    }
+
+    /// Nanoseconds since the start.
+    fn elapsed_ns(&self) -> u64 {
+        let ticks = hw::rdtsc().wrapping_sub(self.tsc0);
+        (u128::from(ticks) * 1_000_000_000 / u128::from(self.tsc_hz.max(1))) as u64
+    }
+
+    /// Waits until as much real time has passed as `virtual_now` is past the start.
+    fn wait_for(&self, virtual_now: u64) {
+        let target = virtual_now.saturating_sub(self.virtual0);
+        while self.elapsed_ns() < target {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// The probe machine's TSC rate: ticks while PIT channel 2 counts 50 ms down
+/// in mode 0 (gate on at port 0x61 bit 0, OUT2 read back in its bit 5).
+fn tsc_hz() -> u64 {
+    const PIT_HZ: u64 = 1_193_182;
+    const COUNT: u16 = 59_659;
+    let gate = hw::inb(0x61);
+    hw::outb(0x61, (gate & !0x02) | 0x01);
+    hw::outb(0x43, 0xB0); // channel 2, low then high byte, mode 0, binary
+    hw::outb(0x42, COUNT as u8);
+    hw::outb(0x42, (COUNT >> 8) as u8);
+    let t0 = hw::rdtsc();
+    while hw::inb(0x61) & 0x20 == 0 {
+        core::hint::spin_loop();
+    }
+    let ticks = hw::rdtsc().wrapping_sub(t0);
+    hw::outb(0x61, gate);
+    ticks * PIT_HZ / u64::from(COUNT)
 }
 
 /// The probe has no wall clock: its "microseconds" count the loop's
@@ -835,6 +895,11 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         vcfg.max_time_us = INTERACTIVE_SLICE_EXITS;
         out!("NANOX:SVM-PROBE:LINUX-INTERACTIVE the probe's keyboard goes to the guest\n");
     }
+    let pace = interactive.then(|| Pace::start(0));
+    if let Some(p) = &pace {
+        out!("NANOX:SVM-PROBE:LINUX-PACE tsc_hz={}\n", p.tsc_hz);
+    }
+    let mut next_draw = 0u64;
     if let Some(ns) = tick {
         vcfg.intr_exit_ns = ns;
     }
@@ -892,6 +957,9 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     let mut slices = 0u64;
     let mut surface = Surface::new();
     let o = loop {
+        if pace.is_some() {
+            vcpu.set_virtual_limit(vcpu.now_ns().saturating_add(PACE_NS));
+        }
         let mut cpu = Traced {
             cpu: &mut env.cpu,
             surface: &mut surface,
@@ -904,12 +972,20 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
             &mut gprs,
         );
         shown = stream(vcpu.serial(), shown, false);
-        if o.verdict != Verdict::Timeout {
+        let paced = pace.is_some() && o.verdict == Verdict::VirtualTimeout;
+        if o.verdict != Verdict::Timeout && !paced {
             break o;
         }
         slices += 1;
         if !interactive {
             progress(env, page, &o, slices, surface.exits.reads_of(code::INTR));
+        }
+        if let Some(p) = &pace {
+            p.wait_for(vcpu.now_ns());
+            if p.elapsed_ns() < next_draw {
+                continue;
+            }
+            next_draw = p.elapsed_ns() + REDRAW_NS;
         }
         if let Some(d) = display.as_mut() {
             d.draw(

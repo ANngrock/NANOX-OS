@@ -232,6 +232,13 @@ impl<'s> PlatformVcpu<'s> {
         self.core.now
     }
 
+    /// The virtual time at which `run` returns `VirtualTimeout`
+    /// (`VmConfig::max_virtual_ns`), for a host that hands out virtual time
+    /// in slices, such as one that keeps it from running ahead of its own clock.
+    pub fn set_virtual_limit(&mut self, ns: u64) {
+        self.core.cfg.max_virtual_ns = ns;
+    }
+
     /// Runs the guest until a verdict. The disk's size becomes virtio-blk's
     /// capacity first.
     pub fn run<C: SvmCpu + ?Sized, K: Clock + ?Sized>(
@@ -385,9 +392,12 @@ impl Running<'_, '_, '_> {
         let now = self.v.core.now;
         let m = &mut self.v.machine;
         if m.pending(now).is_none() {
-            // Wait for the next device event; with none, forever.
+            // Wait for the next device event; with none, forever. Never past
+            // the virtual-time limit: the run ends there and the guest wakes
+            // without an event, as an HLT may, and halts again when resumed.
+            let limit = self.v.core.cfg.max_virtual_ns;
             match m.next_event(now) {
-                Some(t) => self.v.core.now = now.max(t),
+                Some(t) => self.v.core.now = now.max(t.min(limit)),
                 None => return Some(Verdict::Halted),
             }
         }

@@ -7,8 +7,8 @@ use core::fmt;
 
 pub fn outb(port: u16, value: u8) {
     // SAFETY: CPL 0; port I/O has no memory operands. Only the fixed COM1,
-    // isa-debug-exit and (in an interactive run) PS/2 controller ports of the
-    // probe profile are used.
+    // isa-debug-exit and (in an interactive run) PS/2 controller and PIT
+    // channel 2 ports of the probe profile are used.
     unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
 }
 
@@ -193,6 +193,14 @@ pub fn exit(value: u32) -> ! {
     // it the OUT is ignored and the loop below halts the processor.
     unsafe { asm!("out dx, eax", in("dx") 0xF4u16, in("eax") value, options(nomem, nostack)) }
     halt()
+}
+
+/// The probe machine's time-stamp counter (the probe's own, never a guest's).
+pub fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: RDTSC reads a counter; CR4.TSD is clear at CPL 0 anyway.
+    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) }
+    u64::from(hi) << 32 | u64::from(lo)
 }
 
 /// Stops the processor for good, leaving the display as it is.

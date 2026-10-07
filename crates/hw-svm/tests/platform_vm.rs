@@ -907,6 +907,40 @@ fn hlt_wakes_at_the_earliest_device_deadline() {
     rig.cpu.assert_clean();
 }
 
+/// A host that paces virtual time: an HLT stops at the limit (the run ends,
+/// the guest wakes without an event); resumed with the limit lifted, the
+/// guest halts again and sleeps on to its deadline.
+#[test]
+fn hlt_stops_at_the_virtual_time_limit() {
+    let script = [
+        st(APIC + 0xF0, 4, 0x1FF),
+        st(APIC + 0x320, 4, 0x40),  // LAPIC timer: one-shot, vector 0x40
+        st(APIC + 0x380, 4, 5_000), // at exit 3: 10 us later, 13 us
+        Step::Sti,
+        Step::Hlt, // exit 4, stopped at 8 us
+        Step::Hlt, // until 13 us
+        eoi(),
+        debug_exit(),
+    ];
+    let mut rig = Rig::platform(&script);
+    rig.cfg.max_virtual_ns = 8_000;
+    let mut serial = [0u8; 4];
+    let mut v = PlatformVcpu::new(rig.cfg, machine(), &mut serial);
+    let o = run_platform(&mut rig, &mut v, &mut World::new().host());
+    assert_eq!(
+        (o.verdict, o.exits, o.virtual_ns),
+        (Verdict::VirtualTimeout, 4, 8_000)
+    );
+    assert_eq!(v.now_ns(), 8_000);
+    assert!(rig.cpu.interrupts.is_empty(), "woken without an event");
+    v.set_virtual_limit(u64::MAX);
+    let o = run_platform(&mut rig, &mut v, &mut World::new().host());
+    assert_eq!(o.verdict, PASS);
+    assert_eq!(rig.cpu.interrupts, vec![(0x40, rig.cpu.rip_of(6))]);
+    assert_eq!(o.virtual_ns, 13_000 + 2_000);
+    rig.cpu.assert_clean();
+}
+
 #[test]
 fn hlt_without_a_wake_up_source_is_final() {
     // IF=1, nothing scheduled; IF=0 with a LAPIC deadline.
