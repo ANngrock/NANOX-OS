@@ -240,6 +240,8 @@ enum GuestMap {
         base: u64,
         size: u64,
     },
+    /// The Linux guest: pieces wherever the firmware had them.
+    Chunked(&'static linux::RamChunks),
 }
 
 struct Cpu {
@@ -259,6 +261,10 @@ impl SvmCpu for Cpu {
                     None => return false,
                 },
                 GuestMap::Contig { base, size } if a < size => base + a,
+                GuestMap::Chunked(c) => match c.span(a, 1) {
+                    Some((h, _)) => h,
+                    None => return false,
+                },
                 _ => return false,
             };
             // SAFETY: `hpa` is in a frame of the probe's pool that backs

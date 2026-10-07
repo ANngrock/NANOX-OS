@@ -6,7 +6,7 @@ Run inside `nix develop` (pinned QEMU, NANOX_OVMF_CODE/NANOX_OVMF_VARS):
     python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH] [--repro [--runs N]]
         [--linux-kernel BZIMAGE [--linux-init ELF] [--linux-cmdline TEXT] [--linux-only]
          [--linux-host-tick NS|off] [--linux-timeout S] [--linux-disk IMAGE]
-         [--show | --shell-test] [--linux-busybox BUSYBOX]]
+         [--show | --shell-test] [--linux-busybox BUSYBOX] [--linux-ram MIB] [--kvm]]
 
 With --repro the svm profile runs N times (default 2) with identical inputs
 and the per-case digest (verdict, every counter and the serial bytes) of each
@@ -36,6 +36,19 @@ booting in the server window, and at the end the probe halts instead of
 ending the run, so the last screen stays until the window is closed. The
 verdict then comes from the RESULT line, not from the exit status, and
 there is no timeout: the run lasts until the window is closed.
+
+--linux-ram MIB gives the guest that much RAM (fw_cfg opt/nanox/ram-mib; the
+probe's default is 256 MiB); above 2.75 GiB it continues at 4 GiB. The probe
+allocates it in 64 MiB pieces wherever the firmware has them; the machine
+gets 2 GiB more than the guest plus the disk image, which the probe holds
+in memory.
+
+--kvm runs the linux profile on KVM (`-accel kvm -cpu host`) instead of TCG:
+the probe's VMRUN then runs on the processor's own SVM, nested under the
+WSL/Linux kernel's KVM, so the guest runs at close to the machine's speed.
+It needs /dev/kvm (membership of group kvm; without it in the current
+session QEMU is started through `sg kvm`). The records are not comparable
+with TCG ones: under KVM the processor model is the host's.
 
 --show is also interactive: the initramfs gets a static busybox (from
 `nix build .#guest-busybox --out-link ~/.nix-guest-busybox`, or
@@ -138,6 +151,8 @@ LINUX_HOST_TICK = option("--linux-host-tick")
 # A disk image for the guest's virtio-blk; without one a small test disk is made.
 LINUX_DISK = option("--linux-disk")
 LINUX_TIMEOUT_S = int(option("--linux-timeout") or 7200)
+LINUX_RAM_MIB = int(option("--linux-ram")) if option("--linux-ram") else None
+KVM = "--kvm" in sys.argv
 LINUX_PROFILE = ("linux", f"qemu64,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PASS")
 # --show: the linux profile in a window, with a QEMU that has one.
 SHOW = "--show" in sys.argv
@@ -253,6 +268,15 @@ def linux_test_disk(out: Path) -> Path:
     return img
 
 
+def machine_memory(disk) -> str:
+    """The probe machine's RAM for the linux profile: 1 GiB, or with --linux-ram the
+    guest's RAM, 2 GiB more and the disk image the probe holds in memory."""
+    if LINUX_RAM_MIB is None:
+        return "1G"
+    disk_mib = -(-Path(disk).stat().st_size // (1 << 20)) if disk else 0
+    return f"{LINUX_RAM_MIB + 2048 + disk_mib}M"
+
+
 def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linux=None, disk=None):
     d = out / name
     esp = d / "esp/EFI/BOOT"
@@ -263,13 +287,14 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
     vars_fd.chmod(0o644)
     serial = d / "serial.log"
     show = SHOW and bool(linux)
+    kvm = KVM and bool(linux)
     argv = [
         QEMU_DISPLAY if show else "qemu-system-x86_64",
         "-machine", "q35",
-        "-accel", "tcg,thread=single",
-        "-cpu", cpu,
+        "-accel", "kvm" if kvm else "tcg,thread=single",
+        "-cpu", "host" if kvm else cpu,
         "-smp", "1",
-        "-m", "1G" if linux else "256M",
+        "-m", machine_memory(disk) if linux else "256M",
         "-display", "gtk" if show else "none",
         "-monitor", "none",
         "-net", "none",
@@ -297,12 +322,18 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
             argv += ["-fw_cfg", f"name=opt/nanox/disk,file={disk}"]
         if show:
             argv += ["-fw_cfg", "name=opt/nanox/hold,string=1"]
+        if LINUX_RAM_MIB is not None:
+            argv += ["-fw_cfg", f"name=opt/nanox/ram-mib,string={LINUX_RAM_MIB}"]
         if INTERACTIVE:
             argv += ["-fw_cfg", "name=opt/nanox/interactive,string=1"]
     qmp = d / "qmp.sock"
     typing = SHELL_TESTING and bool(linux)
     if typing:
         argv += ["-qmp", f"unix:{qmp},server=on,wait=off"]
+    if kvm and not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        # Group kvm granted after this session began: start QEMU with it.
+        import shlex
+        argv = ["sg", "kvm", "-c", shlex.join(argv)]
     (d / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
     started = time.monotonic()
     # A shown run lasts until its window is closed.
@@ -328,7 +359,7 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
     text = serial.read_text(errors="replace") if serial.exists() else ""
     lines = text.splitlines()
     r = {
-        "cpu": cpu,
+        "cpu": "host (KVM)" if kvm else cpu,
         "shown": show,
         "typed": typed,
         "status": status,

@@ -10,7 +10,12 @@
 //! (`guest_boot::linux::load_linux`), the 64-bit entry state in the VMCB
 //! (`Vmcb::setup_linux_boot`). Guest RAM and its nested tables come from the
 //! firmware (`hw::allocate_pages`); all of the RAM is mapped, every other
-//! guest-physical address is device memory.
+//! guest-physical address is device memory. The RAM's size is fw_cfg
+//! `opt/nanox/ram-mib` (default [`DEFAULT_RAM_MIB`]); what does not fit below
+//! `LOW_RAM_LIMIT` continues at 4 GiB, as the loader's e820 map says. It is
+//! allocated in pieces of [`RAM_CHUNK`] wherever the firmware has them
+//! ([`RamChunks`]): its free memory is split (in OVMF below and above 4 GiB,
+//! and again at 1 GiB boundaries), on real machines all the more.
 //!
 //! The run is cut into slices of [`SLICE_EXITS`] exits (the probe has no wall
 //! clock; its `Clock` counts the loop's iterations, so a slice ends with
@@ -32,11 +37,11 @@
 
 use crate::hw::Serial;
 use crate::screen::{Display, Status};
-use crate::{fwcfg, has, hw, Cpu, Env, Frames, GuestMap, GuestRam, Phys, HOST_TICK_COUNT};
+use crate::{fwcfg, has, hw, Cpu, Env, Frames, GuestMap, Phys, HOST_TICK_COUNT};
 use canvas::View;
 use core::cell::Cell;
 use core::fmt::Write;
-use guest_boot::linux::{self, Acpi, Framebuffer, LinuxConfig};
+use guest_boot::linux::{self, Acpi, Framebuffer, LinuxConfig, HIGH_RAM_BASE, LOW_RAM_LIMIT};
 use guest_boot::GuestMemory as _;
 use hw_svm::exit::code;
 use hw_svm::perm::{MsrPermissionMap, MSRPM_BYTES};
@@ -54,12 +59,12 @@ use vmm_devices::virtio_gpu::{Rect, Scanout};
 use vmm_devices::virtio_net::{NetBackend, MAX_FRAME};
 use vswitch::endpoint::Endpoint;
 
-/// Guest RAM: enough for the kernel (init_size ~62 MiB from 16 MiB), its
-/// memory map and the initramfs at the top.
-pub const RAM: u64 = 256 << 20;
-/// Frames for the nested tables of `RAM` in 4 KiB pages (128 page tables and
-/// three upper levels) with room to spare.
-const NPT_PAGES: usize = 256;
+/// Guest RAM without fw_cfg `opt/nanox/ram-mib`: enough for the kernel
+/// (init_size ~62 MiB from 16 MiB), its memory map and the initramfs at the top.
+const DEFAULT_RAM_MIB: u64 = 256;
+/// The guest RAM fw_cfg may ask for.
+const MIN_RAM_MIB: u64 = 128;
+const MAX_RAM_MIB: u64 = 64 << 10;
 /// The ACPI tables: at 1 MiB, below the kernel (16 MiB).
 const ACPI_GPA: u64 = 0x10_0000;
 const ACPI_MAX: usize = 0x2000;
@@ -106,46 +111,127 @@ const FNV_PRIME: u64 = 0x100_0000_01B3;
 const SERIAL_BYTES: usize = 1 << 20;
 static mut SERIAL: [u8; SERIAL_BYTES] = [0; SERIAL_BYTES];
 
-/// Guest RAM for the devices' DMA: `size` bytes from host-physical `base`.
-struct Dma {
-    base: u64,
+/// Guest RAM is allocated in pieces of this size (the last one may be
+/// shorter). `LOW_RAM_LIMIT` is a whole number of them, so no piece straddles
+/// the low RAM's end.
+pub const RAM_CHUNK: u64 = 64 << 20;
+const MAX_RAM_CHUNKS: usize = (MAX_RAM_MIB << 20).div_ceil(RAM_CHUNK) as usize;
+const _: () = assert!(LOW_RAM_LIMIT.is_multiple_of(RAM_CHUNK));
+
+/// Where guest RAM lives in the host: piece `i` holds the guest RAM bytes
+/// from `i * RAM_CHUNK` at `host[i]`. The first `low` bytes of guest RAM are
+/// at guest-physical 0, the rest at 4 GiB.
+#[derive(Clone, Copy, Debug)]
+pub struct RamChunks {
+    host: [u64; MAX_RAM_CHUNKS],
     size: u64,
+    low: u64,
 }
 
-impl Dma {
-    fn inside(&self, gpa: u64, len: usize) -> bool {
-        gpa.checked_add(len as u64).is_some_and(|e| e <= self.size)
+/// The case's guest RAM pieces (8 KiB of addresses: a static, not the stack).
+static mut CHUNKS: RamChunks = RamChunks {
+    host: [0; MAX_RAM_CHUNKS],
+    size: 0,
+    low: 0,
+};
+
+impl RamChunks {
+    /// Guest RAM's byte offset of guest-physical `gpa`, if it is RAM.
+    fn offset(&self, gpa: u64) -> Option<u64> {
+        if gpa < self.low {
+            return Some(gpa);
+        }
+        let high = gpa.checked_sub(HIGH_RAM_BASE)?;
+        (high < self.size - self.low).then_some(self.low + high)
+    }
+
+    /// The host address of `gpa` and how many of `len` bytes from there stay
+    /// in its piece (at least one), if it is RAM.
+    pub fn span(&self, gpa: u64, len: u64) -> Option<(u64, u64)> {
+        let off = self.offset(gpa)?;
+        let i = (off / RAM_CHUNK) as usize;
+        let inside = off % RAM_CHUNK;
+        let piece = RAM_CHUNK.min(self.size - i as u64 * RAM_CHUNK);
+        Some((self.host[i] + inside, len.clamp(1, piece - inside)))
+    }
+
+    /// Copies between guest RAM at `gpa` and probe memory, piece by piece;
+    /// false (and nothing copied past the gap) where `gpa` leaves RAM.
+    fn copy(&self, mut gpa: u64, len: usize, mut each: impl FnMut(u64, usize, usize)) -> bool {
+        let mut done = 0;
+        while done < len {
+            let Some((host, n)) = self.span(gpa, (len - done) as u64) else {
+                return false;
+            };
+            each(host, done, n as usize);
+            done += n as usize;
+            gpa += n;
+        }
+        true
+    }
+
+    fn read(&self, gpa: u64, buf: &mut [u8]) -> bool {
+        self.copy(gpa, buf.len(), |host, at, n| {
+            // SAFETY: `host..host + n` is guest RAM inside one piece (`span`),
+            // firmware memory the probe allocated and identity-mapped; `buf`
+            // is probe memory outside it; no Rust reference to guest RAM
+            // exists while the guest does not run.
+            unsafe {
+                core::ptr::copy_nonoverlapping(host as *const u8, buf[at..at + n].as_mut_ptr(), n)
+            }
+        })
+    }
+
+    fn write(&self, gpa: u64, data: &[u8]) -> bool {
+        self.copy(gpa, data.len(), |host, at, n| {
+            // SAFETY: as in `read`.
+            unsafe { core::ptr::copy_nonoverlapping(data[at..].as_ptr(), host as *mut u8, n) }
+        })
     }
 }
+
+/// Guest RAM for the devices' DMA.
+struct Dma(&'static RamChunks);
 
 impl GuestMemory for Dma {
     fn read(&self, gpa: u64, buf: &mut [u8]) -> bool {
-        if !self.inside(gpa, buf.len()) {
-            return false;
-        }
-        // SAFETY: inside this case's guest RAM (checked), firmware memory the
-        // probe allocated and identity-mapped; `buf` is probe memory outside
-        // it; no Rust reference to guest RAM exists during the run.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (self.base + gpa) as *const u8,
-                buf.as_mut_ptr(),
-                buf.len(),
-            )
-        };
-        true
+        self.0.read(gpa, buf)
     }
 
     fn write(&mut self, gpa: u64, data: &[u8]) -> bool {
-        if !self.inside(gpa, data.len()) {
-            return false;
-        }
-        // SAFETY: as in `read`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), (self.base + gpa) as *mut u8, data.len())
-        };
-        true
+        self.0.write(gpa, data)
     }
+}
+
+/// Guest RAM for the loader, which writes only where its plan put things.
+struct LoaderRam<'a>(&'a RamChunks);
+
+impl guest_boot::GuestMemory for LoaderRam<'_> {
+    fn write(&mut self, gpa: u64, bytes: &[u8]) {
+        assert!(
+            self.0.write(gpa, bytes),
+            "loader write outside RAM: {gpa:#x}"
+        );
+    }
+
+    fn read(&mut self, gpa: u64, out: &mut [u8]) {
+        assert!(self.0.read(gpa, out), "loader read outside RAM: {gpa:#x}");
+    }
+}
+
+/// Guest RAM in bytes: fw_cfg `opt/nanox/ram-mib` (whole 2 MiB, between
+/// [`MIN_RAM_MIB`] and [`MAX_RAM_MIB`]), or [`DEFAULT_RAM_MIB`].
+fn ram_bytes() -> u64 {
+    let mut buf = [0u8; 24];
+    let mib = match fwcfg::read_file("opt/nanox/ram-mib", &mut buf) {
+        Ok(text) if !text.is_empty() && text.iter().all(u8::is_ascii_digit) => {
+            text.iter().fold(0u64, |n, &c| {
+                n.saturating_mul(10).saturating_add(u64::from(c - b'0'))
+            })
+        }
+        _ => DEFAULT_RAM_MIB,
+    };
+    (mib.clamp(MIN_RAM_MIB, MAX_RAM_MIB) & !1) << 20
 }
 
 /// No disk: virtio-blk has capacity 0 and refuses every request.
@@ -771,16 +857,37 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         out!("NANOX:SVM-PROBE:LINUX-DISK bytes={}\n", f.size);
         disk_image = Some(buf);
     }
-    let ram_pages = (RAM / PAGE_SIZE) as usize;
-    let region = (ram_pages + NPT_PAGES) * PAGE_SIZE as usize;
-    let (Some(region_buf), Some(image_buf), Some(initrd_buf)) = (
-        allocate(system, region),
+    let ram = ram_bytes();
+    // Nested tables of 4 KiB pages: a table per 2 MiB, a directory per GiB, spare.
+    let npt_pages = (ram >> 21) as usize + (ram >> 30) as usize + 64;
+    let (Some(npt_buf), Some(image_buf), Some(initrd_buf)) = (
+        allocate(system, npt_pages * PAGE_SIZE as usize),
         allocate(system, image_file.size),
         allocate(system, initrd_file.size),
     ) else {
         return fail(env, "allocate-pages");
     };
-    let base = region_buf.as_mut_ptr() as u64;
+    let npt_base = npt_buf.as_mut_ptr() as u64;
+    // Guest RAM, zeroed, piece by piece.
+    let chunks_ptr: *mut RamChunks = &raw mut CHUNKS;
+    // SAFETY: a static of this module, borrowed once (the case runs once).
+    let chunks = unsafe { &mut *chunks_ptr };
+    chunks.size = ram;
+    chunks.low = ram.min(LOW_RAM_LIMIT);
+    for (i, host) in chunks
+        .host
+        .iter_mut()
+        .enumerate()
+        .take(ram.div_ceil(RAM_CHUNK) as usize)
+    {
+        let len = RAM_CHUNK.min(ram - i as u64 * RAM_CHUNK) as usize;
+        let Some(piece) = allocate(system, len) else {
+            return fail(env, "allocate-ram");
+        };
+        piece.fill(0);
+        *host = piece.as_mut_ptr() as u64;
+    }
+    let chunks: &'static RamChunks = chunks;
     let Some(fb_buf) = allocate(system, FB_BYTES as usize) else {
         return fail(env, "allocate-framebuffer");
     };
@@ -810,18 +917,26 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         return fail(env, "fw-cfg-read");
     };
 
-    // Guest RAM zeroed and mapped; the nested tables after it.
+    // Guest RAM mapped piece by piece in the nested tables.
     let mut phys = Phys {
-        lo: base,
-        hi: base + region as u64,
+        lo: npt_base,
+        hi: npt_base + (npt_pages as u64) * PAGE_SIZE,
     };
-    for i in 0..ram_pages {
-        phys.fill(base + (i as u64) * PAGE_SIZE, 0);
-    }
-    let mut frames = Frames::new(base + RAM, NPT_PAGES);
+    let mut frames = Frames::new(npt_base, npt_pages);
     let mut npt = Npt::new(&mut phys, &mut frames, 48).expect("nested root");
-    npt.map(&mut phys, &mut frames, 0, base, RAM, NptPerms::RWX)
-        .expect("map guest RAM");
+    let mut off = 0;
+    while off < ram {
+        let len = RAM_CHUNK.min(ram - off);
+        let gpa = if off < chunks.low {
+            off
+        } else {
+            HIGH_RAM_BASE + (off - chunks.low)
+        };
+        let host = chunks.host[(off / RAM_CHUNK) as usize];
+        npt.map(&mut phys, &mut frames, gpa, host, len, NptPerms::RWX)
+            .expect("map guest RAM");
+        off += len;
+    }
     npt.map(
         &mut phys,
         &mut frames,
@@ -835,14 +950,10 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     // ACPI tables, then the kernel with them.
     let mut tables = [0u8; ACPI_MAX];
     let layout = acpi::build(&mut tables, ACPI_GPA, &Platform::default()).expect("ACPI tables");
-    let mut ram = GuestRam {
-        phys: &mut phys,
-        base,
-        size: RAM,
-    };
-    ram.write(ACPI_GPA, &tables[..layout.len]);
+    let mut loader_ram = LoaderRam(chunks);
+    loader_ram.write(ACPI_GPA, &tables[..layout.len]);
     let cfg = LinuxConfig {
-        ram_bytes: RAM,
+        ram_bytes: ram,
         cmdline,
         acpi: Some(Acpi {
             rsdp_gpa: layout.rsdp,
@@ -854,7 +965,7 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         reserved: &[(ECAM_BASE, ECAM_SIZE), (FB.gpa, FB_BYTES)],
         framebuffer: Some(FB),
     };
-    let entry = match linux::load_linux(&mut ram, image, initrd, &cfg) {
+    let entry = match linux::load_linux(&mut loader_ram, image, initrd, &cfg) {
         Ok(e) => e,
         Err(e) => {
             env.report("CASE", "linux", false);
@@ -866,7 +977,7 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         "NANOX:SVM-PROBE:LINUX-BOOT image={} initrd={} ram_mib={} load={:#x} entry={:#x} initrd_gpa={:#x} e820={} acpi={:#x}+{:#x} rsdp={:#x} cmdline=\"",
         image.len(),
         initrd.len(),
-        RAM >> 20,
+        ram >> 20,
         entry.load_address,
         entry.rip,
         entry.initrd_gpa,
@@ -916,7 +1027,7 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
         rsi: entry.rsi,
         ..Gprs::default()
     };
-    env.cpu.ram = GuestMap::Contig { base, size: RAM };
+    env.cpu.ram = GuestMap::Chunked(chunks);
 
     let mut no_disk = NoDisk;
     let mut mem_disk = disk_image.map(|data| MemDisk {
@@ -930,7 +1041,7 @@ pub fn case(env: &mut Env, page: &mut [u8; 4096], msrpm: &mut [u8; MSRPM_BYTES],
     };
     let typing = Cell::new(false);
     let (mut mem, mut net, mut screen, mut agent, mut input) = (
-        Dma { base, size: RAM },
+        Dma(chunks),
         Net::new(),
         NoScreen::default(),
         Agent::new(&typing),

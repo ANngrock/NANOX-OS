@@ -92,17 +92,19 @@ pub fn interrupts_off() {
 pub fn allocate_pages(system: *mut u8, pages: usize) -> Option<u64> {
     type AllocatePages = unsafe extern "efiapi" fn(u32, u32, usize, *mut u64) -> usize;
     const ALLOCATE_ANY_PAGES: u32 = 0;
+    const ALLOCATE_MAX_ADDRESS: u32 = 1;
     const EFI_LOADER_DATA: u32 = 2;
-    let mut addr = 0u64;
     // SAFETY: `system` is the EFI_SYSTEM_TABLE the firmware passed to
     // efi_main; boot services are still active (the probe never calls
     // ExitBootServices), so the table and the function are valid.
-    let status = unsafe {
+    let allocate = |kind: u32, mut addr: u64| unsafe {
         let boot = *(system.add(0x60) as *const *const u8);
         let f: AllocatePages = core::mem::transmute(*(boot.add(0x28) as *const usize));
-        f(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, &mut addr)
+        (f(kind, EFI_LOADER_DATA, pages, &mut addr) == 0).then_some(addr)
     };
-    (status == 0).then_some(addr)
+    // AllocateAnyPages stays below 4 GiB in OVMF; a guest's GiBs of RAM may
+    // only fit above, so the second try allows any address.
+    allocate(ALLOCATE_ANY_PAGES, 0).or_else(|| allocate(ALLOCATE_MAX_ADDRESS, u64::MAX))
 }
 
 /// The firmware's display (UEFI 2.10 §12.9, Graphics Output Protocol): the
