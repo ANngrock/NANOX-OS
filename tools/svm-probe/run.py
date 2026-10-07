@@ -34,7 +34,8 @@ With --show the linux profile runs in a window instead (QEMU with GTK, from
 window opens through WSLg): the NANOX screen the probe draws shows the guest
 booting in the server window, and at the end the probe halts instead of
 ending the run, so the last screen stays until the window is closed. The
-verdict then comes from the RESULT line, not from the exit status.
+verdict then comes from the RESULT line, not from the exit status, and
+there is no timeout: the run lasts until the window is closed.
 
 --show is also interactive: the initramfs gets a static busybox (from
 `nix build .#guest-busybox --out-link ~/.nix-guest-busybox`, or
@@ -284,7 +285,8 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
         argv += ["-qmp", f"unix:{qmp},server=on,wait=off"]
     (d / "argv.json").write_text(json.dumps(argv, indent=1) + "\n")
     started = time.monotonic()
-    timeout = LINUX_TIMEOUT_S if linux else TIMEOUT_S
+    # A shown run lasts until its window is closed.
+    timeout = None if show else LINUX_TIMEOUT_S if linux else TIMEOUT_S
     typed = None
     try:
         if typing:
