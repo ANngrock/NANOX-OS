@@ -60,6 +60,11 @@ clippy, build-none, тесты, xtask-test) и запись в PR. Критер�
   - [x] Экран NANOX в зонде: окно сервера с гостем на дисплее UEFI GOP (`crates/canvas`).
   - [x] Живое окно для владельца: `run.py --show` (QEMU с GTK через WSLg, `.#qemu-display`).
   - [x] Интерактивная оболочка busybox в госте, ввод из окна; проверка `--shell-test` через QMP.
+  - [x] Время интерактивного гостя по настоящему; память гостя любого объёма (куски по 64 МиБ).
+  - [x] Мышь PS/2 с колесом и пересылкой; диск машины через `virtio-driver`.
+  - [x] IPI самому себе в LAPIC (irq_work, SRCU) — найдено на ядре Parrot 7.1.
+  - [ ] KDE Plasma из Parrot 7.4 в окне NANOX: нужен KVM (доступ к /dev/kvm), затем показ
+        `virtio-gpu` или проверка KDE на simpledrm.
   - [ ] Запуск на железе и под ядром NANOX (VMRUN в ядре — Codex); вложенный SVM;
         протокол агента (QGA); сеть наружу через vswitch.
 
