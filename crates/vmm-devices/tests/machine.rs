@@ -259,6 +259,62 @@ fn every_byte_of_a_keyboard_reply_interrupts() {
     assert_eq!(m.pending(0), None);
 }
 
+fn icr(m: &mut Machine, high: u32, low: u32) {
+    m.mmio_write(LAPIC + 0x310, 4, u64::from(high), 0);
+    m.mmio_write(LAPIC + 0x300, 4, u64::from(low), 0);
+}
+
+#[test]
+fn an_ipi_to_itself_is_delivered() {
+    let mut m = machine();
+    enable_lapic(&mut m);
+    // irq_work as Linux raises it: shorthand self, fixed, vector 0xF6
+    icr(&mut m, 0, 0x4_00F6);
+    assert_eq!(m.acknowledge(0), Some(0xF6));
+    eoi(&mut m, 0);
+    // the ICR reads back what was written, delivery status idle
+    assert_eq!(m.mmio_read(LAPIC + 0x300, 4, 0), 0x4_00F6);
+    // all including self: delivered; all excluding self: no one to deliver to
+    icr(&mut m, 0, 0x8_0051);
+    assert_eq!(m.acknowledge(0), Some(0x51));
+    eoi(&mut m, 0);
+    icr(&mut m, 0, 0xC_0052);
+    assert_eq!(m.pending(0), None);
+    // physical destination: its ID 0 and the broadcast, not another ID;
+    // lowest priority as fixed
+    for (dest, delivered) in [(0u32, true), (0xFF, true), (1, false)] {
+        icr(&mut m, dest << 24, 0x153);
+        assert_eq!(m.acknowledge(0), delivered.then_some(0x53), "dest {dest}");
+        if delivered {
+            eoi(&mut m, 0);
+        }
+    }
+    assert_eq!(m.lapic.ignored_writes, 0, "all of them handled");
+}
+
+#[test]
+fn logical_ipis_and_what_is_not_modeled() {
+    let mut m = machine();
+    enable_lapic(&mut m);
+    // flat model, logical ID 1
+    m.mmio_write(LAPIC + 0xE0, 4, 0xFFFF_FFFF, 0);
+    m.mmio_write(LAPIC + 0xD0, 4, 1 << 24, 0);
+    icr(&mut m, 0x03 << 24, 0x854);
+    assert_eq!(m.acknowledge(0), Some(0x54));
+    eoi(&mut m, 0);
+    icr(&mut m, 0x02 << 24, 0x854);
+    assert_eq!(m.pending(0), None);
+    assert_eq!(m.lapic.ignored_writes, 0);
+    // NMI, INIT and SIPI are counted, not delivered; so is the cluster model
+    for low in [0x4_0400, 0x4_0500, 0x4_0600] {
+        icr(&mut m, 0, low);
+    }
+    m.mmio_write(LAPIC + 0xE0, 4, 0x0FFF_FFFF, 0);
+    icr(&mut m, 0x01 << 24, 0x855);
+    assert_eq!(m.pending(0), None);
+    assert_eq!(m.lapic.ignored_writes, 4);
+}
+
 #[test]
 fn the_mouse_on_irq12() {
     let mut m = machine();

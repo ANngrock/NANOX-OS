@@ -1,8 +1,11 @@
 //! Local APIC in xAPIC mode (MMIO page at the APIC base) for one vCPU:
 //! registers, the timer, IRR/ISR/TPR priority and EOI (Intel SDM Vol. 3
-//! ch. 11, AMD APM Vol. 2 ch. 16). Not modeled: IPIs (ICR writes are stored
-//! and counted), LINT pins, thermal/performance/error interrupts, TSC-
-//! deadline mode, x2APIC. The timer counts at `bus_hz / divide`.
+//! ch. 11, AMD APM Vol. 2 ch. 16). IPIs: with one processor, the fixed and
+//! lowest-priority ones that reach it are delivered to itself (Linux raises
+//! its irq_work this way, which SRCU and others rely on); the others (NMI,
+//! INIT, SIPI, SMI, other destinations) are counted. Not modeled: LINT pins,
+//! thermal/performance/error interrupts, TSC-deadline mode, x2APIC. The
+//! timer counts at `bus_hz / divide`.
 
 use crate::{events_in, ns_for_events};
 
@@ -76,9 +79,20 @@ pub struct Lapic {
     /// Timer expirations that found their vector already pending (or
     /// several in one update) and were merged, as real hardware does.
     pub coalesced: u64,
-    /// Writes to unmodeled registers (ICR, read-only registers).
+    /// Writes to unmodeled registers (read-only ones) and IPIs not delivered
+    /// (other delivery modes, other processors).
     pub ignored_writes: u32,
 }
+
+/// ICR_LOW fields: delivery mode (bits 8–10), logical destination mode,
+/// delivery status, destination shorthand (bits 18–19).
+const ICR_FIXED: u32 = 0;
+const ICR_LOWEST: u32 = 1;
+const ICR_LOGICAL: u32 = 1 << 11;
+const ICR_PENDING: u32 = 1 << 12;
+const ICR_SELF: u32 = 1;
+const ICR_ALL: u32 = 2;
+const ICR_OTHERS: u32 = 3;
 
 /// Divide configuration bits 3,1,0 → divisor.
 fn divisor(divide: u32) -> u64 {
@@ -236,6 +250,33 @@ impl Lapic {
     }
 
     /// An interrupt arrives from outside (the I/O APIC): the vector is set in IRR. Vectors below 16 are illegal and ignored.
+    /// An IPI this processor sends (an ICR_LOW write). With one processor
+    /// only those that reach itself have an effect: a fixed or
+    /// lowest-priority interrupt to itself by shorthand (self, all including
+    /// self) or by destination (physical: its ID 0 or the broadcast 0xFF;
+    /// logical, flat model: a destination sharing a bit with its LDR) raises
+    /// the vector. False for what is not modeled: other delivery modes (SMI,
+    /// NMI, INIT, SIPI) and the cluster model.
+    fn send_ipi(&mut self, low: u32) -> bool {
+        let dest = self.icr[1] >> 24;
+        let to_self = match low >> 18 & 3 {
+            ICR_SELF | ICR_ALL => true,
+            ICR_OTHERS => false,
+            _ if low & ICR_LOGICAL == 0 => dest == 0 || dest == 0xFF,
+            _ if self.dfr >> 28 != 0xF => return false,
+            _ => dest & (self.ldr >> 24) != 0,
+        };
+        match low >> 8 & 7 {
+            ICR_FIXED | ICR_LOWEST => {
+                if to_self {
+                    self.raise(low as u8);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn raise(&mut self, v: u8) {
         if v >= 16 {
             self.irr[usize::from(v / 32)] |= 1 << (v % 32);
@@ -313,10 +354,14 @@ impl Lapic {
                     }
                 }
             }
-            reg::ICR_LOW | reg::ICR_HIGH => {
-                self.icr[usize::from(offset == reg::ICR_HIGH)] = value;
-                self.ignored_writes += 1;
+            reg::ICR_LOW => {
+                // Delivery is immediate: the status bit always reads idle.
+                self.icr[0] = value & !ICR_PENDING;
+                if !self.send_ipi(value) {
+                    self.ignored_writes += 1;
+                }
             }
+            reg::ICR_HIGH => self.icr[1] = value & 0xFF00_0000,
             reg::LVT_TIMER => {
                 let mut v = value & LVT_TIMER_BITS;
                 if self.svr & SVR_ENABLE == 0 {

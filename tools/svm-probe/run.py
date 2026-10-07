@@ -6,7 +6,8 @@ Run inside `nix develop` (pinned QEMU, NANOX_OVMF_CODE/NANOX_OVMF_VARS):
     python3 tools/svm-probe/run.py [--no-build] [--m1-kernel PATH] [--repro [--runs N]]
         [--linux-kernel BZIMAGE [--linux-init ELF] [--linux-cmdline TEXT] [--linux-only]
          [--linux-host-tick NS|off] [--linux-timeout S] [--linux-disk IMAGE]
-         [--show | --shell-test] [--linux-busybox BUSYBOX] [--linux-ram MIB] [--kvm]]
+         [--show | --shell-test | --shell-script FILE | --interactive] [--linux-busybox BUSYBOX]
+         [--linux-ram MIB] [--kvm] [--linux-initrd INITRD]]
 
 With --repro the svm profile runs N times (default 2) with identical inputs
 and the per-case digest (verdict, every counter and the serial bytes) of each
@@ -36,6 +37,17 @@ booting in the server window, and at the end the probe halts instead of
 ending the run, so the last screen stays until the window is closed. The
 verdict then comes from the RESULT line, not from the exit status, and
 there is no timeout: the run lasts until the window is closed.
+
+--shell-script FILE types the lines of FILE into the guest's shell the way
+--shell-test types its own (diagnostics: a command can write what it finds
+to /dev/ttyS0); a line ending in `#wait MARK` waits for MARK on the guest's
+serial port before the next one; `exit` is added at the end.
+
+--linux-initrd INITRD boots a distribution as it comes: its own initramfs
+instead of the measurement init (and no busybox or nanox.shell); the run
+then passes only by the probe's RESULT line, as nothing prints the report.
+--interactive is --show without the window: the probe's keyboard and
+mouse go to the guest, no limits, the guest's time paced to real time.
 
 --linux-ram MIB gives the guest that much RAM (fw_cfg opt/nanox/ram-mib; the
 probe's default is 256 MiB); above 2.75 GiB it continues at 4 GiB. The probe
@@ -161,11 +173,14 @@ LINUX_PROFILE = ("linux", f"qemu64,{SVM_FLAGS}", 33, "NANOX:SVM-PROBE:RESULT PAS
 # --show: the linux profile in a window, with a QEMU that has one.
 SHOW = "--show" in sys.argv
 # --shell-test: the interactive shell driven through QMP, without a window.
-SHELL_TESTING = "--shell-test" in sys.argv
-INTERACTIVE = SHOW or SHELL_TESTING
+SHELL_SCRIPT = option("--shell-script")
+SHELL_TESTING = "--shell-test" in sys.argv or bool(SHELL_SCRIPT)
+INTERACTIVE = SHOW or SHELL_TESTING or "--interactive" in sys.argv
+# A distribution's own initramfs, used as it is.
+LINUX_INITRD = option("--linux-initrd")
 LINUX_BUSYBOX = option("--linux-busybox") or os.path.expanduser(
     "~/.nix-guest-busybox/bin/busybox")
-if INTERACTIVE:
+if INTERACTIVE and not LINUX_INITRD:
     LINUX_CMDLINE += " nanox.shell"
 # What --shell-test types, line by line, each with the mark it waits for on the
 # guest's serial port and the least real time that must pass from its Enter to the mark.
@@ -175,6 +190,14 @@ SHELL_TEST = [
     ("exit\n", None, 0),
 ]
 SHELL_TEST_WAIT_S = 120
+if SHELL_SCRIPT:
+    SHELL_TEST = []
+    for script_line in Path(SHELL_SCRIPT).read_text().splitlines():
+        if script_line.strip():
+            text, _, mark = script_line.partition("#wait ")
+            SHELL_TEST.append((text.rstrip() + "\n", mark.strip() or None, 0))
+    if not SHELL_TEST or SHELL_TEST[-1][0].strip() != "exit":
+        SHELL_TEST.append(("exit\n", None, 0))
 QEMU_DISPLAY = os.environ.get("NANOX_QEMU_DISPLAY",
                               os.path.expanduser("~/.nix-qemu-display/bin/qemu-system-x86_64"))
 
@@ -185,6 +208,8 @@ def linux_initrd(out: Path) -> Path:
     sys.path.insert(0, str(ROOT / "tools/hostguest"))
     import linux_surface  # noqa: E402
 
+    if LINUX_INITRD:
+        return Path(LINUX_INITRD)
     init = Path(LINUX_INIT) if LINUX_INIT else LINUX_INIT_DEFAULT
     files = [("init", 0o100755, init.read_bytes())]
     if INTERACTIVE:
@@ -197,7 +222,14 @@ def linux_initrd(out: Path) -> Path:
 
 # QMP key names of the characters --shell-test types (a list: shift first).
 QCODES = {" ": ["spc"], "\n": ["ret"], "-": ["minus"], "/": ["slash"], ".": ["dot"],
-          ";": ["semicolon"],
+          ";": ["semicolon"], "=": ["equal"], "'": ["apostrophe"], ",": ["comma"],
+          "[": ["bracket_left"], "]": ["bracket_right"], "\\": ["backslash"],
+          "`": ["grave_accent"], "&": ["shift", "7"], "*": ["shift", "8"],
+          "+": ["shift", "equal"], '"': ["shift", "apostrophe"], ":": ["shift", "semicolon"],
+          "<": ["shift", "comma"], "{": ["shift", "bracket_left"],
+          "}": ["shift", "bracket_right"], "!": ["shift", "1"], "@": ["shift", "2"],
+          "#": ["shift", "3"], "%": ["shift", "5"], "^": ["shift", "6"],
+          "?": ["shift", "slash"], "~": ["shift", "grave_accent"],
           ">": ["shift", "dot"], "$": ["shift", "4"], "(": ["shift", "9"],
           ")": ["shift", "0"], "|": ["shift", "backslash"], "_": ["shift", "minus"]}
 
@@ -424,7 +456,7 @@ def run_profile(out: Path, name: str, cpu: str, code: Path, vars_src: Path, linu
                 "lines": [next((g for g in guest if m in g), None) for m in marks],
                 "seconds_to_mark": typed,
                 "mouse_packets": mouse,
-                "ok": bool(typed) and mouse >= len(MOUSE_EVENTS) and all(
+                "ok": bool(typed) and (SHELL_SCRIPT or mouse >= len(MOUSE_EVENTS)) and all(
                     s is not None and s >= least
                     for s, (_, m, least) in zip(typed, SHELL_TEST) if m),
             }
@@ -653,6 +685,7 @@ def main() -> int:
             "kernel": LINUX_KERNEL,
             "kernel_sha256": sha256(Path(LINUX_KERNEL)),
             "init": str(init),
+            "initrd_given": LINUX_INITRD,
             "init_sha256": sha256(init),
             "initrd_bytes": initrd.stat().st_size,
             "initrd_sha256": sha256(initrd),
@@ -683,8 +716,9 @@ def main() -> int:
             print(f"        nanox screen: {r['linux']['nanox_screen']}")
             if "shell_test" in r["linux"]:
                 print(f"        shell test: {r['linux']['shell_test']}")
-    if initrd:
+    if initrd and not LINUX_INITRD:
         # The archive is rebuilt from the init on every run; its hash is recorded.
+        # A given initramfs (--linux-initrd) is the caller's and stays.
         initrd.unlink()
     if "svm" in summary["profiles"]:
         cmp = compare_m0(summary["profiles"]["svm"]["serial_lines"], kernel_sha)
